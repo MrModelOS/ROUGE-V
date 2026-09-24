@@ -1,0 +1,36 @@
+# Build
+build/
+build-*/
+build-cuda/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.ll
+*.bc
+
+# Temp
+/tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ninja / CMake leftovers
+.ninja_*
+CMakeCache.txt
+CMakeFiles/

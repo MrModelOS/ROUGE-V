@@ -1,0 +1,16 @@
+{
+  "lifetime_hours": 26280,
+  "energy_price": 0.12,
+  "memory_cost": 800,
+  "ops_cost": 400,
+  "h100": {
+    "hardware_cost": 30000,
+    "power_w": 350,
+    "tokens_per_sec": 2200
+  },
+  "crimson": {
+    "hardware_cost": 15000,
+    "power_w": 200,
+    "tokens_per_sec": 3200
+  }
+}

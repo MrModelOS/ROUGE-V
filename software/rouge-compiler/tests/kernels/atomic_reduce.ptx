@@ -1,0 +1,64 @@
+.version 8.0
+.target sm_80
+.address_size 64
+
+// ROUGE-V test kernel: relaxed global atomics.
+// Every in-bounds thread atomically accumulates its data value into a global
+// f32 sum (red.add.f32), bumps a global u32 counter (red.add.u32), and uses
+// the *returning* form atom.add.u32 on a thread-private slot (claim-and-clear:
+// the old value must be 0 for every slot). Exercises atom.*/red.* lowering in
+// both the ptx2ir AOT path and the rouge-cuda interpreter.
+// Values in the test are multiples of 0.25 and the total stays below 2^24, so
+// the f32 result is exact regardless of the atomic completion order.
+
+.visible .entry atomic_reduce(
+    .param .u64 ar_param_0,
+    .param .u64 ar_param_1,
+    .param .u64 ar_param_2,
+    .param .u64 ar_param_3,
+    .param .u32 ar_param_4
+)
+{
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<7>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [ar_param_0];
+    ld.param.u64 %rd2, [ar_param_1];
+    ld.param.u64 %rd3, [ar_param_2];
+    ld.param.u64 %rd4, [ar_param_3];
+    ld.param.u32 %r1, [ar_param_4];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mul.wide.u32 %rd5, %r2, %r3;
+    mov.u32 %r4, %tid.x;
+    cvt.u64.u32 %rd6, %r4;
+    add.s64 %rd5, %rd5, %rd6;
+    cvt.u32.u64 %r5, %rd5;
+
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra LAR_END;
+
+    // val = data[g]
+    mul.wide.u32 %rd6, %r5, 4;
+    add.s64 %rd1, %rd1, %rd6;
+    ld.global.f32 %r6, [%rd1];
+
+    // sum += val (no return value)
+    red.global.add.f32 [%rd2], %r6;
+
+    // count += 1
+    mov.u32 %r7, 1;
+    red.global.add.u32 [%rd3], %r7;
+
+    // claim-and-clear a thread-private slot: atom.add returns the old value
+    mul.wide.u32 %rd6, %r5, 4;
+    add.s64 %rd4, %rd4, %rd6;
+    mov.u32 %r7, 1;
+    atom.global.add.u32 %r8, [%rd4], %r7;
+    st.global.u32 [%rd4], %r8;
+
+LAR_END:
+    ret;
+}

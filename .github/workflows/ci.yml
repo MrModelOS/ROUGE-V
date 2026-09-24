@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rouge-compiler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build cmake
+
+      - name: Configure (rouge-compiler)
+        run: cmake -S software/rouge-compiler -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (rouge-compiler)
+        run: cmake --build build
+
+      - name: Test (rouge-compiler)
+        run: ctest --test-dir build --output-on-failure
+
+  rouge-cuda:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build cmake
+
+      - name: Configure (rouge-cuda)
+        run: cmake -S software/rouge-cuda -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (rouge-cuda)
+        run: cmake --build build-cuda
+
+      - name: Test (rouge-cuda)
+        run: ctest --test-dir build-cuda --output-on-failure
