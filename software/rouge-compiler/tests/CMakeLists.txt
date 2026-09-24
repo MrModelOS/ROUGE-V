@@ -63,6 +63,12 @@ if(CLANG_EXECUTABLE)
   target_link_libraries(test_aot_fp16_reduce PRIVATE rouge-runtime)
   add_test(NAME aot_native_fp16_reduce COMMAND test_aot_fp16_reduce)
 
+  # Test 2e: tiled GEMM 16x16 in F16 via shared memory (gemm_tile kernel).
+  add_executable(test_aot_gemm_tile test_aot_gemm_tile.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/gemm_tile.o)
+  target_link_libraries(test_aot_gemm_tile PRIVATE rouge-runtime)
+  add_test(NAME aot_native_gemm_tile COMMAND test_aot_gemm_tile)
+
   # ---- Test 3 (informational): same IR through the RISC-V backend ----
   # Compiles the IR for riscv64 with the vector extension (rv64gcv). Reports
   # status; skipped gracefully when this LLVM build lacks a riscv target.
