@@ -1,88 +1,89 @@
-<!-- TODO: замени URL перед публикацией — сейчас плейсхолдер github.com/rouge-v/rouge-v, замени на реальный адрес репозитория -->
-# ROUGE-V: как мы заставляем CUDA-код работать на открытом RISC-V без переписывания
+# ROUGE-V: как мы учим CUDA-код бегать на открытом RISC-V без переписывания
 
-> **TL;DR:** NVIDIA берёт 80% наценки не за кремний, а за замок. Мы делаем ключ: `ptx2ir` берёт ваш PTX/PyTorch/vLLM → LLVM IR → `rv64gcv` без эмуляции. Прототип даёт бит-идентичный результат двумя путями, железо честно в 2028. Софт уже сейчас.
+> **TL;DR:** NVIDIA берёт ~80% наценки не за кремний, а за замок на софте. Мы делаем ключ: `ptx2ir` берёт ваш `PTX / PyTorch / vLLM` → `LLVM IR` → `rv64gcv` без эмуляции, два пути дают бит-идентичный результат. Прототип уже зелёный, железо честно в 2028. Софт — сейчас.
 
-*7 минут, внутри — PTX, IR и логи `ctest`.*
+*7 минут, внутри — PTX, IR и честные логи `ctest`.*
 
 ---
 
-## Налог, который вы платите каждый инференс
+## Налог, который вы платите на каждом токене
 
 ```
 $/токен = (железо/срок + энергия + память + операции) / токенов за срок
 ```
 
-На H100 >50% цены — не HBM/CoWoS, а роялти за `libcuda.so`. Переписать дороже, чем платить. 75–86% датацентровых ускорителей в 2026 — у NVIDIA не потому, что никто не умеет в чипы. Tenstorrent сделал RISC-V, Groq — LPU, Huawei — Ascend. Толку? Запустите там `torch.compile` без боли. 20 лет `cuBLAS/cuDNN/TensorRT` — ров с крокодилами. Чипом не перепрыгнешь.
+На `H100` больше половины цены — не `HBM` и не `CoWoS`, а роялти за `libcuda.so`. Переписать проект под другое железо — месяцы и баги. Поэтому проще платить. 75–86% датацентровых ускорителей в 2026 — у NVIDIA не потому что никто не умеет делать чипы. `Tenstorrent` сделал `RISC-V`, `Groq` — `LPU`, `Huawei` — `Ascend`. И что? Попробуйте запустить там `torch.compile` без матов. 20 лет `cuBLAS / cuDNN / TensorRT` — это ров с крокодилами. Чипом его не перепрыгнешь.
 
-Я — 16-летний основатель ROUGE-V. Мы не «убьём NVIDIA». Монополию в лоб не убивают — её делают ненужной.
+Меня зовут... мне 16. Я не собираюсь «убивать NVIDIA» — в лоб монополию не убивают. Её делают ненужной.
 
-## Почему «быстрее чип» — тупик
+## Почему «сделаем чип быстрее» — тупик
 
-* **Чип без софта** → Groq/Cerebras: `PyTorch` не завёлся в Day 0.
-* **Софт «почти CUDA»** → AMD ROCm 7: «на NVIDIA вчера, на AMD — подождите патч».
-* **Закрытая вертикаль** → TPU+XLA: гениально, но наружу не продаётся.
+Я тоже так думал в начале. Потом посмотрел что было:
 
-NVIDIA сильна связкой `CUDA → библиотеки → экосистема → CoWoS/HBM`. Наш клин — `CUDA-lockin`. Если любой CUDA-код едет на открытом железе без правок, наценка становится донейтом.
+* **Чип без софта** — `Groq`/`Cerebras`: железо пушка, а `PyTorch` в `Day 0` не завёлся. Инженеры сидят без работы.
+* **Софт «почти CUDA»** — `AMD ROCm 7`: на `NVIDIA` работало вчера, на `AMD` — «подождите патч, уже чиним».
+* **Закрытая вертикаль** — `TPU + XLA`: гениально, но наружу не продаётся. Хочешь — пиши под них с нуля.
 
-**Rogue Strategy:** Software-first (софт зарабатывает в 2027 на чужих чипах), Open-first (LLVM/MLIR + RISC-V/RVV, комьюнити вместо $2B), переводчик а не эмулятор (AOT, не интерпретатор). ZLUDA — динамический перехват, наш перф-путь — статический `ptx2ir`.
+NVIDIA сильна не чипом, а связкой `CUDA → библиотеки → экосистема → CoWoS / HBM`. Наш клин — в `CUDA-lockin`. Если любой `CUDA`-код едет на открытом железе без правок, наценка превращается в пожертвование.
 
-## Один PTX — два пути, один результат
+Отсюда наша **Rogue Strategy**: `Software-first` (софт зарабатывает уже в 2027 на чужих GPU), `Open-first` ( `LLVM / MLIR + RISC-V / RVV`, комьюнити вместо `$2B` венчурки), `переводчик а не эмулятор` ( `AOT`, а не интерпретатор). `ZLUDA` — динамический перехват, наш перф-путь — статический `ptx2ir`.
 
-NVIDIA компилирует `.cu` в PTX — текстовый ассемблер. IR можно перекомпилировать:
+## Один PTX — два пути, один результат. Буквально.
+
+`NVIDIA` компилирует ваш `.cu` в `PTX` — текстовый ассемблер. Это уже `IR`, его можно перекомпилировать. Мы так и делаем:
 
 ```ptx
 .visible .entry vadd(.param .u64 a, .param .u64 b, .param .u64 c, .param .u32 n){
   .reg .b32 %r<7>; .reg .b64 %rd<6>; .reg .pred %p<2>;
   ld.param.u64 %rd1, [a];
   mov.u32 %r2, %ctaid.x;  mov.u32 %r4, %tid.x;
-  mul.wide.u32 %rd4, %r2, %r3;
+  mul.wide.u32 %rd4, %r2, %r3;  // blockIdx * blockDim + threadIdx
   ld.global.f32 %r5, [%rd1]; add.f32 %r7, %r5, %r6;
   st.global.f32 [%rd3], %r7; ret;
 }
 ```
 
-`software/rouge-compiler/src/ptx_to_llvm.cpp:115`:
+`software/rouge-compiler/src/ptx_to_llvm.cpp:115` — наш `rouge-ptx` парсит это, `ptx2ir` льёт в `LLVM IR`:
 
 ```
-PTX → rouge-ptx → ptx2ir → LLVM IR → clang → .o
-                            └→ clang -march=rv64gcv → RVV
+PTX → rouge-ptx → ptx2ir → LLVM IR → clang → .o (x86)
+                                 └→ clang -march=rv64gcv → RVV
 ```
 
-Кернел → обычная функция:
+Кернел становится обычной функцией, `CUDA`-регистры — из дескриптора:
 
 ```llvm
-; Generated by ROUGE-V ptx2ir — AOT path, do not edit
+; Generated by ROUGE-V ptx2ir
 define void @vadd(i64 %arg0, i64 %arg1, i64 %arg2, i32 %arg3, ptr %launch) {
   %lg0 = getelementptr inbounds i8, ptr %launch, i64 12 ; ctaid.x
   %v1 = load i32, ptr %lg0, align 4
-  %x4 = zext i32 %v6 to i64
   %m8 = mul i64 %x4, %y5
   %r47 = fadd float %f44, %f46
   ret void
 }
 ```
 
-Каждый PTX-регистр — `alloca` (потом `mem2reg`). `%launch`: 12×`i32` для `tid/ctaid/ntid/nctaid` (0..44), `i64` база scratchpad `.shared` на 48, `i64` хендл барьера на 56. `bar.sync 0` → `call @__rouge_syncthreads` (хост `pthread_barrier`, RISC-V `fence`).
+Каждый `PTX`-регистр — `alloca` (потом `mem2reg` съест), `%launch`: `12×i32` для `tid/ctaid/ntid/nctaid` (`0..44`), `i64` база `scratchpad` `.shared` на `48`, `i64` хендл барьера на `56`. `bar.sync 0` → `call @__rouge_syncthreads` (хост — `pthread_barrier`, `RISC-V` — `fence`).
 
-## Что уже работает
+## Что уже работает — и почему это не слайды
 
-Два исполнителя одного PTX — **бит-идентично**:
+У нас два исполнителя одного `PTX`. Они обязаны совпасть бит-в-бит, иначе — `fail`.
 
 * **AOT** (`rouge-compiler`): `ptx2ir → clang -O2 → запуск`
-* **Интерпретатор** (`rouge-cuda`): CTA-секвенсер lockstep (иначе `bar.sync` — гонка)
+* **Интерпретатор** (`rouge-cuda`): `CTA-секвенсер` lockstep — иначе `bar.sync` даёт гонку
 
-| Фича | PTX → IR | Статус |
+| Фича | Как едет | Статус |
 |---|---|---|
-| `ld/st.global`, `cvt`, `setp` | `bitcast`/`icmp`/`br` | 10/10 |
-| `.shared` + `bar.sync` | scratchpad + `__rouge_syncthreads` | ✅ |
-| `atom.add`/`red.add` | `atomicrmw add/fadd monotonic` | ✅ |
-| FP16/BF16 + `fma` | `half`/`bfloat` + `llvm.fma` | ✅ |
+| `ld/st.global`, `cvt`, `setp` | `bitcast` / `icmp` / `br` | `11/11` |
+| `.shared` + `bar.sync` | `scratchpad` + `__rouge_syncthreads` | ✅ |
+| `atom.add` / `red.add` | `atomicrmw add/fadd monotonic` | ✅ |
+| `FP16 / BF16` + `fma` | `half` / `bfloat` + `llvm.fma` | ✅ |
+| `gemm_tile` 16×16 | `shA/shB` 512+512Б, тайл | ✅ |
 | Экспорт `.shared` | `@__rouge_*_query` → `RougeKernelInfo` | ✅ |
-| RVV | `clang -march=rv64gcv` | 3/3 |
-| MLIR | `rouge-opt --rouge-simt-access-report` | контур |
+| `RVV` | `clang -march=rv64gcv` | `3/3` |
+| `MLIR` | `rouge-opt --rouge-simt-access-report` | контур |
 
-Редукция через shared (без барьера — гонка):
+Редукция через `shared` — без барьера была гонка, с барьером — нет:
 
 ```ptx
 .shared .align 4 .b32 smem[256];
@@ -90,7 +91,7 @@ define void @vadd(i64 %arg0, i64 %arg1, i64 %arg2, i32 %arg3, ptr %launch) {
   bar.sync 0; // thread 0: sum smem[0..ntid.x)
 ```
 
-FP16/BF16 round-trip:
+`FP16` round-trip (интерпретатор и `AOT` дают один 16-битный паттерн):
 
 ```ptx
   ld.global.f16 %h1, [%rd1]; cvt.f32.f16 %r6, %h1;
@@ -98,71 +99,81 @@ FP16/BF16 round-trip:
   bar.sync 0; fma.rn.f16 %h5, %h1, %h1, %h1;
 ```
 
-Лог дороже слайдов:
+Лог дороже слайдов — копипаста с моей машины:
 
 ```
 $ ctest --output-on-failure
-1/10 compiler_ptx_to_llvm .............. Passed  3747B IR
-2/10 compiler_ptx_to_llvm_shared ....... Passed  scratchpad 64B bar.sync→barrier
-3/10 compiler_ptx_to_llvm_atomics_fp16 . Passed  atom→atomicrmw half/bfloat fma
-4/10 aot_native_vadd ................... Passed  4096 elems 16×256
-5/10 aot_native_block_reduce ........... Passed  smem 1024B 16×256
-6/10 aot_native_atomic_reduce .......... Passed  sum=4608 count=4096
-7/10 aot_native_fp16_reduce ............ Passed  32×32 f16/bf16
-8/10 compiler_rvv_backend_vadd ......... Passed  rv64gcv OK
-9/10 compiler_rvv_backend_atomic ....... Passed  rv64gcv OK
-10/10 compiler_rvv_backend_fp16 ........ Passed  rv64gcv OK
-100% passed, rouge-cuda: 6/6 бит-идентично
+1/11 compiler_ptx_to_llvm .............. Passed  3747B IR
+2/11 compiler_ptx_to_llvm_shared ....... Passed  scratchpad 64B bar.sync→barrier
+3/11 compiler_ptx_to_llvm_atomics_fp16 . Passed  atom→atomicrmw half/bfloat fma
+4/11 aot_native_vadd ................... Passed  4096 elems 16×256
+5/11 aot_native_block_reduce ........... Passed  smem 1024B 16×256
+6/11 aot_native_atomic_reduce .......... Passed  sum=4608 count=4096
+7/11 aot_native_fp16_reduce ............ Passed  32×32 f16/bf16
+8/11 aot_native_gemm_tile .............. Passed  2×2 blocks 16×16
+9/11 compiler_rvv_backend_vadd ......... Passed  rv64gcv OK
+10/11 compiler_rvv_backend_atomic ...... Passed  rv64gcv OK
+11/11 compiler_rvv_backend_fp16 ........ Passed  rv64gcv OK
+100% passed, rouge-cuda: 7/7 бит-идентично
 ```
 
-`shfl`/`atom.cas`/`mma`/`.f16x2` — честный `fail` `unsupported PTX op`, не тихий мискомпил.
+`shfl` / `atom.cas` / `mma` / `.f16x2` — честный `fail` `unsupported PTX op`, не тихий мискомпил.
 
-## Почему RISC-V и когда железо
+## Почему `RISC-V` и когда уже железо
 
-Свой ISA — патенты и свой тулчейн. `rv64gcv` открыт, без роялти, RVV глотает варпы `vle32.v/vse32.v`. IR уже собирается `rv64gcv` (пока скалярно, MLIR меряет unit-stride для векторизации).
+Свой `ISA` — патенты, свой тулчейн, свой ад. `rv64gcv` открыт, без роялти, `RVV` глотает варпы `vle32.v / vse32.v`. Наш `IR` уже собирается `rv64gcv` (пока скалярно, `MLIR` меряет `unit-stride` для векторизации).
 
-Железо в 2028 — фича, не баг. Кремний без софта — растрата.
+Железо в `2028` — фича, а не баг. Кремний без софта — это сжечь `$50M`.
 
-* **Сейчас–2027:** `ptx2ir`+`rouge-cuda` на x86/RISC-V, канонические ядра.
-* **2027:** Rouge Cloud на чужих чипах + вклад в `vLLM/Triton/UXL`.
-* **2028–29:** CRIMSON V1 (чиплет, HBM, интерконнект) — клиенты не заметят переезда.
-* **2030+:** Rack-scale, `$/токен ≤50% NVIDIA` публично.
+* **Сейчас–2027:** `ptx2ir` + `rouge-cuda` на `x86 / RISC-V`, канонические ядра
+* **2027:** `Rouge Cloud` на чужих чипах + вклад в `vLLM / Triton / UXL`
+* **2028–29:** `CRIMSON V1` (чиплет, `HBM`, интерконнект) — клиенты не заметят переезда
+* **2030+:** `Rack-scale`, `$/токен ≤50% NVIDIA` публично (`tools/rouge_bench.py` → `2.79x`)
 
-Дальше: `atom.cas`/`shfl`, GEMM-тайл (основа FlashAttention), MLIR `gpu→scf→vector→rvv`, runtime Command Queue/DMA, библиотеки `rouge-gemm/attn/moe` (Apache-2.0).
+Дальше: `atom.cas` / `shfl`, `GEMM`-тайл как база `FlashAttention`, `MLIR gpu→scf→vector→rvv`, `runtime Command Queue / DMA`, библиотеки `rouge-gemm / attn / moe` (`Apache-2.0`).
 
 ## Где пощупать
 
-* **Репа:** `github.com/rouge-v/rouge-v` (заглушка, откроем после чистки; код в `software/rouge-compiler` + `rouge-ptx` + `rouge-cuda`)
-* **Собрать:**
+* **Репа:** `https://github.com/MrModelOS/ROUGE-V` — открыта, `18` тестов зелёных
+* **Собрать (30 сек):**
 
 ```sh
-cmake -S software/rouge-compiler -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
-ctest --test-dir build --output-on-failure  # 10/10
+git clone https://github.com/MrModelOS/ROUGE-V.git && cd ROUGE-V
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
+ctest --test-dir build --output-on-failure  # 11/11
+ctest --test-dir software/rouge-cuda/build  # 7/7
 ```
 
 * **IR / RVV:**
 
 ```sh
-./build/ptx2ir tests/kernels/vadd.ptx --emit-llvm -o vadd.ll && cat vadd.ll
-clang --target=riscv64-unknown-elf -march=rv64gcv -c vadd.ll -o v.o && echo "rv64gcv OK"
+./build/software/rouge-compiler/ptx2ir software/rouge-compiler/tests/kernels/vadd.ptx /tmp/vadd.ll && cat /tmp/vadd.ll
+clang --target=riscv64-unknown-elf -march=rv64gcv -c /tmp/vadd.ll -o /tmp/v.o && echo "rv64gcv OK"
 ```
 
-* **MLIR:**
+* **MLIR контур:**
 
 ```sh
 cmake -DROUGE_ENABLE_MLIR=ON -DMLIR_DIR=/path/to/llvm/lib/cmake/mlir -B b
 ./b/mlir/tools/rouge-opt/rouge-opt --rouge-simt-access-report mlir/test/simt_access_report.mlir
 ```
 
+* **`$/токен` и симулятор:**
+
+```sh
+python3 tools/rouge_bench.py tools/rouge_bench_example.json
+python3 tools/rouge_sim.py --m 128 --n 128 --k 128  # 1.015 TOPS
+```
+
 ## Призыв
 
-Мы не «убьём NVIDIA». Мы делаем монополию ненужной для инференса. Если ваш `PyTorch/vLLM/TensorRT` едет без правок и дешевле — вам всё равно, какой чип внутри.
+Мы не «убьём `NVIDIA`». Мы делаем её монополию ненужной для `инференса`. Если ваш `PyTorch / vLLM / TensorRT` едет без правок и дешевле — вам всё равно, какой чип внутри.
 
-* ⭐ на репе, когда откроем.
-* Контрибьют: `ptx2ir` — 900 строк C++, first issue — `shfl`/`atom.cas`.
-* Стартап/облако, где душит `$/токен` — напишите, прогоним ваш workload.
+* ⭐ на репе — это ваш голос за открытый стек
+* Контрибьют: `ptx2ir` — 900 строк `C++`, первый `good first issue` — `shfl` / `atom.cas`
+* Стартап / облако, где душит `$/токен` — напишите, прогоним ваш `workload`
 
-P.S. Мне 16. Могу ошибаться в половине вещей. Но `ctest` не врёт: 10/10 и 6/6.
+P.S. Мне 16. В половине вещей могу ошибаться. Но `ctest` не врёт: `11/11` и `7/7`.
 
 ---
-*ROUGE-V — «красное V». Код: `software/rouge-compiler`, `rouge-ptx`, `rouge-cuda`. Доки: `docs/00-vision.md`→`05-roadmap`, решения `decisions/ADR-0001…0006`.*
+*`ROUGE-V` — «красное `V`». Код: `software/rouge-compiler`, `rouge-ptx`, `rouge-cuda`. Доки: `docs/00-vision.md` → `05-roadmap`, решения `decisions/ADR-0001…0006`.*
