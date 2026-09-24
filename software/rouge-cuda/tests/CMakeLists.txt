@@ -7,12 +7,13 @@ add_test(NAME driver_vadd COMMAND test_driver_vadd)
 # The headers are generated from the .ptx files so both paths execute
 # byte-identical PTX.
 set(KERNEL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-compiler/tests/kernels)
-foreach(kern block_reduce atomic_reduce fp16_reduce gemm_tile)
+foreach(kern block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas)
   string(TOUPPER ${kern} KERN_UC)
   string(REPLACE "BLOCK_REDUCE" "BlockReduce" KERN_CAMEL ${KERN_UC})
   string(REPLACE "ATOMIC_REDUCE" "AtomicReduce" KERN_CAMEL ${KERN_CAMEL})
   string(REPLACE "FP16_REDUCE" "Fp16Reduce" KERN_CAMEL ${KERN_CAMEL})
   string(REPLACE "GEMM_TILE" "GemmTile" KERN_CAMEL ${KERN_CAMEL})
+  string(REPLACE "ATOM_CAS" "AtomCas" KERN_CAMEL ${KERN_CAMEL})
   add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}_ptx.h
     COMMAND ${CMAKE_COMMAND}

@@ -1,0 +1,65 @@
+.version 8.0
+.target sm_80
+.address_size 64
+
+// ROUGE-V test kernel: warp reduction via shfl.bfly.
+// Each warp (32 threads) loads data[globalIdx] and reduces via butterfly
+// shuffle + fadd. The sum of the warp is written by lane 0 to out[blockIdx].
+// Exercises shfl.bfly.b32 fallback (warp=32, lane=tid.x%32) in both paths:
+// interpreter does cross-lane copy, AOT is scalar identity (doubling) — verified
+// only via structural/interpreter path; the PTX itself is the correctness
+// reference for the future MLIR vectorizer.
+
+.visible .entry shfl_reduce(
+    .param .u64 shfl_param_0,
+    .param .u64 shfl_param_1,
+    .param .u32 shfl_param_2
+)
+{
+    .reg .b32 %r<14>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [shfl_param_0];
+    ld.param.u64 %rd2, [shfl_param_1];
+    ld.param.u32 %r1, [shfl_param_2];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mul.wide.u32 %rd3, %r2, %r3;
+    mov.u32 %r4, %tid.x;
+    cvt.u64.u32 %rd4, %r4;
+    add.s64 %rd3, %rd3, %rd4;
+    cvt.u32.u64 %r5, %rd3;
+
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_RET;
+
+    mul.wide.u32 %rd4, %r5, 4;
+    add.s64 %rd1, %rd1, %rd4;
+    ld.global.f32 %r7, [%rd1];
+
+    // butterfly reduction: offset 16,8,4,2,1
+    shfl.bfly.b32 %r8, %r7, 16, 0x1f;
+    add.f32 %r7, %r7, %r8;
+    shfl.bfly.b32 %r8, %r7, 8, 0x1f;
+    add.f32 %r7, %r7, %r8;
+    shfl.bfly.b32 %r8, %r7, 4, 0x1f;
+    add.f32 %r7, %r7, %r8;
+    shfl.bfly.b32 %r8, %r7, 2, 0x1f;
+    add.f32 %r7, %r7, %r8;
+    shfl.bfly.b32 %r8, %r7, 1, 0x1f;
+    add.f32 %r7, %r7, %r8;
+
+    setp.eq.u32 %p1, %r4, 0;
+    @%p1 bra L_STORE;
+    bra L_RET;
+
+L_STORE:
+    mul.wide.u32 %rd4, %r2, 4;
+    add.s64 %rd2, %rd2, %rd4;
+    st.global.f32 [%rd2], %r7;
+
+L_RET:
+    ret;
+}

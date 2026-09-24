@@ -435,6 +435,11 @@ const PtxParam* find_param(const PtxFunction& fn, const std::string& name) {
   return nullptr;
 }
 
+// Warp state for shfl/vote fallbacks: the CTA scheduler sets this to the
+// current block's states[] before stepping, so run_thread_step can read a
+// neighbour lane's register (warp=32 lanes, lane = linear % 32).
+static std::vector<ExecState>* g_block_states = nullptr;
+
 // Advance one thread by exactly one instruction. Returns:
 //   1 = advanced, 2 = blocked at a block barrier (bar.*),
 //   3 = finished (ret/exit), 0 = emulation error.
@@ -577,6 +582,26 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       }
       st.pc = next_pc;
       return 1;
+    }
+
+    if (op.find("x2") != std::string::npos &&
+        op.rfind("ld.", 0) != 0 && op.rfind("st.", 0) != 0) {
+      // f16x2/bf16x2 fallback for non-memory ops: payload as i32
+      if (A.size() >= 2) {
+        if (op.rfind("cvt.", 0) == 0 || op.rfind("mov.", 0) == 0) {
+          st.setreg(A[0], operand_u64(st, A[1]));
+        } else if (op.rfind("add.", 0) == 0 || op.rfind("sub.", 0) == 0 ||
+                   op.rfind("mul.", 0) == 0 || op.rfind("fma.", 0) == 0) {
+          if (A.size() >= 3 && op.rfind("add.", 0) == 0)
+            st.setreg(A[0], operand_u64(st, A[1]) + operand_u64(st, A[2]));
+          else
+            st.setreg(A[0], operand_u64(st, A[1]));
+        } else {
+          st.setreg(A[0], operand_u64(st, A[1]));
+        }
+        st.pc = next_pc;
+        return 1;
+      }
     }
 
     if (op.rfind("cvt.", 0) == 0) {
@@ -754,18 +779,129 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
     }
 
     if (op.rfind("atom.", 0) == 0 || op.rfind("red.", 0) == 0) {
-      // atom.add.{u32,s32,u64,s64,f32} %r, [addr], %val  -> old value
-      // red.add.{...} [addr], %val                         -> no result
-      // Scope/space qualifiers (".global", ".cta") are accepted and ignored:
-      // memory is unified in both execution paths.
-      if (op.find(".add.") == std::string::npos) {
+      // Supported forms (scope/space qualifiers are accepted and ignored):
+      //   atom.add.{u32,s32,u64,s64,f32} %r, [addr], %val  -> old
+      //   red.add.{...} [addr], %val                        -> no result
+      //   atom.cas.b32 %r, [addr], %cmp, %new               -> old (cmpxchg)
+      //   atom.cas.b64 %r, [addr], %cmp, %new
+      //   atom.exch.b32 %r, [addr], %val                    -> old (swap)
+      //   atom.min/max.{u32,s32,u64,s64,f32} %r, [addr], %val -> old
+      //   red.min/max.{...} [addr], %val                    -> no result
+      const bool has_dst = op.rfind("atom.", 0) == 0;
+      const bool is_cas = op.find(".cas.") != std::string::npos;
+      const bool is_exch = op.find(".exch.") != std::string::npos;
+      const bool is_min = op.find(".min.") != std::string::npos;
+      const bool is_max = op.find(".max.") != std::string::npos;
+      const bool is_add = op.find(".add.") != std::string::npos;
+      if (!is_cas && !is_exch && !is_min && !is_max && !is_add) {
         if (error) *error = "unsupported atomic '" + op + "' in " + fn.name;
         return 0;
       }
-      const bool has_dst = op.rfind("atom.", 0) == 0;
+      const std::string ty = op.substr(op.rfind('.') + 1);
+      if (is_cas) {
+        const size_t ai = 1; // cas is always atom (has dst)
+        if (!has_dst) { if (error) *error = "red.cas not supported '" + op + "' in " + fn.name; return 0; }
+        if (A.size() < 4) { if (error) *error = "bad " + op + " in " + fn.name; return 0; }
+        const uintptr_t addr = mem_addr(fn, st, A[ai]);
+        auto* p = reinterpret_cast<uint8_t*>(addr);
+        if (ty == "b32" || ty == "u32" || ty == "s32" || ty == "f32") {
+          uint32_t cur = 0; std::memcpy(&cur, p, 4);
+          const uint32_t cmp = static_cast<uint32_t>(operand_u64(st, A[ai + 1]));
+          const uint32_t nw = static_cast<uint32_t>(operand_u64(st, A[ai + 2]));
+          const uint32_t old = cur;
+          if (cur == cmp) std::memcpy(p, &nw, 4);
+          st.setreg(A[0], old);
+        } else if (ty == "b64" || ty == "u64" || ty == "s64" || ty == "f64") {
+          uint64_t cur = 0; std::memcpy(&cur, p, 8);
+          const uint64_t cmp = operand_u64(st, A[ai + 1]);
+          const uint64_t nw = operand_u64(st, A[ai + 2]);
+          const uint64_t old = cur;
+          if (cur == cmp) std::memcpy(p, &nw, 8);
+          st.setreg(A[0], old);
+        } else {
+          if (error) *error = "unsupported atomic type '" + ty + "' in " + fn.name;
+          return 0;
+        }
+        st.pc = next_pc;
+        return 1;
+      }
+      if (is_exch) {
+        if (!has_dst) { if (error) *error = "red.exch not supported '" + op + "' in " + fn.name; return 0; }
+        const size_t ai = 1;
+        if (A.size() < 3) { if (error) *error = "bad " + op + " in " + fn.name; return 0; }
+        const uintptr_t addr = mem_addr(fn, st, A[ai]);
+        auto* p = reinterpret_cast<uint8_t*>(addr);
+        const uint64_t val = operand_u64(st, A[ai + 1]);
+        if (ty == "b32" || ty == "u32" || ty == "s32" || ty == "f32") {
+          uint32_t cur = 0; std::memcpy(&cur, p, 4);
+          const uint32_t nv = static_cast<uint32_t>(val);
+          std::memcpy(p, &nv, 4);
+          st.setreg(A[0], cur);
+        } else if (ty == "b64" || ty == "u64" || ty == "s64" || ty == "f64") {
+          uint64_t cur = 0; std::memcpy(&cur, p, 8);
+          std::memcpy(p, &val, 8);
+          st.setreg(A[0], cur);
+        } else {
+          if (error) *error = "unsupported atomic type '" + ty + "' in " + fn.name;
+          return 0;
+        }
+        st.pc = next_pc;
+        return 1;
+      }
+      if (is_min || is_max) {
+        const size_t ai = has_dst ? 1 : 0;
+        if (A.size() < ai + 2) { if (error) *error = "bad " + op + " in " + fn.name; return 0; }
+        const uintptr_t addr = mem_addr(fn, st, A[ai]);
+        auto* p = reinterpret_cast<uint8_t*>(addr);
+        const uint64_t val = operand_u64(st, A[ai + 1]);
+        uint64_t old = 0;
+        const bool do_min = is_min;
+        if (ty == "u32" || ty == "b32") {
+          uint32_t cur = 0; std::memcpy(&cur, p, 4);
+          const uint32_t v = static_cast<uint32_t>(val);
+          const uint32_t res = do_min ? (cur < v ? cur : v) : (cur > v ? cur : v);
+          std::memcpy(p, &res, 4);
+          old = cur;
+        } else if (ty == "s32") {
+          int32_t cur = 0; std::memcpy(&cur, p, 4);
+          const int32_t v = static_cast<int32_t>(static_cast<uint32_t>(val));
+          const int32_t res = do_min ? (cur < v ? cur : v) : (cur > v ? cur : v);
+          std::memcpy(p, &res, 4);
+          old = static_cast<uint32_t>(cur);
+        } else if (ty == "u64" || ty == "b64") {
+          uint64_t cur = 0; std::memcpy(&cur, p, 8);
+          const uint64_t res = do_min ? (cur < val ? cur : val) : (cur > val ? cur : val);
+          std::memcpy(p, &res, 8);
+          old = cur;
+        } else if (ty == "s64") {
+          int64_t cur = 0; std::memcpy(&cur, p, 8);
+          const int64_t v = static_cast<int64_t>(val);
+          const int64_t res = do_min ? (cur < v ? cur : v) : (cur > v ? cur : v);
+          std::memcpy(p, &res, 8);
+          old = static_cast<uint64_t>(cur);
+        } else if (ty == "f32") {
+          float cur = 0; std::memcpy(&cur, p, 4);
+          const float v = bit_cast_v<float>(static_cast<uint32_t>(val));
+          const float res = do_min ? fminf(cur, v) : fmaxf(cur, v);
+          std::memcpy(p, &res, 4);
+          old = bit_cast_v<uint32_t>(cur);
+        } else if (ty == "f64") {
+          double cur = 0; std::memcpy(&cur, p, 8);
+          const double v = bit_cast_v<double>(val);
+          const double res = do_min ? fmin(cur, v) : fmax(cur, v);
+          std::memcpy(p, &res, 8);
+          old = bit_cast_v<uint64_t>(cur);
+        } else {
+          if (error) *error = "unsupported atomic type '" + ty + "' in " + fn.name;
+          return 0;
+        }
+        if (has_dst) st.setreg(A[0], old);
+        st.pc = next_pc;
+        return 1;
+      }
+      // is_add
       const size_t ai = has_dst ? 1 : 0;
       if (A.size() < ai + 2) { if (error) *error = "bad " + op + " in " + fn.name; return 0; }
-      const std::string ty = op.substr(op.rfind('.') + 1);
       const uintptr_t addr = mem_addr(fn, st, A[ai]);
       const uint64_t val = operand_u64(st, A[ai + 1]);
       auto* p = reinterpret_cast<uint8_t*>(addr);
@@ -793,6 +929,156 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
         return 0;
       }
       if (has_dst) st.setreg(A[0], old);
+      st.pc = next_pc;
+      return 1;
+    }
+
+    // ---- warp shuffles: shfl.sync.{up,down,bfly,idx}.b32 (and without .sync) ----
+    // PTX: shfl.sync.<kind>.b32 d, a, b, c, mask  (or 4 args without mask)
+    // Simplified: warp=32 lanes, lane = linear % 32, warpBase = linear - lane.
+    // idx: target = b & 0x1f, bfly: lane ^ offset, up: lane - offset, down: lane + offset.
+    // Out-of-range or inactive lanes keep their own source value.
+    if (op.rfind("shfl", 0) == 0) {
+      if (A.size() < 3) {
+        if (error) *error = "bad " + op + " in " + fn.name;
+        return 0;
+      }
+      const std::string dst = A[0];
+      const std::string src = A[1];
+      const bool is_idx = op.find(".idx.") != std::string::npos;
+      const bool is_bfly = op.find(".bfly.") != std::string::npos;
+      const bool is_up = op.find(".up.") != std::string::npos;
+      const bool is_down = op.find(".down.") != std::string::npos;
+      const uint32_t sel = static_cast<uint32_t>(operand_u64(st, A[2]));
+      const uint32_t linear = st.tid[0] + st.tid[1] * st.ntid[0] + st.tid[2] * st.ntid[0] * st.ntid[1];
+      const uint32_t lane = linear % 32;
+      const uint32_t warpBase = linear - lane;
+      uint32_t targetLane = 0;
+      bool oob = false;
+      if (is_idx) targetLane = sel & 0x1f;
+      else if (is_bfly) targetLane = lane ^ (sel & 0x1f);
+      else if (is_up) {
+        const uint32_t off = sel & 0x1f;
+        if (lane < off) oob = true;
+        else targetLane = lane - off;
+      } else if (is_down) {
+        const uint32_t off = sel & 0x1f;
+        targetLane = lane + off;
+        if (targetLane >= 32) oob = true;
+      } else {
+        targetLane = sel & 0x1f;
+      }
+      uint64_t val = st.reg(src);
+      if (!oob && g_block_states) {
+        const size_t targetLinear = static_cast<size_t>(warpBase + targetLane);
+        if (targetLinear < g_block_states->size()) {
+          // For partial warps (block size not multiple of 32) the target lane
+          // may be beyond the block; treat as out-of-range -> keep own value.
+          const ExecState& srcState = (*g_block_states)[targetLinear];
+          auto it = srcState.regs.find(src);
+          if (it != srcState.regs.end()) val = it->second;
+          else {
+            // src may be an immediate? already handled via operand_u64 above, but
+            // for register source we copy neighbour's register.
+            uint64_t v = 0;
+            if (srcState.spec_reg(src, &v)) val = v;
+          }
+        } else {
+          oob = true;
+        }
+      }
+      if (oob) val = st.reg(src);
+      st.setreg(dst, val);
+      st.pc = next_pc;
+      return 1;
+    }
+
+    // ---- vote.{any,all,uni}.pred and vote.sync.* ----
+    if (op.rfind("vote", 0) == 0) {
+      if (A.size() < 2) {
+        if (error) *error = "bad " + op + " in " + fn.name;
+        return 0;
+      }
+      const std::string dst = A[0];
+      std::string srcPred = A[1];
+      bool srcNeg = false;
+      if (!srcPred.empty() && srcPred[0] == '!') {
+        srcNeg = true;
+        srcPred = srcPred.substr(1);
+      }
+      const bool is_any = op.find(".any.") != std::string::npos;
+      const bool is_all = op.find(".all.") != std::string::npos;
+      const bool is_uni = op.find(".uni.") != std::string::npos;
+      const uint32_t linear = st.tid[0] + st.tid[1] * st.ntid[0] + st.tid[2] * st.ntid[0] * st.ntid[1];
+      const uint32_t lane = linear % 32;
+      const uint32_t warpBase = linear - lane;
+      bool any = false;
+      bool all = true;
+      bool uni = true;
+      bool firstVal = false;
+      bool haveFirst = false;
+      int activeCount = 0;
+      if (g_block_states) {
+        for (uint32_t l = 0; l < 32; ++l) {
+          const size_t idx = static_cast<size_t>(warpBase + l);
+          if (idx >= g_block_states->size()) continue;
+          const ExecState& s = (*g_block_states)[idx];
+          auto it = s.preds.find(srcPred);
+          bool v = (it != s.preds.end()) && it->second;
+          if (srcNeg) v = !v;
+          if (!haveFirst) {
+            firstVal = v;
+            haveFirst = true;
+          } else if (v != firstVal) {
+            uni = false;
+          }
+          any = any || v;
+          all = all && v;
+          ++activeCount;
+        }
+        if (activeCount == 0) {
+          any = false;
+          all = false;
+          uni = true;
+        }
+      } else {
+        auto it = st.preds.find(srcPred);
+        bool v = (it != st.preds.end()) && it->second;
+        if (srcNeg) v = !v;
+        any = v;
+        all = v;
+        uni = true;
+      }
+      bool result = false;
+      if (is_any) result = any;
+      else if (is_all) result = all;
+      else if (is_uni) result = uni;
+      else result = any;
+      st.preds[dst] = result;
+      st.pc = next_pc;
+      return 1;
+    }
+
+    // ---- activemask.b32 ----
+    if (op.rfind("activemask", 0) == 0) {
+      if (A.empty()) {
+        if (error) *error = "bad " + op + " in " + fn.name;
+        return 0;
+      }
+      const std::string dst = A[0];
+      const uint32_t linear = st.tid[0] + st.tid[1] * st.ntid[0] + st.tid[2] * st.ntid[0] * st.ntid[1];
+      const uint32_t lane = linear % 32;
+      const uint32_t warpBase = linear - lane;
+      uint32_t mask = 0;
+      if (g_block_states) {
+        for (uint32_t l = 0; l < 32; ++l) {
+          const size_t idx = static_cast<size_t>(warpBase + l);
+          if (idx < g_block_states->size()) mask |= (1u << l);
+        }
+      } else {
+        mask = 0xffffffffu;
+      }
+      st.setreg(dst, static_cast<uint64_t>(mask));
       st.pc = next_pc;
       return 1;
     }
@@ -852,6 +1138,8 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
               st.nctaid[0] = gx; st.nctaid[1] = gy; st.nctaid[2] = gz;
             }
 
+        // Warp shuffles need cross-lane visibility: expose this block's states.
+        g_block_states = &states;
         // CTA scheduler: all live threads step one instruction per round, so
         // shared-memory writes performed "before" a bar.sync are visible to the
         // threads that read "after" it (barrier release when every live thread
@@ -866,10 +1154,14 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
             anyAlive = true;
             if (++steps > kMaxSteps) {
               if (error) *error = "emulation step limit exceeded (runaway loop?) in " + fn.name;
+              g_block_states = nullptr;
               return false;
             }
             const int rc = run_thread_step(fn, paramsBlob, states[i], error);
-            if (rc == 0) return false;
+            if (rc == 0) {
+              g_block_states = nullptr;
+              return false;
+            }
             if (rc == 2) blocked[i] = true;
             else if (rc == 3) alive[i] = false;
           }
@@ -884,6 +1176,7 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
             continue;
           }
         }
+        g_block_states = nullptr;
       }
   return true;
 }

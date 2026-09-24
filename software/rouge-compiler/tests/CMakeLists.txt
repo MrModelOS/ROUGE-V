@@ -13,14 +13,26 @@ add_executable(test_ptx_to_llvm_atomics_fp16 test_ptx_to_llvm_atomics_fp16.cpp)
 target_link_libraries(test_ptx_to_llvm_atomics_fp16 PRIVATE rouge-compiler-lib rouge-ptx)
 add_test(NAME compiler_ptx_to_llvm_atomics_fp16 COMMAND test_ptx_to_llvm_atomics_fp16)
 
+# ---- Test 1d: cas / exch / min / max lowering ----
+add_executable(test_ptx_to_llvm_atom_cas test_ptx_to_llvm_atom_cas.cpp)
+target_link_libraries(test_ptx_to_llvm_atom_cas PRIVATE rouge-compiler-lib rouge-ptx)
+add_test(NAME compiler_ptx_to_llvm_atom_cas COMMAND test_ptx_to_llvm_atom_cas)
+
 set(VADD_PTX ${CMAKE_CURRENT_SOURCE_DIR}/kernels/vadd.ptx)
 set(BLOCK_REDUCE_PTX ${CMAKE_CURRENT_SOURCE_DIR}/kernels/block_reduce.ptx)
 set(ATOMIC_REDUCE_PTX ${CMAKE_CURRENT_SOURCE_DIR}/kernels/atomic_reduce.ptx)
 set(FP16_REDUCE_PTX ${CMAKE_CURRENT_SOURCE_DIR}/kernels/fp16_reduce.ptx)
 set(GEMM_TILE_PTX ${CMAKE_CURRENT_SOURCE_DIR}/kernels/gemm_tile.ptx)
+set(ATOM_CAS_PTX ${CMAKE_CURRENT_SOURCE_DIR}/kernels/atom_cas.ptx)
+set(SHFL_REDUCE_PTX ${CMAKE_CURRENT_SOURCE_DIR}/kernels/shfl_reduce.ptx)
+
+# ---- Test 1e: warp shuffles + vote + activemask (structural) ----
+add_executable(test_ptx_to_llvm_warp test_ptx_to_llvm_warp.cpp)
+target_link_libraries(test_ptx_to_llvm_warp PRIVATE rouge-compiler-lib rouge-ptx)
+add_test(NAME compiler_ptx_to_llvm_warp COMMAND test_ptx_to_llvm_warp)
 
 # Stage 1 always runs: PTX -> LLVM IR via our translator CLI.
-foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile)
+foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce)
   add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
     COMMAND ptx2ir ${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kern}.ptx
@@ -33,7 +45,7 @@ endforeach()
 find_program(CLANG_EXECUTABLE clang)
 if(CLANG_EXECUTABLE)
   # Compile one IR module per canonical kernel: ptx2ir -> clang -O2 -> .o
-  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile)
+  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce)
     add_custom_command(
       OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.o
       COMMAND ${CLANG_EXECUTABLE} -O2 -c ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
@@ -68,6 +80,18 @@ if(CLANG_EXECUTABLE)
                  ${CMAKE_CURRENT_BINARY_DIR}/gemm_tile.o)
   target_link_libraries(test_aot_gemm_tile PRIVATE rouge-runtime)
   add_test(NAME aot_native_gemm_tile COMMAND test_aot_gemm_tile)
+
+  # Test 2f: cas / exch / min / max (atom_cas kernel).
+  add_executable(test_aot_atom_cas test_aot_atom_cas.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/atom_cas.o)
+  target_link_libraries(test_aot_atom_cas PRIVATE rouge-runtime)
+  add_test(NAME aot_native_atom_cas COMMAND test_aot_atom_cas)
+
+  # Test 2g: warp shuffle reduction (shfl.bfly — one warp per block, AOT scalar fallback).
+  add_executable(test_aot_shfl_reduce test_aot_shfl_reduce.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/shfl_reduce.o)
+  target_link_libraries(test_aot_shfl_reduce PRIVATE rouge-runtime)
+  add_test(NAME aot_native_shfl_reduce COMMAND test_aot_shfl_reduce)
 
   # ---- Test 3 (informational): same IR through the RISC-V backend ----
   # Compiles the IR for riscv64 with the vector extension (rv64gcv). Reports
