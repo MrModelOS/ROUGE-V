@@ -701,8 +701,8 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
 
     if (op.rfind("setp.", 0) == 0) {
       if (A.size() < 3) { if (error) *error = "bad setp in " + fn.name; return 0; }
-      const uint32_t x = static_cast<uint32_t>(st.reg(A[1]));
-      const uint32_t y = static_cast<uint32_t>(st.reg(A[2]));
+      const uint32_t x = static_cast<uint32_t>(operand_u64(st, A[1]));
+      const uint32_t y = static_cast<uint32_t>(operand_u64(st, A[2]));
       const size_t d1 = op.find('.');
       std::string cond = (d1 == std::string::npos) ? "ge" : op.substr(d1 + 1);
       const size_t d2 = cond.find('.');
