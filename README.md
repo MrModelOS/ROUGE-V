@@ -40,14 +40,54 @@ enables the vendor-PTX test.
 
 ### Use
 
-```sh
-./build/rouge-compiler/ptx2ir \
-    software/rouge-compiler/tests/kernels/vadd.ptx /tmp/vadd.ll
+The question a user has is "will you translate my kernel?". One command answers it:
 
-clang -O2 -c /tmp/vadd.ll -o /tmp/vadd.o                  # host
-clang --target=riscv64-unknown-elf -march=rv64gcv \
-      -c /tmp/vadd.ll -o /tmp/vadd-rv64.o                 # RISC-V + Vector
+```sh
+./build/rouge-compiler/rouge-run kernel.ptx
 ```
+
+```
+input: kernel.ptx
+kernels found: 1
+  @gemm_tile  params=3  instructions=67
+  shared memory: 1024 bytes in 2 variable(s)
+    shA          @   0     512 bytes  (.b16 x 256)
+    shB          @ 512     512 bytes  (.b16 x 256)
+translation: ok (10869 bytes of LLVM IR)
+
+OK
+```
+
+Outside the supported subset you get a refusal, not a wrong answer:
+
+```
+rouge-run: REFUSED: unsupported PTX op 'mma.sync.aligned.m16n8k16...' @ 4
+This instruction is outside the supported subset. Nothing was emitted;
+nothing was approximated.
+```
+
+Emit a native object, or inspect the IR directly:
+
+```sh
+./build/rouge-compiler/rouge-run kernel.ptx -o kernel.o --print-ir
+./build/rouge-compiler/ptx2ir kernel.ptx kernel.ll
+```
+
+Target RISC-V instead of the host:
+
+```sh
+clang --target=riscv64-unknown-elf -march=rv64gcv -c kernel.ll -o kernel-rv64.o
+```
+
+Where the PTX comes from:
+
+```sh
+nvcc -arch=sm_75 -ptx kernel.cu -o kernel.ptx   # build from CUDA source
+cuobjdump -ptx ./my_app > kernel.ptx             # extract from a fatbin
+```
+
+[QUICKSTART.md](QUICKSTART.md) covers the rest, including the minimal host
+driver needed to launch a translated kernel.
 
 ```
 $ ctest --test-dir build

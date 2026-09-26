@@ -28,7 +28,7 @@
 
 `nvcc` компилирует `.cu` не в машинный код GPU, а в **PTX** — текстовый ассемблер, опубликованный в открытой спецификации. Дальше:
 
-```
+```text
 CUDA-код → PTX → rouge-ptx → ptx2ir → LLVM IR → clang → нативный бинарник
                                             └→ rv64gcv (RISC-V + Vector)
 ```
@@ -65,7 +65,7 @@ define void @vadd(i64 %arg0, i64 %arg1, i64 %arg2, i32 %arg3, ptr %launch) {
 | RISC-V Vector (`rv64gcv`) | тот же IR | ✅ |
 | MLIR-контур | анализ SIMT-паттернов | контур |
 
-```
+```console
 $ ctest --output-on-failure
  1/16 compiler_ptx_to_llvm .................  Passed
  4/16 aot_native_vadd ......................  Passed  4096 elems 16×256

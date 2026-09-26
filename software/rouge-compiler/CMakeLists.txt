@@ -23,6 +23,11 @@ target_link_libraries(rouge-compiler-lib PUBLIC rouge-ptx)
 add_executable(ptx2ir src/ptx2ir_main.cpp)
 target_link_libraries(ptx2ir PRIVATE rouge-compiler-lib)
 
+# ---- CLI: rouge-run <kernel.ptx> [-o kernel.o] ----
+# Translates a kernel and verifies the result survives a real backend.
+add_executable(rouge-run src/rouge_run_main.cpp)
+target_link_libraries(rouge-run PRIVATE rouge-compiler-lib)
+
 # ---- Host runtime: C-API helpers for AOT kernels (barriers, launch state) ----
 # Seed of the libcudart/libcuda replacement; host pthread backend.
 find_package(Threads REQUIRED)
