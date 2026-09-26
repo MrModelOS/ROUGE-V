@@ -6,18 +6,19 @@
 #      toolchain, makes the whole platform report SKIP (exit code 0) instead of
 #      failing the test run - same policy as check_rvv_backend.cmake;
 #   2. runs our own ptx2ir with --target <triple>;
-#   3. checks that the emitted IR really carries the requested target triple and
-#      the target-correct GPU address spaces. These two assertions depend only on
-#      our translator, never on the host toolchain, so a violation is a genuine
-#      regression and fails the test;
+#   3. checks that the emitted IR really carries the requested target triple,
+#      the target-correct GPU address spaces, and (NVPTX only) a launchable
+#      kernel shape: calling convention 71 with no host launch descriptor.
+#      All of these depend only on our translator, never on the host toolchain,
+#      so a violation is a genuine regression and fails the test;
 #   4. compiles the IR with clang for that target and checks an object appeared.
 #
-# Failure policy (see check_rvv_backend.cmake for the "informational" style):
+# Failure policy:
 #   * environment problem (no backend, no ROCm)      -> STATUS "SKIP", exit 0
 #   * our translator or the IR contract is wrong     -> FATAL_ERROR
-#   * clang rejects our IR although the probe passed -> STATUS "SKIP" by default,
-#     because that is a host toolchain quirk (LLVM version, missing device libs);
-#     pass -DSTRICT=ON to turn it into a hard failure.
+#   * clang rejects our IR although the probe passed -> FATAL_ERROR, because the
+#     probe already established that this host can target that triple, so the
+#     fault is in the IR rather than in the toolchain.
 #
 # Required variables:
 #   CLANG       clang executable
@@ -28,17 +29,13 @@
 #   KERNELS     comma separated kernel names, e.g. "vadd,block_reduce"
 #   PLATFORMS   comma separated "name|triple|flag1+flag2" specs,
 #               e.g. "amdgpu|amdgcn-amd-amdhsa|-mcpu=gfx1100+-O2"
-# Optional:
-#   STRICT      ON -> "clang rejected our IR" fails the test instead of skipping
+# Optional: none. There is deliberately no "skip when clang complains" switch:
+# once the backend probe has passed, a clang complaint is our bug.
 #
 # Note on separators: these values travel through the CTest command line as one
 # -D argument each, where a ';' splits the argument into several and a space
 # splits it as well. Hence commas between list items and '+' between the flags
 # of one spec; both are turned into proper CMake lists below.
-
-if(NOT DEFINED STRICT)
-  set(STRICT OFF)
-endif()
 
 foreach(req CLANG PTX2IR KERNEL_DIR IR_FILE OUT_FILE KERNELS PLATFORMS)
   if(NOT DEFINED ${req} OR "${${req}}" STREQUAL "")
@@ -144,6 +141,27 @@ function(rouge_addrspace_contract triple out_req out_forbid)
   set(${out_forbid} "${forbid}" PARENT_SCOPE)
 endfunction()
 
+# rouge_kernel_contract(<triple> <out_cc> <out_forbid_text>)
+# A PTX .entry kernel aimed at a real GPU must be built the way that GPU
+# launches one, not the way the host calls a function:
+#   * calling convention 71 is LLVM's NVVM_KERNEL, which is what makes the
+#     backend emit ".visible .entry" instead of ".visible .func";
+#   * the launch descriptor must be gone, because on a GPU the grid shape comes
+#     from the hardware registers and the block scratchpad from the shared
+#     window; an IR that still reads it cannot be launched.
+# Only NVPTX is a real kernel target so far: AMDGPU still uses the host
+# calling convention, so it is deliberately excluded rather than silently
+# exempted.
+function(rouge_kernel_contract triple out_cc out_forbid)
+  if(triple MATCHES "^nvptx")
+    set(${out_cc} "cc 71" PARENT_SCOPE)
+    set(${out_forbid} "%launch" PARENT_SCOPE)
+  else()
+    set(${out_cc} "" PARENT_SCOPE)
+    set(${out_forbid} "" PARENT_SCOPE)
+  endif()
+endfunction()
+
 set(ok_cells 0)
 set(skipped_cells 0)
 
@@ -191,6 +209,7 @@ foreach(spec IN LISTS MATRIX_PLATFORMS)
   endif()
 
   rouge_addrspace_contract("${triple}" AS_REQUIRED AS_FORBIDDEN)
+  rouge_kernel_contract("${triple}" KERNEL_CC KERNEL_FORBID)
 
   set(platform_ok 0)
   foreach(kern IN LISTS MATRIX_KERNELS)
@@ -235,6 +254,23 @@ foreach(spec IN LISTS MATRIX_PLATFORMS)
                    "IR uses addrspace(${as}) which does not belong to ${triple}")
       endif()
     endforeach()
+    # ---- step 3b: NVPTX IR must be a launchable kernel, not a host function --
+    if(NOT KERNEL_CC STREQUAL "")
+      string(FIND "${ir_text}" "${KERNEL_CC} void" _cc_at)
+      if(_cc_at EQUAL -1)
+        message(FATAL_ERROR "gpu target matrix: FAILED - ${pname}/${kern}: "
+                   "NVPTX IR lacks \"${KERNEL_CC}\", so the backend would emit "
+                   "\".func\" instead of a launchable \".entry\" kernel")
+      endif()
+    endif()
+    if(NOT KERNEL_FORBID STREQUAL "")
+      string(FIND "${ir_text}" "${KERNEL_FORBID}" _lf_at)
+      if(NOT _lf_at EQUAL -1)
+        message(FATAL_ERROR "gpu target matrix: FAILED - ${pname}/${kern}: "
+                   "NVPTX IR still references the host \"${KERNEL_FORBID}\" "
+                   "descriptor, which does not exist on a GPU")
+      endif()
+    endif()
 
     # ---- step 4: the real backend must accept the result ----
     execute_process(
@@ -245,15 +281,14 @@ foreach(spec IN LISTS MATRIX_PLATFORMS)
       ERROR_VARIABLE err)
     string(STRIP "${err}" err)
     rouge_condense("${err}" err)
+    # Step 1 already proved this clang has a working backend for the triple: it
+    # compiled a trivial module for it. If clang then rejects the IR we produced,
+    # the fault is in that IR, not in the host toolchain. Skipping here is what
+    # let a genuinely broken AMD build pass as "informational" once already.
     if(NOT rc EQUAL 0)
-      if(STRICT)
-        message(FATAL_ERROR "gpu target matrix: FAILED - ${pname}/${kern}: "
-                   "clang rejected the IR for ${triple} (exit ${rc}): ${err}")
-      else()
-        message(STATUS "gpu target matrix: SKIP ${pname}/${kern} (clang exit ${rc}: ${err})")
-        set(skipped_cells 1)
-        continue()
-      endif()
+      message(FATAL_ERROR "gpu target matrix: FAILED - ${pname}/${kern}: "
+                 "clang rejected the IR for ${triple} (exit ${rc}) although the "
+                 "backend probe passed: ${err}")
     endif()
     if(NOT EXISTS "${obj_file}")
       message(FATAL_ERROR "gpu target matrix: FAILED - ${pname}/${kern}: "

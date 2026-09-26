@@ -171,6 +171,8 @@ class LlvmGen {
   const rouge::PtxProgram* prog_ = nullptr;  // for module-scope .global decls
   std::string target_ = "x86_64-pc-linux-gnu";
   std::set<std::string> shared_addr_regs_;  // written by cvta.to.shared
+  std::string smem_sym_;    // GPU block scratchpad global
+  std::string smem_decl_;  // its module-level declaration, emitted with the header
   // Pointer type per SSA value, so memory operations can print "ptr addrspace(N)"
   // for GPU targets and plain "ptr" for CPU targets.
   std::map<std::string, std::string> ptr_ty_;
@@ -390,8 +392,16 @@ class LlvmGen {
     return "";
   }
 
-  // CUDA special register read from the launch descriptor (always i32).
+  // CUDA special register read. On the host these come out of the launch
+  // descriptor; on a GPU they are hardware registers reached through NVVM.
+  // Either way the result is the thread's index and nothing else depends on
+  // where it came from.
   std::string load_spec(const std::string& name) {
+    if (is_nvptx()) {
+      const std::string v = fresh("%v");
+      line("  " + v + " = call i32 @" + nvvm_sreg(name) + "()");
+      return v;
+    }
     const int off = spec_offset(name);
     const std::string gep = fresh("%lg");
     line("  " + gep + " = getelementptr inbounds i8, ptr %launch, i64 " +
@@ -533,23 +543,74 @@ class LlvmGen {
     line("target triple = \"" + target_ + "\"");
     emit_global_decls();
     emit_shared_metadata();
+    // The scratchpad has to be declared before the body that addresses it, and
+    // the body is what first asks for its size, so size it here.
+    if (is_nvptx() && !fn_->sharedVars.empty()) {
+      smem_global();
+      line(smem_decl_);
+    }
   }
 
   void emit_signature() {
     // Module-level declare for the block barrier runtime helper (bar.sync).
     for (const auto& ins : body_)
       if (ins.op == "bar.sync" || ins.op.rfind("bar.", 0) == 0) use_sync_ = true;
-    if (use_sync_) line("declare void @__rouge_syncthreads(ptr)");
+    // On a real GPU the barrier is a hardware instruction reached through
+    // NVVM, not a call into a host pthread barrier.
+    if (use_sync_ && !is_nvptx()) line("declare void @__rouge_syncthreads(ptr)");
     scan_intrinsics();
+    if (gpu_kernel()) emit_gpu_intrinsics();
     for (const auto& d : intrinsics_) line(d);
-    std::string sig = "define void @" + fn_->name + "(";
+    // Calling convention 71 is LLVM's NVVM_KERNEL. It is what makes clang
+    // emit ".visible .entry" (a launchable kernel) instead of ".visible .func"
+    // (an ordinary device function the driver will not accept).
+    std::string sig = "define " + std::string(gpu_kernel() ? "cc 71 void" : "void") +
+                      " @" + fn_->name + "(";
     for (size_t i = 0; i < fn_->params.size(); ++i) {
       if (i) sig += ", ";
       sig += param_llvm_type(fn_->params[i]) + " %arg" + std::to_string(i);
     }
-    if (!fn_->params.empty()) sig += ", ";
-    sig += "ptr %launch) {";
+    // The launch descriptor carries the grid/block shape and the block
+    // scratchpad. On a GPU both come from the hardware and the shared window,
+    // so the descriptor has no place in the signature.
+    if (!gpu_kernel()) {
+      if (!fn_->params.empty()) sig += ", ";
+      sig += "ptr %launch";
+    }
+    sig += ") {";
     line(sig);
+  }
+
+  // True when the target is a real GPU and the kernel has to be built the way
+  // that GPU launches one, rather than as a host function.
+  //
+  // NVPTX only, for now. AMDGPU needs the same treatment (workitem ids from
+  // llvm.amdgcn.*, the barrier from s_barrier, and its own kernel calling
+  // convention), and until that exists AMD keeps the host calling convention
+  // with the launch descriptor: it must not lose the parameter it reads from.
+  bool gpu_kernel() const { return is_nvptx(); }
+
+  // The NVVM intrinsics stand in for the launch descriptor: the special
+  // registers come from the hardware, and the block scratchpad is a module
+  // global in the shared address space.
+  void emit_gpu_intrinsics() {
+    for (const auto& ins : body_) {
+      if (ins.args.size() < 2) continue;
+      if (spec_offset(ins.args[1]) < 0) continue;
+      if (!ins.args[1].empty() && ins.args[1][0] == '%') continue;
+      nvvm_sreg(ins.args[1]);
+    }
+    if (use_sync_) {
+      intrinsics_.insert("declare void @llvm.nvvm.barrier0()");
+      intrinsics_.insert("declare void @llvm.nvvm.barrier0.aligned(i32, i32)");
+    }
+  }
+
+  // Emit (once) a read of the named special register and return the intrinsic.
+  std::string nvvm_sreg(const std::string& name) {
+    const std::string fn = "llvm.nvvm.read.ptx.sreg." + name;
+    intrinsics_.insert("declare i32 @" + fn + "()");
+    return fn;
   }
 
   static std::string param_llvm_type(const rouge::PtxParam& p) {
@@ -861,11 +922,14 @@ class LlvmGen {
     }
 
     if (op == "bar.sync" || op.rfind("bar.", 0) == 0) {
-      // Block-wide barrier: host -> __rouge_syncthreads (pthread_barrier);
-      // RISC-V target -> fence / custom inter-core barrier.
-      if (A.size() > 0 && is_numeric(A[0])) {
-        // bar.sync 0[, count] — ignore barrier id for now (single barrier).
+      // Block-wide barrier. On the host this is __rouge_syncthreads (a
+      // pthread barrier); on a GPU it is the hardware barrier instruction,
+      // which needs no operand and no argument block.
+      if (is_nvptx()) {
+        line("  call void @llvm.nvvm.barrier0()");
+        return true;
       }
+      // bar.sync 0[, count] — ignore barrier id for now (single barrier).
       line("  call void @__rouge_syncthreads(ptr %launch)");
       return true;
     }
@@ -2007,13 +2071,39 @@ class LlvmGen {
     return inttoptr_as(a, global_ptr_ty());
   }
 
-  // Read the block scratchpad base (launch descriptor, offset 48) as i64.
+  // Read the block scratchpad base as i64. On the host it is a field of the
+  // launch descriptor; on a GPU it is a module global that the compiler places
+  // in the shared address space, so the kernel's own LDS window addresses it.
   std::string load_smem_base() {
+    if (is_nvptx()) {
+      const std::string a = fresh("%a");
+      line("  " + a + " = ptrtoint ptr addrspace(3) @" + smem_global() +
+           " to i64");
+      return a;
+    }
     const std::string gep = fresh("%lg");
     line("  " + gep + " = getelementptr inbounds i8, ptr %launch, i64 48");
     const std::string v = fresh("%v");
     line("  " + v + " = load i64, ptr " + gep + ", align 8");
     return v;
+  }
+
+  // The GPU block scratchpad. Its size is fixed at compile time by the .shared
+  // declaration, so a static global is enough; the address space is the one
+  // NVPTX uses for .shared.
+  std::string smem_global() {
+    if (!smem_sym_.empty()) return smem_sym_;
+    size_t bytes = 1;
+    for (const auto& sv : fn_->sharedVars)
+      bytes = std::max(bytes, static_cast<size_t>(sv.offset) +
+                                      static_cast<size_t>(sv.elemBytes) *
+                                          static_cast<size_t>(sv.count));
+    smem_sym_ = "__rouge_" + fn_->name + "_smem";
+    // A global's alignment follows the initialiser, comma-separated. 16 bytes
+    // is the widest shared access a kernel may perform.
+    smem_decl_ = "@" + smem_sym_ + " = internal addrspace(3) global [" +
+                 std::to_string(bytes) + " x i8] zeroinitializer, align 16";
+    return smem_sym_;
   }
 
   // If the operand names a .shared var (optionally with a +/-Const byte
