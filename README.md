@@ -1,101 +1,127 @@
 # ROUGE-V
 
-> **Открытый компилятор CUDA-кода для открытого железа.** Переводим код, написанный под NVIDIA, на RISC-V — без переписывания и без эмуляции инструкций.
+A compiler that translates CUDA PTX into native code for RISC-V.
 
 [![CI](https://github.com/MrModelOS/ROUGE-V/actions/workflows/ci.yml/badge.svg)](https://github.com/MrModelOS/ROUGE-V/actions/workflows/ci.yml)
-![Лицензия](https://img.shields.io/badge/license-Apache--2.0%20WITH%20LLVM--exception-blue)
-![Тесты](https://img.shields.io/badge/tests-24%20passed-brightgreen)
+![License](https://img.shields.io/badge/license-Apache--2.0%20WITH%20LLVM--exception-blue)
 
----
+`nvcc` does not produce machine code for a GPU. It produces **PTX** — a textual
+assembly with a published specification. Anything that can read PTX can compile
+it for a different target.
 
-## Проблема
+ROUGE-V does exactly that: PTX → LLVM IR → native code, for RISC-V and the
+vector extension `rv64gcv`. It is a compiler, not an emulator — the translated
+kernel is compiled, not interpreted instruction by instruction.
 
-Если вы писали на CUDA, вы знаете это чувство: код работает, всё хорошо, а когда нужно перенести его на другое железо — начинается месяц работы. Не потому что задача сложная, а потому что выходной стандарт **закрыт**.
-
-Мы делаем так, чтобы перенос перестал быть отдельным проектом.
-
-## Что уже работает
-
-Не обещания, а код и зелёные тесты — **24 штуки**, прямо сейчас в `main`:
-
-| | |
-|---|---|
-| **PTX → LLVM IR → нативный код** | `ptx2ir`, без эмуляции инструкций |
-| **PTX от настоящего `nvcc`** | сгенерированные NVIDIA ядра идут насквозь |
-| **Два пути — один результат** | AOT-компиляция и интерпретатор сходятся бит-в-бит |
-| **Shared memory + `bar.sync`** | блок-редукция 16×256 потоков, честная SIMT-семантика |
-| **Атомики** | `atom.add` / `red.add` → `atomicrmw` |
-| **FP16 / BF16** | `half` / `bfloat`, `fma`, конверсии, f16-тайл в shared |
-| **Тайл GEMM 16×16** | `shA`/`shB` в shared, `bar.sync`, f16 |
-| **Warp-примитивы** | `shfl` (в т.ч. с условной записью), `vote`, `activemask` |
-| **RVV** | тот же IR собирается под `rv64gcv` |
-| **MLIR-контур** | `rouge-opt --rouge-simt-access-report` — анализ SIMT-паттернов |
+## Try it
 
 ```sh
-git clone https://github.com/MrModelOS/ROUGE-V.git && cd ROUGE-V
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
-ctest --test-dir build --output-on-failure            # 16/16
-ctest --test-dir software/rouge-cuda/build             #  8/8
+git clone https://github.com/MrModelOS/ROUGE-V.git
+cd ROUGE-V
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
-Дальше — [QUICKSTART.md](QUICKSTART.md).
+Translate a kernel by hand:
 
-## Как это устроено
+```sh
+./build/rouge-compiler/ptx2ir \
+    software/rouge-compiler/tests/kernels/vadd.ptx /tmp/vadd.ll
 
+clang -O2 -c /tmp/vadd.ll -o /tmp/vadd.o                       # host
+clang --target=riscv64-unknown-elf -march=rv64gcv \
+      -c /tmp/vadd.ll -o /tmp/vadd-rv64.o                      # RISC-V + Vector
 ```
-CUDA-код → PTX → rouge-ptx → ptx2ir → LLVM IR → clang → нативный бинарник
-                                            └→ rv64gcv (RISC-V + Vector)
-```
 
-Перехват идёт на уровне IR, а не «прогоном чужих инструкций». Каждый PTX-регистр становится `alloca`, CUDA-спецрегистры читаются из дескриптора запуска, `bar.sync` превращается в вызов рантайма, `.shared` — в scratchpad блока.
+## Components
 
-Неподдерживаемое — **явная ошибка с указанием инструкции**, а не тихая порча. Это принципиально: транслятор, который врёт, хуже транслятора, который отказывается.
-
-* [docs/06 — архитектура компилятора](docs/06-compiler-architecture.md)
-* [rouge-compiler](software/rouge-compiler/README.md) · [rouge-cuda](software/rouge-cuda/README.md)
-
-## Принципы
-
-**1. Открытость — не компромисс, а инструмент.**
-RISC-V, LLVM, MLIR, SPIR-V, PyTorch, Triton. Мы не изобретаем закрытый стандарт — мы делаем существующие открытые доступными и быстрыми.
-
-**2. Честность выше красивой картинки.**
-Неподдерживаемое — отказ. `cvt.sat` — отказ. f64-арифметика — отказ, пока не сделаем. Мы не ставим галочку на «умеем всё».
-
-**3. Никаких выдуманных измерений.**
-В репозитории есть калькулятор `$/токен` — но это **методика**, а не замер. Ни одна цифра в проекте не выдаётся за результат испытаний, если её никто не измерял.
-
-## Юридическая рамка
-
-Мы относимся к этому серьёзно, поэтому коротко и прямо:
-
-* **Мы не копируем и не реверс-инжинирим** проприетарные бинарники и заголовки NVIDIA. Ни `nvngx`, ни cuBLAS.
-* `PTX`, который мы переводим, **выпускает `nvcc` пользователя, из его собственной лицензии**, по опубликованной спецификации PTX ISA. Мы не извлекаем его из закрытых артефактов NVIDIA.
-* Заголовочные файлы в `software/rouge-cuda/include/` — **наши**, написанные с нуля по публичной документации API.
-* Правило clean-room закреплено в [CONTRIBUTING.md](CONTRIBUTING.md) и проверяется на ревью: любой, кто приносит код, должен подтвердить происхождение.
-* **ROUGE-V не связан с NVIDIA.** Мы не одобрены и не поддерживаемы ими. CUDA, NVIDIA, GeForce и прочие торговые марки принадлежат их владельцам и используются здесь только чтобы описать совместимость.
-
-## Документы
-
-Всё, что касается архитектуры компилятора, — в открытом доступе и обновляется по мере работы:
-
-| | |
+| Component | What it is |
 |---|---|
-| [docs/06](docs/06-compiler-architecture.md) | Архитектура AOT-компилятора и транслятора |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Как собрать, как тестировать, правила clean-room |
-| [QUICKSTART.md](QUICKSTART.md) | Запуск за 30 секунд |
-| [LICENSE](LICENSE) | Apache 2.0 WITH LLVM-exception |
+| [`rouge-ptx`](software/rouge-ptx/) | Shared PTX front-end: parser + reference interpreter |
+| [`rouge-compiler`](software/rouge-compiler/) | `ptx2ir`, the AOT translator; host runtime; MLIR contour |
+| [`rouge-cuda`](software/rouge-cuda/) | CUDA Driver/Runtime API interposition and fallback execution path |
 
-## Спасибо
+The AOT path and the interpreter must agree bit-for-bit on every kernel. That
+constraint is what the test suite is built around.
 
-Этот проект не был бы возможен без людей, которые нашли в нём что-то, кроме кода.
+## Supported PTX subset
 
-Спасибо тем, кто задавал неудобные вопросы, пробовал на своём железе и присылал баги — в том числе тому, кто взял настоящий PTX из `nvcc` и не поверил, что у нас он не читается. Именно такие находки оказались ценнее всего остального.
+| Group | Instructions |
+|---|---|
+| Parameters | `ld.param.{u32,u64}` (+ signed/bit variants) |
+| Moves | `mov.*`, `cvta.to.global.*`, `cvta.to.shared.*` |
+| Arithmetic | `add`/`sub`/`mul`/`div`/`rem`, `mad.lo`/`mad.hi`, `mul.wide.*` |
+| Bitwise / shift | `and`/`or`/`xor`/`not`, `shl`, `shr.{u,s}`, `bfi`/`bfe` |
+| Compare | `setp.{ge,gt,lt,le,eq,ne}.{u32,s32,f32}` |
+| Select | `selp.*`, `slct.*`, predicate `and`/`or`/`not` |
+| Min / max / unary | `min`/`max.*`, `neg`, `abs`, `popc`, `clz`, `bfind.shiftamt` |
+| Floating point | `f16`/`bf16` arithmetic, `fma.rn`, `sqrt`, `rcp`, `rsqrt`, `fneg` |
+| Memory | `ld`/`st` global and shared: `f32`, `u32`, `u64`, `u8`/`s8`, `u16`/`s16`, `f16`/`bf16`, `v2.f32` |
+| Shared memory | `.shared` declarations, `cvta.to.shared`, `[reg+offset]` indexing |
+| Synchronization | `bar.sync` → runtime barrier |
+| Warp | `shfl.{idx,bfly,up,down}` (incl. predicated destinations), `vote.*`, `activemask` |
+| Atomics | `atom.add`/`cas`/`exch`/`min`/`max`, `red.add.*` → LLVM `atomicrmw` / `cmpxchg` |
 
-Спасибо комьюнити RISC-V, LLVM, MLIR, Triton, SYCL и UXL — работающие над открытыми инструментами, на которых всё это стоит.
+Unsupported instructions produce an error naming the instruction. There is no
+silent miscompilation — a wrong answer is worse than a refusal.
 
-**MrModel** и все, кто помогает развитию проекта.
+## Tests
 
-## Лицензия
+24 tests, all passing:
 
-[Apache 2.0 WITH LLVM-exception](LICENSE) — как у LLVM, чтобы наш код свободно жил внутри LLVM и MLIR.
+| Suite | Count | What it covers |
+|---|---|---|
+| `rouge-compiler` | 16 | structural IR checks, AOT execution, vendor PTX, RISC-V backend |
+| `rouge-cuda` | 8 | same kernels through the Driver API and the interpreter |
+
+`compiler_nvcc_ptx` is the one that matters most: it compiles real CUDA C with
+the vendor's own `nvcc`, takes the PTX it produces, and pushes it through
+`ptx2ir` → `clang`. It skips if `nvcc` is not installed.
+
+```
+$ ctest --test-dir build
+...
+13/16 compiler_nvcc_ptx ....................   Passed   nvcc -> ptx2ir -> clang
+100% tests passed out of 16
+```
+
+## Architecture
+
+[docs/06-compiler-architecture.md](docs/06-compiler-architecture.md) — the
+launch descriptor, shared-memory layout, the `bar.sync` model, atomics, FP16 /
+BF16 lowering, and the planned SIMT → RVV path.
+
+## Legal
+
+ROUGE-V contains no NVIDIA source code, headers, or binaries, and performs no
+reverse engineering of them. The PTX it compiles is produced by the user's own
+`nvcc` installation, under the user's NVIDIA license, from a published
+specification. The CUDA API headers under `software/rouge-cuda/include/` are
+written from scratch against public API documentation. The clean-room rule is
+enforced in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+ROUGE-V is not affiliated with, endorsed by, or supported by NVIDIA. CUDA and
+other trademarks are the property of their respective owners and are used here
+only to describe compatibility.
+
+## Contributing
+
+Issues and pull requests are open. Good first targets are listed in the
+roadmap of the compiler component; `atom.cas` coverage and `f16x2` warp
+variants are the obvious ones. Read [CONTRIBUTING.md](CONTRIBUTING.md) first —
+it describes the build, the test workflow, and the clean-room requirement that
+applies to all contributions.
+
+## Acknowledgements
+
+ROUGE-V builds on work of others, principally:
+
+- **LLVM / MLIR** — IR, backend, and the pass infrastructure this is written against
+- **RISC-V International** — the `rv64gcv` ISA and Vector Extension specifications
+- **NVIDIA** — the published PTX ISA and CUDA API documentation, which define the input format
+
+## License
+
+Apache 2.0 WITH LLVM-exception — the same license as LLVM, so this code can
+live inside LLVM and MLIR without friction.
