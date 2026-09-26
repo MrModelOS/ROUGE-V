@@ -185,11 +185,54 @@ claim-проверки без гонок.
 
 ### Шаг 4. Генерация кода (Back-End) и Runtime
 
+- **Выбор цели: `ptx2ir --target <triple>`.** Triple попадает в модуль как
+  `target triple = "..."` и определяет, какие типы указателей попадут в IR.
+  Регистры PTX хранят адреса как `i64` (ровно так же, как в самом PTX), и в
+  точке использования превращаются в типизированный указатель через
+  `inttoptr`. Какой именно тип указателя нужен, решает цель:
+
+  | Память | `amdgcn-amd-amdhsa` | `nvptx64-nvidia-cuda` | CPU (`x86_64-…`, `riscv64-…`) |
+  |---|---|---|---|
+  | global | `ptr addrspace(1)` | `ptr addrspace(1)` | `ptr` |
+  | shared | `ptr addrspace(5)` | `ptr addrspace(3)` | `ptr` |
+
+  - **AMDGPU требует `addrspace(5)` ещё и у `alloca`:** стека у него нет,
+    приватные объекты живут в shared-пространстве, и общий `alloca` бэкенд
+    отвергает — `alloca on amdgpu must be in addrspace(5)`. Поэтому при
+    `--target amdgcn-amd-amdhsa` приватный регистр-`alloca` печатается как
+    `alloca T, align N, addrspace(5)` (пространство идёт **после** выравнивания).
+  - **CPU-цели типизированных указателей не принимают:** для них допустим только
+    generic `ptr`, типизированная форма даёт ошибку верификатора («expected ptr»).
+    Типизированная форма — строго GPU-возможность; для CPU `global` и `shared`
+    неразличимы, и различает их уже сам runtime по адресу.
+  - **Почему это не «просто типы, а вопрос качества кода.** Без явного
+    адресного пространства бэкенд не знает, global это адрес или shared, и
+    испускает **скалярные** обращения через целое — `ld.b32`/`st.b32` без
+    адресного пространства — вместо `global_load`/`global_store` (AMDGPU) и
+    `ld.global`/`st.global` (NVPTX). Проверяется на одном и том же `vadd.ptx`:
+    с типизированными указателями AMD-бэкенд печатает `global_load_b` /
+    `global_store_b`, а NVPTX — `ld.global.b` / `st.global.b`; если тот же IR
+    свести к плоскому `ptr`, остаются только безымянные `ld.b32` / `st.b32`.
+  - **Выбор делает фронтенд, а не бэкенд.** `ptx2ir` печатает IR уже с
+    правильными для цели типами, поэтому последующая сборка — обычный `clang -c`
+    с соответствующим `--target` и `-mcpu`/`-march`, без каких-либо
+    дополнительных флагов. `ptx_to_llvm_ir(prog, i, &err, target)` несёт
+    triple последним аргументом и по умолчанию использует
+    `x86_64-pc-linux-gnu`.
+
 - **LLVM Backend для RISC-V:** добавляем в LLVM поддержку нашего ассемблерного
   расширения (`rv64gcv_xrouge` — базовый RV64 + Vector + кастомные инструкции
   матричного умножения `matmul.mma`). Тот же IR, который генерирует ptx2ir,
   уже собирается штатным бэкендом `riscv64-unknown-elf -march=rv64gcv`
   (проверяется тестом `compiler_rvv_backend`).
+- **AMDGPU и NVPTX — штатные бэкенды LLVM, а не кастомный код:** собственный
+  бэкенд проекту не нужен, достаточно корректных адресных пространств в IR
+  (см. выше). Проверено на пяти канонических ядрах (`vadd`, `block_reduce`,
+  `atomic_reduce`, `fp16_reduce`, `gemm_tile`): IR собирается в нативный объект
+  под `amdgcn-amd-amdhsa -mcpu=gfx1100` и `nvptx64-nvidia-cuda -march=sm_75`.
+  Это утверждение о **сборке**: исполнения на реальной видеокарте не было —
+  такого железа в проекте нет, — поэтому никаких выводов о производительности из
+  этих сборок не следует.
 - **C-API Runtime (замена libcuda.so / libcudart.so):** открытая обёртка-
   заглушка над вызовами CUDA C-API:
   - `cudaMalloc()` → выделение в адресном пространстве ROUGE-V;
@@ -210,6 +253,10 @@ claim-проверки без гонок.
 | FP16/BF16 (half/bfloat, fma, cvt, ld/st, shared-тайл) | ✅ | `ctest aot_native_fp16_reduce` / `driver_fp16_reduce` |
 | Экспорт `.shared`-раскладки в runtime (`__rouge_*_query`) | ✅ | `test_aot_block_reduce` без `kScratch` + `rouge_runtime.h` |
 | RVV-кросс-проверка (`rv64gcv`) — 3 ядра | ✅ | `ctest compiler_rvv_backend_*` |
+| Выбор цели в `ptx2ir` (`--target`) + адресные пространства global/shared | ✅ | `ptx2ir --target amdgcn-amd-amdhsa vadd.ptx` — `addrspace(1)`/`addrspace(5)` |
+| Сборка под AMD GPU (`amdgcn-amd-amdhsa -mcpu=gfx1100`) — 5 ядер | ✅ сборка | `ptx2ir --target amdgcn-amd-amdhsa … && clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c` |
+| Сборка под NVIDIA GPU (`nvptx64-nvidia-cuda -march=sm_75`) — 5 ядер | ✅ сборка | `ptx2ir --target nvptx64-nvidia-cuda … && clang --target=nvptx64-nvidia-cuda -march=sm_75 -c` |
+| Исполнение кернела на AMD/NVIDIA GPU | ⛔ не проверялось | требуется реальная видеокарта; сейчас подтверждена только сборка объекта |
 | MLIR-контур: `rouge-simt-access-report` (GPU→Vector) | ✅ контур | `cmake -DROUGE_ENABLE_MLIR=ON` + `rouge-opt --rouge-simt-access-report` |
 | MLIR Dialect Conversion GPU→Vector/Linalg→ROUGE (векторизация) | 📋 план | — |
 | Hardware-Aware Passes (tiling/coalescing/double-buffer) | 📋 план | — |
@@ -227,6 +274,3 @@ Warp-shuffle (`shfl.*`), тензорные инструкции, `atom.exch`/`a
 
 ## Связанные документы
 
-- [03. Архитектура ПО](./03-software-architecture.md) — место компилятора в стеке
-- [05. Дорожная карта](./05-roadmap.md) — задачи Phase 0–4
-- [02. Архитектура железа](./02-hardware-architecture.md) — векторное ядро, SPM, DMA

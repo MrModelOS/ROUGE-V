@@ -49,6 +49,34 @@ clang --target=riscv64-unknown-elf -march=rv64gcv \
       -c /tmp/vadd.ll -o /tmp/vadd-rv64.o                 # RISC-V + Vector
 ```
 
+Тройную цель выбирают на стороне транслятора флагом `--target` — это просто
+префикс аргументов `ptx2ir`, остальная команда не меняется. Один и тот же PTX
+собирается под четыре платформы:
+
+```sh
+./build/rouge-compiler/ptx2ir --target amdgcn-amd-amdhsa kernel.ptx kernel-amd.ll
+clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
+```
+
+| `--target` | Платформа | Флаги бэкенда | Что на самом деле проверено |
+|---|---|---|---|
+| *(по умолчанию)* `x86_64-pc-linux-gnu` | хост x86-64 | — | собирается **и исполняется** — тесты `aot_native_*` |
+| `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | собирается в нативный объект — `ctest compiler_rvv_backend_*` |
+| `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | собирается в нативный объект — не исполнялось |
+| `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | собирается в нативный объект — не исполнялось |
+
+Под все четыре тройки собираются пять канонических ядер из
+`software/rouge-compiler/tests/kernels/`: `vadd`, `block_reduce`,
+`atomic_reduce`, `fp16_reduce`, `gemm_tile`.
+
+Две GPU-строки — утверждение о **сборке**, и только о ней. Видеокарты AMD или
+NVIDIA в проекте нет, поэтому из этих строк не выполнялось ничего и никаких цифр
+производительности из них не следует. Настоящее исполнение проверено только на
+x86-64; RISC-V, AMD и NVIDIA проверены как объекты, которые принимает настоящий
+бэкенд LLVM. Цель меняет адресные пространства в эмитимом IR — именно поэтому
+эти бэкенды печатают `global_load`/`global_store`, а не скалярные обращения;
+подробности в [docs/06-compiler-architecture.md](docs/06-compiler-architecture.md).
+
 ```
 $ ctest --test-dir build
 ...

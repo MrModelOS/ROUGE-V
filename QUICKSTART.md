@@ -83,6 +83,50 @@ cat kernel.ll
 clang --target=riscv64-unknown-elf -march=rv64gcv -c /tmp/kernel.ll -o /tmp/kernel-rv64.o
 ```
 
+### 5. Собрать под любую из четырёх платформ
+
+Цель выбирается флагом `--target` у `ptx2ir` — это просто префикс аргументов,
+остальная команда не меняется. Один и тот же PTX собирается под четыре платформы:
+
+```bash
+# 1) хост x86-64 — цель по умолчанию
+./build/rouge-compiler/ptx2ir kernel.ptx /tmp/kernel.ll
+clang -O2 -c /tmp/kernel.ll -o /tmp/kernel.o
+
+# 2) RISC-V + векторное расширение
+./build/rouge-compiler/ptx2ir --target riscv64-unknown-elf kernel.ptx /tmp/kernel-rv.ll
+clang --target=riscv64-unknown-elf -march=rv64gcv -c /tmp/kernel-rv.ll -o /tmp/kernel-rv64.o
+
+# 3) AMD RDNA 3
+./build/rouge-compiler/ptx2ir --target amdgcn-amd-amdhsa kernel.ptx /tmp/kernel-amd.ll
+clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c /tmp/kernel-amd.ll -o /tmp/kernel-amd.o
+
+# 4) NVIDIA
+./build/rouge-compiler/ptx2ir --target nvptx64-nvidia-cuda kernel.ptx /tmp/kernel-sm75.ll
+clang --target=nvptx64-nvidia-cuda -march=sm_75 -c /tmp/kernel-sm75.ll -o /tmp/kernel-sm75.o
+```
+
+| `--target` | Платформа | Флаги бэкенда | Что на самом деле проверено |
+|---|---|---|---|
+| *(по умолчанию)* `x86_64-pc-linux-gnu` | хост x86-64 | — | собирается **и исполняется** — тесты `aot_native_*` |
+| `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | собирается в нативный объект |
+| `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | собирается в нативный объект, **не исполнялось** |
+| `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | собирается в нативный объект, **не исполнялось** |
+
+Собираются все пять канонических ядер из `software/rouge-compiler/tests/kernels/`:
+`vadd`, `block_reduce`, `atomic_reduce`, `fp16_reduce`, `gemm_tile`.
+
+Об ограничении стоит сказать прямо: строки AMD и NVIDIA — утверждение о **сборке**,
+а не о работе. Видеокарты в проекте нет, исполнение на GPU не проверялось, и никаких
+цифр производительности из этих строк не следует. Настоящая проверка исполнения —
+только на x86-64 через `ctest`; RISC-V, AMD и NVIDIA проверены как объекты, которые
+принимает настоящий бэкенд LLVM.
+
+Почему `--target` меняет содержимое IR, а не только строку `target triple`:
+у AMD и NVPTX свои адресные пространства, и без их указания бэкенд не может
+отличить global от shared — подробности в
+[docs/06-compiler-architecture.md](docs/06-compiler-architecture.md).
+
 ## Откуда берётся PTX
 
 Три обычных способа:

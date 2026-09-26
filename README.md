@@ -79,6 +79,34 @@ Target RISC-V instead of the host:
 clang --target=riscv64-unknown-elf -march=rv64gcv -c kernel.ll -o kernel-rv64.o
 ```
 
+The triple itself is chosen on the translator side with `--target`, which is
+just a prefix of `ptx2ir`'s arguments — the rest of the command is unchanged.
+The same PTX therefore builds for four platforms:
+
+```sh
+./build/rouge-compiler/ptx2ir --target amdgcn-amd-amdhsa kernel.ptx kernel-amd.ll
+clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
+```
+
+| `--target` | Platform | Backend flags | What is actually verified |
+|---|---|---|---|
+| *(default)* `x86_64-pc-linux-gnu` | host x86-64 | — | compiles **and executes** — the `aot_native_*` ctest suite |
+| `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | compiles to a native object — `ctest compiler_rvv_backend_*` |
+| `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | compiles to a native object — never executed |
+| `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | compiles to a native object — never executed |
+
+All five canonical kernels in `software/rouge-compiler/tests/kernels/` — `vadd`,
+`block_reduce`, `atomic_reduce`, `fp16_reduce`, `gemm_tile` — build for all four
+triples.
+
+The two GPU rows are a **compile-time** claim, and only that. No AMD or NVIDIA
+device is involved anywhere in the project, so nothing from those rows has been
+run and no performance number follows from them. Actual execution is verified on
+x86-64 only; RISC-V, AMD and NVIDIA are verified as objects that a real backend
+accepts. The target changes the address spaces in the emitted IR, which is what
+lets those backends emit `global_load`/`global_store` instead of scalar accesses
+— see [docs/06-compiler-architecture.md](docs/06-compiler-architecture.md).
+
 Where the PTX comes from:
 
 ```sh

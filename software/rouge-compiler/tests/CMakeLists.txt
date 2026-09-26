@@ -120,4 +120,59 @@ if(CLANG_EXECUTABLE)
         -DOUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/${kern}-rv64.o
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check_rvv_backend.cmake)
   endforeach()
+
+  # ---- Tests 5 + 6 (informational): GPU target matrix ----
+  # ptx2ir --target <triple> must emit IR that carries the requested target
+  # triple plus the target-correct GPU address spaces, and that IR must survive
+  # a real LLVM GPU backend. The matrix script probes each backend first, so on
+  # a host whose LLVM lacks it (or, for AMD, without the ROCm toolchain) the
+  # platform is reported as SKIP and never fails the run.
+
+  # Kernels exercised by the GPU matrix. vadd/block_reduce/atomic_reduce are the
+  # plain kernels, fp16_reduce and gemm_tile additionally use the shared-memory
+  # address space, so the matrix covers both kinds of address-space mapping.
+  set(GPU_MATRIX_KERNELS vadd block_reduce atomic_reduce fp16_reduce gemm_tile)
+
+  # GPU target used by the AMD matrix; override on the command line to target a
+  # different gfx architecture, e.g.
+  #   -DROUGE_AMDGPU_TRIPLE=amdgcn-amd-amdhsa -DROUGE_AMDGPU_FLAGS="-mcpu=gfx90a -O2"
+  set(ROUGE_AMDGPU_TRIPLE "amdgcn-amd-amdhsa" CACHE STRING
+      "LLVM triple passed to ptx2ir --target for the AMD GPU matrix test")
+  set(ROUGE_AMDGPU_FLAGS "-mcpu=gfx1100 -O2" CACHE STRING
+      "Extra clang flags for the AMD GPU matrix test")
+
+  # GPU target used by the NVIDIA matrix.
+  set(ROUGE_NVPTX_TRIPLE "nvptx64-nvidia-cuda" CACHE STRING
+      "LLVM triple passed to ptx2ir --target for the NVIDIA GPU matrix test")
+  set(ROUGE_NVPTX_FLAGS "-march=sm_75 -O2" CACHE STRING
+      "Extra clang flags for the NVIDIA GPU matrix test")
+
+  # These values are handed to the matrix script as single -D arguments, where a
+  # ';' or a space would be split by the CTest command line. The script therefore
+  # expects ',' between list items and '+' between the clang flags of one spec.
+  string(REPLACE " " "+" AMDGPU_FLAGS_SPEC "${ROUGE_AMDGPU_FLAGS}")
+  string(REPLACE " " "+" NVPTX_FLAGS_SPEC "${ROUGE_NVPTX_FLAGS}")
+  string(REPLACE ";" "," GPU_MATRIX_KERNELS_SPEC "${GPU_MATRIX_KERNELS}")
+
+  add_test(NAME compiler_amdgpu_backend
+    COMMAND ${CMAKE_COMMAND}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DPTX2IR=$<TARGET_FILE:ptx2ir>
+      -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
+      -DIR_FILE=${CMAKE_CURRENT_BINARY_DIR}/vadd.ll
+      -DOUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/vadd-amdgpu.o
+      -DKERNELS=${GPU_MATRIX_KERNELS_SPEC}
+      -DPLATFORMS=amdgpu|${ROUGE_AMDGPU_TRIPLE}|${AMDGPU_FLAGS_SPEC}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_targets.cmake)
+
+  add_test(NAME compiler_nvptx_backend
+    COMMAND ${CMAKE_COMMAND}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DPTX2IR=$<TARGET_FILE:ptx2ir>
+      -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
+      -DIR_FILE=${CMAKE_CURRENT_BINARY_DIR}/vadd.ll
+      -DOUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/vadd-nvptx.o
+      -DKERNELS=${GPU_MATRIX_KERNELS_SPEC}
+      -DPLATFORMS=nvptx|${ROUGE_NVPTX_TRIPLE}|${NVPTX_FLAGS_SPEC}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_targets.cmake)
 endif()

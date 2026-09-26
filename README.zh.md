@@ -48,6 +48,32 @@ clang --target=riscv64-unknown-elf -march=rv64gcv \
       -c /tmp/vadd.ll -o /tmp/vadd-rv64.o                 # RISC-V + Vector
 ```
 
+目标三元组由翻译器一侧的 `--target` 决定 —— 它只是 `ptx2ir` 参数的前缀，
+其余命令不变。同一个 PTX 可以为四个平台构建：
+
+```sh
+./build/rouge-compiler/ptx2ir --target amdgcn-amd-amdhsa kernel.ptx kernel-amd.ll
+clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
+```
+
+| `--target` | 平台 | 后端参数 | 实际验证到的内容 |
+|---|---|---|---|
+| *(默认)* `x86_64-pc-linux-gnu` | x86-64 主机 | —— | **构建并执行** —— `aot_native_*` ctest 套件 |
+| `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | 构建为原生目标文件 —— `ctest compiler_rvv_backend_*` |
+| `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | 构建为原生目标文件 —— 从未执行 |
+| `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | 构建为原生目标文件 —— 从未执行 |
+
+`software/rouge-compiler/tests/kernels/` 中全部五个标准内核 —— `vadd`、
+`block_reduce`、`atomic_reduce`、`fp16_reduce`、`gemm_tile` —— 都能在四种
+三元组下构建。
+
+两行 GPU 是**构建层面**的结论，仅此而已。项目中没有 AMD 或 NVIDIA 设备，
+因此这两行没有任何内容被实际执行，也无法由此得出任何性能数字。真正的执行
+只在 x86-64 上验证过；RISC-V、AMD 和 NVIDIA 验证的是真实 LLVM 后端能够接受
+所生成的目标文件。目标选择会改变所输出 IR 中的地址空间，这正是这些后端能够
+生成 `global_load`/`global_store` 而非标量访存的原因 —— 详见
+[docs/06-compiler-architecture.md](docs/06-compiler-architecture.md)。
+
 ```
 $ ctest --test-dir build
 ...

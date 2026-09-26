@@ -48,8 +48,42 @@ ctest --test-dir build --output-on-failure
 | `aot_native_block_reduce` | **shared + `bar.sync` в AOT**: блок-редукция 16×256 (pthread-барьер), scratchpad из `__rouge_*_query` — без `kScratch` в драйвере |
 | `aot_native_atomic_reduce` | **атомики в AOT**: `atom.add`/`red.add` как `atomicrmw` на реальных потоках (гонка на кэш-линиях) |
 | `aot_native_fp16_reduce` | **FP16/BF16 в AOT**: half/bfloat, cvt, fma, f16-тайл в shared + `bar.sync` (бит-идентично интерпретатору) |
-| `compiler_rvv_backend_*` | тот же IR собирается бэкендом RISC-V `rv64gcv` (3 ядра: vadd, atomic, fp16 — информационные) |
+| `compiler_rvv_backend_*` | тот же IR собирается бэкендом RISC-V `rv64gcv` (информационные) |
+| `compiler_amdgpu_backend` | IR собирается бэкендом AMD `gfx1100` (5 ядер, информационный; SKIP без ROCm) |
+| `compiler_nvptx_backend` | IR собирается бэкендом NVIDIA `sm_75` (5 ядер, информационный) |
+| AMD-бэкенд — кросс-сборка | тот же IR с `addrspace(1)` (global) и `addrspace(5)` (shared) собирается в нативный объект `amdgcn-amd-amdhsa -mcpu=gfx1100` (5 ядер). Объект получен, но **ни разу не исполнялся** — GPU в проекте нет |
+| NVIDIA-бэкенд — кросс-сборка | тот же IR с `addrspace(1)` (global) и `addrspace(3)` (shared) собирается в нативный объект `nvptx64-nvidia-cuda -march=sm_75` (5 ядер). Собирается, но **ни разу не исполнялось** — GPU в проекте нет |
 | `mlir_simt_access_report` | MLIR-контур: `rouge-opt --rouge-simt-access-report` (только с `-DROUGE_ENABLE_MLIR=ON` + MLIR) |
+
+Цель выбирается флагом `--target` (см. ниже). Две строки GPU-бэкендов — это
+проверка **сборки**: бэкенд LLVM принял IR и выдал объект. Исполнения на реальном
+железе не было, поэтому строки ничего не говорят о производительности.
+
+## Четыре цели сборки
+
+`ptx2ir` принимает `--target <llvm-triple>`, и этот triple попадает в модуль как
+`target triple = "..."`. Дальше IR собирается обычным `clang -c` с тем же
+`--target` и соответствующим `-mcpu`/`-march`:
+
+| `--target` | Платформа | Флаги бэкенда | Статус |
+|---|---|---|---|
+| *(по умолчанию)* `x86_64-pc-linux-gnu` | хост x86-64 | — | собирается и исполняется (`aot_native_*`) |
+| `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | собирается в объект |
+| `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | собирается в объект, не исполнялось |
+| `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | собирается в объект, не исполнялось |
+
+```sh
+./build/rouge-compiler/ptx2ir --target amdgcn-amd-amdhsa   kernel.ptx kernel-amd.ll
+clang --target=amdgcn-amd-amdhsa   -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
+./build/rouge-compiler/ptx2ir --target nvptx64-nvidia-cuda kernel.ptx kernel-sm75.ll
+clang --target=nvptx64-nvidia-cuda -march=sm_75   -c kernel-sm75.ll -o kernel-sm75.o
+```
+
+`--target` влияет не только на строку triple, но и на типы указателей в IR:
+global — `addrspace(1)` у обоих GPU-бэкендов, shared — `addrspace(5)` у AMDGPU
+и `addrspace(3)` у NVPTX, а для CPU остаётся generic `ptr`. Без этого бэкенд
+печатает скалярные обращения вместо `global_load`/`global_store`. Подробности —
+`docs/06-compiler-architecture.md`.
 
 ## Поддерживаемое подмножество PTX
 

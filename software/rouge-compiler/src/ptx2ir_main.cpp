@@ -1,5 +1,5 @@
 // ptx2ir — ROUGE-V AOT compiler, stage 1 CLI.
-// Usage: ptx2ir <kernel.ptx> [output.ll]
+// Usage: ptx2ir [--target <llvm-triple>] <kernel.ptx> [output.ll]
 // Parses PTX assembly and emits textual LLVM IR for the first (.entry) kernel.
 // With no output path the IR goes to stdout.
 
@@ -11,12 +11,30 @@
 #include "rougecomp/ptx_to_llvm.h"
 
 int main(int argc, char** argv) {
-  if (argc < 2 || argc > 3) {
-    std::cerr << "usage: " << argv[0] << " <kernel.ptx> [output.ll]\n";
+  if (argc < 2 || argc > 5) {
+    std::cerr << "usage: " << argv[0]
+              << " [--target <llvm-triple>] <kernel.ptx> [output.ll]\n"
+                 "\n"
+                 "targets:\n"
+                 "  (default)                x86_64-pc-linux-gnu     host\n"
+                 "  riscv64-unknown-elf      RISC-V      (+ -march=rv64gcv)\n"
+                 "  amdgcn-amd-amdhsa        AMD GPU     (+ -mcpu=gfx1100)\n"
+                 "  nvptx64-nvidia-cuda      NVIDIA GPU  (+ -march=sm_XX)\n";
     return 2;
   }
-  const std::string inPath = argv[1];
-  const std::string outPath = (argc > 2) ? argv[2] : "";
+  std::string target = "x86_64-pc-linux-gnu";
+  int i = 1;
+  // Accept both "--target X" and "--target=X".
+  if (std::string(argv[i]) == "--target") {
+    if (++i >= argc) { std::cerr << "ptx2ir: --target needs a value\n"; return 2; }
+    target = argv[i++];
+  } else if (std::string(argv[i]).rfind("--target=", 0) == 0) {
+    target = std::string(argv[i]).substr(9);
+    ++i;
+  }
+  if (i >= argc) { std::cerr << "ptx2ir: no input file\n"; return 2; }
+  const std::string inPath = argv[i];
+  const std::string outPath = (i + 1 < argc) ? argv[i + 1] : "";
 
   std::ifstream in(inPath, std::ios::binary);
   if (!in) {
@@ -38,7 +56,7 @@ int main(int argc, char** argv) {
   }
 
   err.clear();
-  std::string ir = rougecomp::ptx_to_llvm_ir(*prog, 0, &err);
+  std::string ir = rougecomp::ptx_to_llvm_ir(*prog, 0, &err, target);
   if (ir.empty()) {
     std::cerr << "ptx2ir: translation error: " << err << "\n";
     return 1;
