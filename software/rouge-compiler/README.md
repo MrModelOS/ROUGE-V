@@ -2,7 +2,7 @@
 
 Основной путь выполнения CUDA-кода: **перехват на уровне IR → нативный
 бинарник без эмуляции инструкций**. Архитектура: `docs/06-compiler-architecture.md`,
-решение: [ADR-0006](../../decisions/0006-aot-compiler.md).
+архитектура: [docs/06-compiler-architecture.md](../../docs/06-compiler-architecture.md).
 
 ## Что внутри
 

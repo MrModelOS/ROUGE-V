@@ -2,7 +2,7 @@
 """
 ROUGE-V ISA v0.1 — cycle-приблизительный симулятор тайлового GEMM.
 
-Модель железа (CRIMSON V1 оценка):
+Условная модель вычислительного тайла (оценка):
   - Scratchpad SRAM: тайлы A[Tm×Tk] + B[Tk×Tn] + C[Tm×Tn] живут в SRAM
   - Векторные lanes: VLEN=512 (элементов за вектор-инструкцию)
   - DMA ping-pong (double buffering): загрузка следующего тайла
@@ -17,7 +17,7 @@ import argparse
 import math
 
 # Ссылки:
-#   docs/02-hardware-architecture.md — CRIMSON V1 (4× Compute Tile + HBM3e, UCIe)
+#   Параметры условные; это калькулятор модели, а не спецификация продукта.
 #   software/rouge-compiler/mlir/README.md — контур MLIR (SimtAccessReport)
 # Примеры:
 #   python3 tools/rouge_sim.py --m 128 --n 128 --k 128

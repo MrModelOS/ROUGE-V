@@ -1,16 +1,19 @@
 {
+  "_comment": "УСЛОВНЫЕ примерные значения исключительно для проверки формулы. Это НЕ измерения и НЕ характеристики какого-либо продукта. Подставьте свои замеры.",
   "lifetime_hours": 26280,
   "energy_price": 0.12,
   "memory_cost": 800,
   "ops_cost": 400,
   "h100": {
+    "_note": "условный пример",
     "hardware_cost": 30000,
     "power_w": 350,
     "tokens_per_sec": 2200
   },
-  "crimson": {
-    "hardware_cost": 15000,
-    "power_w": 200,
-    "tokens_per_sec": 3200
+  "config_b": {
+    "_note": "условный пример",
+    "hardware_cost": 12000,
+    "power_w": 280,
+    "tokens_per_sec": 2400
   }
 }

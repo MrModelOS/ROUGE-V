@@ -3,7 +3,6 @@
 > **Статус:** действует (рабочая веха: ptx2ir + нативный AOT-запуск;
 > shared memory, `bar.sync`, атомики и FP16/BF16 в обоих путях исполнения;
 > MLIR-контур GPU→Vector стартовал).
-> **Решение:** [ADR-0006](../decisions/0006-aot-compiler.md).
 > **Код:** `software/rouge-compiler`, общий фронтенд `software/rouge-ptx`.
 
 ## Задача
@@ -230,6 +229,4 @@ Warp-shuffle (`shfl.*`), тензорные инструкции, `atom.exch`/`a
 
 - [03. Архитектура ПО](./03-software-architecture.md) — место компилятора в стеке
 - [05. Дорожная карта](./05-roadmap.md) — задачи Phase 0–4
-- [ADR-0005](../decisions/0005-cuda-compat.md) — гибрид: перехват + трансляция
-- [ADR-0006](../decisions/0006-aot-compiler.md) — это решение
 - [02. Архитектура железа](./02-hardware-architecture.md) — векторное ядро, SPM, DMA
