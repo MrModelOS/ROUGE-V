@@ -40,3 +40,6 @@ software/rouge-compiler/tests/real_nvcc.ptx
 
 # Внутренние рабочие документы (не публикуются)
 internal/
+
+# Случайная папка в корне (переехала в software/rouge-compiler/tests/kernels)
+kernels/
