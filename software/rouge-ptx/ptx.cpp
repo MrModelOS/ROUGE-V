@@ -61,7 +61,16 @@ bool parse_instruction(const std::string& raw, PtxInstruction* out) {
     const size_t sp = rest.find(' ');
     if (sp == std::string::npos) return false;
     std::string pred = trim(rest.substr(1, sp - 1));
+    // Negation may precede the register sigil: "@!%p1" as well as "@%p1" and
+    // "@!p1" all occur in real PTX. Strip '!' first, then '%', and keep the
+    // '!' prefix so consumers see the canonical "!p1" / "p1" form.
+    bool negate = false;
+    if (!pred.empty() && pred[0] == '!') {
+      negate = true;
+      pred = pred.substr(1);
+    }
     if (!pred.empty() && pred[0] == '%') pred = pred.substr(1);
+    if (negate) pred = "!" + pred;
     out->pred = pred;
     rest = trim(rest.substr(sp + 1));
   }
@@ -133,7 +142,83 @@ int shared_elem_bytes(const std::string& type) {
   return 4;  // .b32/.u32/.s32/.f32
 }
 
+// Parse a module-scope ".global .align 4 .b32 arr[4096];" / ".const ...".
+// nvcc emits one of these per __device__ variable; "cvta.to.global.u64 %rd,
+// arr" then has to yield the symbol's real address.
+void parse_global_decl(const std::string& line, PtxProgram* prog) {
+  std::string s = trim(line);
+  const size_t semi = s.find(';');
+  if (semi != std::string::npos) s = s.substr(0, semi);
+  std::stringstream ss(s);
+  std::string tok;
+  int align = 0, elemBytes = 4;
+  bool isConst = false;
+  ss >> tok;  // ".global" or ".const"
+  if (tok == ".const") isConst = true;
+  while (ss >> tok) {
+    if (tok == ".align") {
+      ss >> tok;
+      align = std::atoi(tok.c_str());
+    } else if (!tok.empty() && tok[0] == '.') {
+      elemBytes = shared_elem_bytes(tok);
+    } else {
+      std::string t = tok;
+      if (!t.empty() && t.back() == ',') t.pop_back();
+      if (t.empty()) continue;
+      PtxGlobalVar v;
+      const size_t lb = t.find('[');
+      if (lb != std::string::npos) {
+        const size_t rb = t.find(']', lb);
+        if (rb != std::string::npos) {
+          v.name = t.substr(0, lb);
+          v.count = std::atoi(t.substr(lb + 1, rb - lb - 1).c_str());
+        }
+      } else {
+        v.name = t;
+      }
+      if (v.name.empty()) continue;
+      v.elemBytes = elemBytes;
+      v.align = align > 0 ? align : (elemBytes >= 8 ? 8 : elemBytes);
+      v.isConst = isConst;
+      prog->globalIndex[v.name] = static_cast<int>(prog->globals.size());
+      prog->globals.push_back(std::move(v));
+    }
+  }
+}
+
 int align_up(int v, int a) { return (v + a - 1) / a * a; }
+
+// Parse one ".param ..." entry of a kernel signature. Pointer/space/align
+// attributes are tolerated: the last recognised width token wins (so
+// ".param .u32 .ptr .global .b64 name" is stored as 8 bytes), the name is the
+// last token. Real nvcc output puts the whole signature on one line, so this
+// is fed comma-separated entries by the parser below.
+bool parse_param_entry(const std::string& entry, PtxFunction* fn, int lineNo,
+                       std::string* error) {
+  std::stringstream pss(entry);
+  std::string tok, name;
+  if (!(pss >> tok) || tok != ".param") return true;  // not a parameter
+  uint32_t w = 0;
+  while (pss >> tok) {
+    name = tok;
+    const uint32_t tw = param_width(tok);
+    if (tw != 0) w = tw;
+  }
+  if (w == 0 || name.empty()) {
+    if (error)
+      *error = "unsupported param type in '" + entry + "' (line " +
+               std::to_string(lineNo) + ")";
+    return false;
+  }
+  PtxParam p;
+  p.name = name;
+  p.width = static_cast<int>(w);
+  p.index = static_cast<int>(fn->params.size());
+  p.offset = fn->paramsBlobSize;
+  fn->paramsBlobSize += static_cast<int>(w);
+  fn->params.push_back(std::move(p));
+  return true;
+}
 
 // Parse ".shared .align 4 .b32 smem[256];" (or a comma list of vars) and lay
 // them out in the block scratchpad: successive variables get alignment-padded
@@ -282,11 +367,34 @@ std::unique_ptr<PtxProgram> parse_ptx(const std::string& text, std::string* erro
       cur = &prog->functions.back();
       cur->name = fname;
       prog->functionIndex[fname] = static_cast<int>(prog->functions.size()) - 1;
-      inParams = (paren != std::string::npos);
+      if (paren == std::string::npos) {
+        inParams = false;
+      } else {
+        // Real nvcc output keeps the whole signature on ONE line:
+        //   .visible .entry k(.param .u64 a, .param .u32 n) {
+        // while hand-written PTX spreads it over several lines. Support both.
+        const size_t close = rest.find(')', paren);
+        if (close == std::string::npos) {
+          inParams = true;  // multi-line signature
+        } else {
+          std::stringstream sig(rest.substr(paren + 1, close - paren - 1));
+          std::string entry;
+          while (std::getline(sig, entry, ',')) {
+            entry = trim(entry);
+            if (entry.empty()) continue;
+            if (!parse_param_entry(entry, cur, lineNo, error)) return nullptr;
+          }
+          inParams = false;
+        }
+      }
       continue;
     }
 
-    if (!cur) continue;  // pre-function directives: .version .target .address_size
+    if (!cur) {  // module-scope: .version/.target/.address_size and .global
+      if (s.rfind(".global", 0) == 0 || s.rfind(".const", 0) == 0)
+        parse_global_decl(s, prog.get());
+      continue;
+    }
 
     if (inParams) {
       if (s == ")") {
@@ -294,25 +402,20 @@ std::unique_ptr<PtxProgram> parse_ptx(const std::string& text, std::string* erro
         continue;
       }
       if (s.rfind(".param", 0) == 0) {
-        std::string ps = s;
-        if (!ps.empty() && ps.back() == ',') ps.pop_back();
-        std::stringstream pss(ps);
-        std::string tok, type, name;
-        pss >> tok;   // ".param"
-        pss >> type;  // ".u64"
-        pss >> name;
-        const uint32_t w = param_width(type);
-        if (w == 0) {
-          if (error) *error = "unsupported param type '" + type + "' (line " + std::to_string(lineNo) + ")";
-          return nullptr;
+        // Multi-line signature: one or more comma-separated entries, possibly
+        // with the closing ")" on the same line.
+        std::stringstream pss(s);
+        std::string entry;
+        while (std::getline(pss, entry, ',')) {
+          entry = trim(entry);
+          const size_t cp = entry.find(')');
+          if (cp != std::string::npos) {
+            entry = trim(entry.substr(0, cp));
+            inParams = false;
+          }
+          if (entry.empty()) continue;
+          if (!parse_param_entry(entry, cur, lineNo, error)) return nullptr;
         }
-        PtxParam p;
-        p.name = name;
-        p.width = static_cast<int>(w);
-        p.index = static_cast<int>(cur->params.size());
-        p.offset = cur->paramsBlobSize;
-        cur->paramsBlobSize += static_cast<int>(w);
-        cur->params.push_back(std::move(p));
       }
       continue;
     }
@@ -420,19 +523,158 @@ bool shared_symbol_addr(const PtxFunction& fn, const ExecState& st,
   return true;
 }
 
-// Resolve a memory operand: shared symbol first, otherwise a GPR holding an
-// address (global, or shared address produced by cvta.to.shared).
+// Split a PTX memory operand into a base symbol/register and a constant byte
+// offset: "[%r6]" -> ("r6", 0), "[%r6+512]" -> ("r6", 512), "[smem-4]" -> ...
+// Real nvcc output indexes shared memory exactly this way, so the offset form
+// is not optional. Returns false when there is no trailing +/-Const.
+bool split_reg_offset(const std::string& inner, std::string* base,
+                      int64_t* offset) {
+  const size_t p = inner.find_first_of("+-");
+  if (p == std::string::npos || p == 0) return false;
+  const std::string tail = inner.substr(p + 1);
+  if (tail.empty()) return false;
+  for (char c : tail)
+    if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+  *base = inner.substr(0, p);
+  *offset = std::strtoll(tail.c_str(), nullptr, 10);
+  return true;
+}
+
+// Resolve a memory operand: shared symbol first, then a shared symbol with a
+// constant offset, then a GPR holding an address (global, or a shared address
+// produced by cvta.to.shared), then a GPR plus a constant offset.
 uintptr_t mem_addr(const PtxFunction& fn, const ExecState& st,
                    const std::string& tok) {
   uintptr_t shared = 0;
   if (shared_symbol_addr(fn, st, tok, &shared)) return shared;
-  return static_cast<uintptr_t>(st.reg(strip_brackets(tok)));
+  const std::string inner = strip_brackets(tok);
+  std::string base;
+  int64_t off = 0;
+  if (split_reg_offset(inner, &base, &off))
+    return static_cast<uintptr_t>(st.reg(base) + static_cast<uint64_t>(off));
+  return static_cast<uintptr_t>(st.reg(inner));
 }
 
 const PtxParam* find_param(const PtxFunction& fn, const std::string& name) {
   for (const auto& p : fn.params)
     if (p.name == name) return &p;
   return nullptr;
+}
+
+// ---- integer ALU helpers -------------------------------------------------
+// Everything below is written with plain C++ operators and explicit masks so
+// the interpreter lands on exactly the bits the AOT path gets from LLVM's
+// integer instructions (same operands, same widths, same shifts). None of it
+// relies on implementation-defined behaviour (signed overflow, >> on a
+// negative value, INT_MIN / -1, out-of-range float->int casts).
+
+bool ends_with(const std::string& s, const char* suffix) {
+  const size_t n = std::strlen(suffix);
+  return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+// Width in bits of the integer type a mnemonic ends with (".s32", ".u64",
+// ".b16", ...); 0 for float / predicate / vector forms so callers can route
+// those to the dedicated blocks.
+int int_type_bits(const std::string& op) {
+  if (ends_with(op, ".s64") || ends_with(op, ".u64") || ends_with(op, ".b64")) return 64;
+  if (ends_with(op, ".s32") || ends_with(op, ".u32") || ends_with(op, ".b32")) return 32;
+  if (ends_with(op, ".s16") || ends_with(op, ".u16") || ends_with(op, ".b16")) return 16;
+  return 0;
+}
+
+bool is_signed_int_type(const std::string& op) {
+  return ends_with(op, ".s16") || ends_with(op, ".s32") || ends_with(op, ".s64");
+}
+
+// Truncate a computed value to the width of the destination register, so stale
+// upper bits never leak into a later read of the same register.
+uint64_t width_mask(uint64_t v, int bits) {
+  if (bits >= 64) return v;
+  return v & ((1ull << bits) - 1ull);
+}
+
+// Sign-extend the low `bits` of v to 64 bits (no UB: v is unsigned).
+uint64_t sext64(uint64_t v, int bits) {
+  if (bits >= 64) return v;
+  const uint64_t sign = 1ull << (bits - 1);
+  return (v ^ sign) - sign;
+}
+
+// Arithmetic shift right (PTX shr.s32 / shr.s64): shifts in copies of the
+// sign bit without relying on the pre-C++20 rule for negative operands.
+uint32_t sar32(uint32_t v, unsigned sh) {
+  if (sh == 0) return v;
+  if ((v & 0x80000000u) == 0) return v >> sh;
+  return ~((~v) >> sh);
+}
+
+uint64_t sar64(uint64_t v, unsigned sh) {
+  if (sh == 0) return v;
+  if ((v & 0x8000000000000000ull) == 0) return v >> sh;
+  return ~((~v) >> sh);
+}
+
+unsigned popcount32(uint32_t v) {
+  v = v - ((v >> 1) & 0x55555555u);
+  v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+  v = (v + (v >> 4)) & 0x0f0f0f0fu;
+  return (v * 0x01010101u) >> 24;
+}
+
+unsigned popcount64(uint64_t v) {
+  return popcount32(static_cast<uint32_t>(v)) +
+         popcount32(static_cast<uint32_t>(v >> 32));
+}
+
+unsigned clz32(uint32_t v) {
+  if (v == 0) return 32;
+  unsigned n = 0;
+  if ((v & 0xffff0000u) == 0) { n += 16; v <<= 16; }
+  if ((v & 0xff000000u) == 0) { n += 8;  v <<= 8;  }
+  if ((v & 0xf0000000u) == 0) { n += 4;  v <<= 4;  }
+  if ((v & 0xc0000000u) == 0) { n += 2;  v <<= 2;  }
+  if ((v & 0x80000000u) == 0) { n += 1; }
+  return n;
+}
+
+unsigned clz64(uint64_t v) {
+  if (v == 0) return 64;
+  if (static_cast<uint32_t>(v >> 32) != 0) return clz32(static_cast<uint32_t>(v >> 32));
+  return 32u + clz32(static_cast<uint32_t>(v));
+}
+
+// PTX float/double -> integer conversion: round toward zero and saturate at
+// the destination range (NaN -> 0), which is what the hardware and the AOT
+// path's fptosi/fptoui produce. Casts are only reached for in-range values.
+uint64_t fp_to_int(double d, int bits, bool sgn) {
+  if (std::isnan(d)) return 0;
+  const uint64_t half =
+      (bits >= 64) ? 0x8000000000000000ull : (1ull << (bits - 1));
+  const uint64_t umax = (bits >= 64) ? ~0ull : ((1ull << bits) - 1ull);
+  if (sgn) {
+    const double lo = -std::ldexp(1.0, bits - 1);
+    const double hi = std::ldexp(1.0, bits - 1);
+    if (d <= lo) return half;
+    if (d >= hi) return half - 1ull;
+    return static_cast<uint64_t>(static_cast<int64_t>(d));
+  }
+  if (d <= 0.0) return 0;
+  const double hi = std::ldexp(1.0, bits);
+  if (d >= hi) return umax;
+  return static_cast<uint64_t>(d);
+}
+
+// Operands are split on ',', so a vector destination "{%r2, %r3}" reaches the
+// interpreter as the two tokens "{%r2" and "r3}". Strip the braces and the
+// "%" prefix (norm_operand only drops a leading one) to get the register names.
+std::string vector_reg_name(const std::string& tok) {
+  std::string s = trim(tok);
+  if (!s.empty() && s.front() == '{') s.erase(s.begin());
+  if (!s.empty() && s.back() == '}') s.pop_back();
+  s = trim(s);
+  if (!s.empty() && s.front() == '%') s.erase(s.begin());
+  return s;
 }
 
 // Warp state for shfl/vote fallbacks: the CTA scheduler sets this to the
@@ -512,11 +754,18 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       return 1;
     }
 
-    if (op == "mul.wide.u32") {
-      if (A.size() < 3) { if (error) *error = "bad mul.wide.u32 in " + fn.name; return 0; }
+    if (op == "mul.wide.u32" || op == "mul.wide.s32") {
+      if (A.size() < 3) { if (error) *error = "bad mul.wide in " + fn.name; return 0; }
       const uint32_t a = static_cast<uint32_t>(operand_u64(st, A[1]));
       const uint32_t b = static_cast<uint32_t>(operand_u64(st, A[2]));
-      st.setreg(A[0], static_cast<uint64_t>(a) * static_cast<uint64_t>(b));
+      if (op == "mul.wide.s32") {
+        // 32x32 -> 64 signed widening multiply (matches the AOT's sext+mul).
+        const int64_t prod = static_cast<int64_t>(static_cast<int32_t>(a)) *
+                             static_cast<int64_t>(static_cast<int32_t>(b));
+        st.setreg(A[0], static_cast<uint64_t>(prod));
+      } else {
+        st.setreg(A[0], static_cast<uint64_t>(a) * static_cast<uint64_t>(b));
+      }
       st.pc = next_pc;
       return 1;
     }
@@ -527,7 +776,7 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       st.pc = next_pc;
       return 1;
     }
-    if (op == "sub.s64" || op == "sub.u64" || op == "sub.u32") {
+    if (op == "sub.s64" || op == "sub.u64" || op == "sub.u32" || op == "sub.s32") {
       if (A.size() < 3) { if (error) *error = "bad sub in " + fn.name; return 0; }
       st.setreg(A[0], operand_u64(st, A[1]) - operand_u64(st, A[2]));
       st.pc = next_pc;
@@ -584,6 +833,320 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       return 1;
     }
 
+    // ---- integer bit logic: and / or / xor / not / shl / shr ---------------
+    // and.pred / or.pred / not.pred end in a predicate type, so int_type_bits
+    // returns 0 for them and they fall through to the predicate block below.
+    if (op.rfind("and.", 0) == 0 || op.rfind("or.", 0) == 0 ||
+        op.rfind("xor.", 0) == 0 || op.rfind("not.", 0) == 0 ||
+        op.rfind("shl.", 0) == 0 || op.rfind("shr.", 0) == 0) {
+      const int bits = int_type_bits(op);
+      if (bits == 16 || bits == 32 || bits == 64) {
+        const bool unary = op.rfind("not.", 0) == 0;
+        const size_t need = unary ? 2 : 3;
+        if (A.size() < need) {
+          if (error) *error = "bad " + op + " in " + fn.name;
+          return 0;
+        }
+        const uint64_t a = operand_u64(st, A[1]);
+        const uint64_t b = unary ? 0 : operand_u64(st, A[2]);
+        uint64_t r = a;
+        if (op.rfind("and.", 0) == 0) r = a & b;
+        else if (op.rfind("or.", 0) == 0) r = a | b;
+        else if (op.rfind("xor.", 0) == 0) r = a ^ b;
+        else if (unary) r = ~a;
+        else {
+          // PTX shift amounts are taken modulo the operand width.
+          const unsigned sh =
+              static_cast<unsigned>(b & (bits == 64 ? 63ull : 31ull));
+          if (op.rfind("shl.", 0) == 0) r = a << sh;
+          else if (is_signed_int_type(op))
+            r = (bits == 64) ? sar64(a, sh) : sar32(static_cast<uint32_t>(a), sh);
+          else
+            r = (bits == 64) ? (a >> sh) : (static_cast<uint32_t>(a) >> sh);
+        }
+        st.setreg(A[0], width_mask(r, bits));
+        st.pc = next_pc;
+        return 1;
+      }
+    }
+
+    // ---- integer multiply / multiply-add / divide / remainder ------------
+    // mul.wide.* is handled above; f32/f16 forms by their own blocks.
+    if (op.rfind("mul.lo.", 0) == 0 || op.rfind("mul.hi.", 0) == 0 ||
+        op.rfind("mad.lo.", 0) == 0 || op.rfind("mad.hi.", 0) == 0 ||
+        op.rfind("div.", 0) == 0 || op.rfind("rem.", 0) == 0) {
+      const int bits = int_type_bits(op);
+      if (bits == 32 || bits == 64) {
+        const bool is_mad = op.rfind("mad.", 0) == 0;
+        const size_t need = is_mad ? 4 : 3;
+        if (A.size() < need) {
+          if (error) *error = "bad " + op + " in " + fn.name;
+          return 0;
+        }
+        const uint64_t a = operand_u64(st, A[1]);
+        const uint64_t b = operand_u64(st, A[2]);
+        const uint64_t c = is_mad ? operand_u64(st, A[3]) : 0;
+        const bool sgn = is_signed_int_type(op);
+        uint64_t r = 0;
+        if (op.rfind("mul.", 0) == 0 || is_mad) {
+          if (bits == 64) {
+            // 64-bit product: the low word of the full 128-bit result, and
+            // the addend joins it in 64-bit (modulo 2^64).
+            r = a * b + (is_mad ? c : 0ull);
+          } else {
+            const uint64_t prod = static_cast<uint64_t>(static_cast<uint32_t>(a)) *
+                                  static_cast<uint64_t>(static_cast<uint32_t>(b));
+            if (op.find(".hi.") != std::string::npos) {
+              // High word of the 64-bit product. nvcc only emits mad.hi with a
+              // zero addend (it splits a 64-bit product into lo + hi), so the
+              // high word alone is the result.
+              r = sgn ? sar64(bit_cast_v<uint64_t>(
+                                 static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(a))) *
+                                 static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(b)))),
+                             32)
+                      : (prod >> 32);
+            } else {
+              r = prod + (is_mad ? c : 0ull);
+            }
+          }
+        } else if (bits == 32) {
+          // A zero divisor is undefined in PTX; return 0 instead of trapping.
+          if (sgn) {
+            const int32_t x = static_cast<int32_t>(static_cast<uint32_t>(a));
+            const int32_t y = static_cast<int32_t>(static_cast<uint32_t>(b));
+            if (y == 0) r = 0;
+            else if (x == INT32_MIN && y == -1) r = static_cast<uint32_t>(x);  // wraps
+            else if (op.rfind("rem.", 0) == 0) r = static_cast<uint32_t>(x % y);
+            else r = static_cast<uint32_t>(x / y);
+          } else {
+            const uint32_t x = static_cast<uint32_t>(a);
+            const uint32_t y = static_cast<uint32_t>(b);
+            if (y == 0) r = 0;
+            else if (op.rfind("rem.", 0) == 0) r = x % y;
+            else r = x / y;
+          }
+        } else {
+          if (sgn) {
+            const int64_t x = static_cast<int64_t>(a);
+            const int64_t y = static_cast<int64_t>(b);
+            if (y == 0) r = 0;
+            else if (x == INT64_MIN && y == -1) r = static_cast<uint64_t>(x);  // wraps
+            else if (op.rfind("rem.", 0) == 0) r = static_cast<uint64_t>(x % y);
+            else r = static_cast<uint64_t>(x / y);
+          } else {
+            if (b == 0) r = 0;
+            else if (op.rfind("rem.", 0) == 0) r = a % b;
+            else r = a / b;
+          }
+        }
+        st.setreg(A[0], width_mask(r, bits));
+        st.pc = next_pc;
+        return 1;
+      }
+    }
+
+    // ---- min / max --------------------------------------------------------
+    if (op.rfind("min.", 0) == 0 || op.rfind("max.", 0) == 0) {
+      const int bits = int_type_bits(op);
+      if (bits == 32 || bits == 64) {
+        if (A.size() < 3) {
+          if (error) *error = "bad " + op + " in " + fn.name;
+          return 0;
+        }
+        const uint64_t a = operand_u64(st, A[1]);
+        const uint64_t b = operand_u64(st, A[2]);
+        const bool is_min = op.rfind("min.", 0) == 0;
+        uint64_t r = a;
+        if (bits == 32) {
+          if (is_signed_int_type(op)) {
+            const int32_t x = static_cast<int32_t>(static_cast<uint32_t>(a));
+            const int32_t y = static_cast<int32_t>(static_cast<uint32_t>(b));
+            r = is_min ? (x < y ? x : y) : (x > y ? x : y);
+          } else {
+            const uint32_t x = static_cast<uint32_t>(a);
+            const uint32_t y = static_cast<uint32_t>(b);
+            r = is_min ? (x < y ? x : y) : (x > y ? x : y);
+          }
+        } else if (is_signed_int_type(op)) {
+          const int64_t x = static_cast<int64_t>(a);
+          const int64_t y = static_cast<int64_t>(b);
+          r = static_cast<uint64_t>(is_min ? (x < y ? x : y) : (x > y ? x : y));
+        } else {
+          r = is_min ? (a < b ? a : b) : (a > b ? a : b);
+        }
+        st.setreg(A[0], width_mask(r, bits));
+        st.pc = next_pc;
+        return 1;
+      }
+    }
+
+    // ---- bfi / bfe: bit-field insert / extract ----------------------------
+    // nvcc lowers __shfl through bfi, so real PTX needs it even though
+    // hand-written kernels rarely use it.
+    //   bfi.b32 d, a, b, c : insert field b of a starting at bit c&0xff,
+    //                       width (c>>8)&0xff  -> d
+    //   bfe.b32 d, a, b, c : extract that field out of a
+    if (op.rfind("bfi.", 0) == 0 || op.rfind("bfe.", 0) == 0) {
+      if (A.size() < 4) { if (error) *error = "bad " + op + " in " + fn.name; return 0; }
+      const uint64_t a = operand_u64(st, A[1]);
+      const uint64_t b = operand_u64(st, A[2]);
+      const uint32_t c = static_cast<uint32_t>(operand_u64(st, A[3]));
+      const unsigned start = c & 0xffu;
+      unsigned width = (c >> 8) & 0xffu;
+      if (width == 0) width = 32;
+      if (width > 32) width = 32;
+      const uint32_t mask32 = (width >= 32) ? 0xffffffffu
+                                            : ((1u << width) - 1u);
+      uint64_t r;
+      if (op.rfind("bfi.", 0) == 0) {
+        const uint32_t av = static_cast<uint32_t>(a) & ~mask32;
+        const uint32_t bv = static_cast<uint32_t>(b) & mask32;
+        r = av | (static_cast<uint64_t>(bv) << start);
+      } else {
+        r = (static_cast<uint32_t>(a) >> start) & mask32;
+      }
+      int rb = 32;
+      {
+        const auto it = fn.regBits.find(A[0]);
+        if (it != fn.regBits.end()) rb = it->second;
+      }
+      st.setreg(A[0], width_mask(r, rb));
+      st.pc = next_pc;
+      return 1;
+    }
+
+    // ---- neg / abs / popc / clz / bfind.shiftamt --------------------------
+    if (op.rfind("neg.", 0) == 0 || op.rfind("abs.", 0) == 0 ||
+        op.rfind("popc.", 0) == 0 || op.rfind("clz.", 0) == 0 ||
+        op.rfind("bfind.shiftamt.", 0) == 0) {
+      const int bits = int_type_bits(op);
+      if (bits != 0) {
+        if (A.size() < 2) {
+          if (error) *error = "bad " + op + " in " + fn.name;
+          return 0;
+        }
+        const uint64_t a = operand_u64(st, A[1]);
+        uint64_t r = 0;
+        if (op.rfind("neg.", 0) == 0) {
+          r = 0ull - a;  // two's complement negation
+        } else if (op.rfind("abs.", 0) == 0) {
+          if (op.find(".u") != std::string::npos) {
+            r = a & ~(1ull << (bits - 1));  // abs.u*: drop the sign bit
+          } else if (bits == 32) {
+            const int32_t x = static_cast<int32_t>(static_cast<uint32_t>(a));
+            r = static_cast<uint32_t>(x < 0 ? 0u - static_cast<uint32_t>(x)
+                                            : static_cast<uint32_t>(x));
+          } else {
+            // abs.s64: |x|, with INT64_MIN wrapping to itself.
+            r = (a >> 63) ? (0ull - a) : a;
+          }
+        } else if (op.rfind("popc.", 0) == 0) {
+          r = (bits == 64) ? popcount64(a) : popcount32(static_cast<uint32_t>(a));
+        } else {
+          // clz and bfind.shiftamt: distance from the top set bit (all-zero
+          // input yields the full width, as on the hardware).
+          r = (bits == 64) ? clz64(a) : clz32(static_cast<uint32_t>(a));
+        }
+        st.setreg(A[0], width_mask(r, bits));
+        st.pc = next_pc;
+        return 1;
+      }
+    }
+
+    // ---- f32 unary: fneg / fnabs / sqrt / rsqrt / rcp ---------------------
+    if (op == "fneg.f32" || op == "fnabs.f32" ||
+        ((op.rfind("sqrt.", 0) == 0 || op.rfind("rsqrt.", 0) == 0 ||
+          op.rfind("rcp.", 0) == 0) &&
+         op.find(".f32") != std::string::npos)) {
+      if (A.size() < 2) {
+        if (error) *error = "bad " + op + " in " + fn.name;
+        return 0;
+      }
+      const uint32_t in = static_cast<uint32_t>(operand_u64(st, A[1]));
+      uint32_t r = in;
+      if (op == "fneg.f32") {
+        r = in ^ 0x80000000u;  // sign flip (exact for +-0, inf and NaN too)
+      } else if (op == "fnabs.f32") {
+        r = in & 0x7fffffffu;
+      } else {
+        const float x = bit_cast_v<float>(in);
+        float y = 0.0f;
+        if (op.rfind("rsqrt.", 0) == 0) y = 1.0f / std::sqrt(x);
+        else if (op.rfind("rcp.", 0) == 0) y = 1.0f / x;
+        else y = std::sqrt(x);
+        r = bit_cast_v<uint32_t>(y);
+      }
+      st.setreg(A[0], r);
+      st.pc = next_pc;
+      return 1;
+    }
+
+    // ---- selp / slct: per-thread select -----------------------------------
+    if (op.rfind("selp.", 0) == 0) {
+      // selp.<type> %d, %a, %b, %p  ->  %p ? %a : %b
+      if (A.size() < 4) {
+        if (error) *error = "bad " + op + " in " + fn.name;
+        return 0;
+      }
+      const auto it = st.preds.find(A[3]);
+      const bool take_a = (it != st.preds.end()) && it->second;
+      const int bits = int_type_bits(op);
+      st.setreg(A[0], width_mask(operand_u64(st, take_a ? A[1] : A[2]), bits ? bits : 64));
+      st.pc = next_pc;
+      return 1;
+    }
+
+    if (op.rfind("slct.", 0) == 0) {
+      // slct.<type> %d, %a, %b, %c  ->  (c & 1) ? %a : %b
+      if (A.size() < 4) {
+        if (error) *error = "bad " + op + " in " + fn.name;
+        return 0;
+      }
+      const bool take_a = (operand_u64(st, A[3]) & 1ull) != 0;
+      const int bits = int_type_bits(op);
+      st.setreg(A[0], width_mask(operand_u64(st, take_a ? A[1] : A[2]), bits ? bits : 64));
+      st.pc = next_pc;
+      return 1;
+    }
+
+    // ---- predicate logic: and.pred / or.pred / not.pred -------------------
+    if (op.rfind("and.pred", 0) == 0 || op.rfind("or.pred", 0) == 0) {
+      // and.pred d, a, b[, c]  ->  (a && b) || !c     (c defaults to true)
+      // or.pred  d, a, b[, c]  ->  (a || b) || !c
+      if (A.size() < 3) {
+        if (error) *error = "bad " + op + " in " + fn.name;
+        return 0;
+      }
+      const auto value = [&](const std::string& n) {
+        const auto it = st.preds.find(n);
+        return it != st.preds.end() && it->second;
+      };
+      const bool a = value(A[1]);
+      const bool b = value(A[2]);
+      const bool c = A.size() >= 4 ? value(A[3]) : true;
+      st.preds[A[0]] = (op[0] == 'a') ? ((a && b) || !c) : ((a || b) || !c);
+      st.pc = next_pc;
+      return 1;
+    }
+
+    if (op.rfind("not.pred", 0) == 0 || op.rfind("cnot.pred", 0) == 0) {
+      // not.pred d, a[, c]  ->  (a != c); with the 2-operand form c is true,
+      // which reduces to !a.
+      if (A.size() < 2) {
+        if (error) *error = "bad " + op + " in " + fn.name;
+        return 0;
+      }
+      const auto value = [&](const std::string& n) {
+        const auto it = st.preds.find(n);
+        return it != st.preds.end() && it->second;
+      };
+      const bool a = value(A[1]);
+      const bool c = A.size() >= 3 ? value(A[2]) : true;
+      st.preds[A[0]] = (a != c);
+      st.pc = next_pc;
+      return 1;
+    }
+
     if (op.find("x2") != std::string::npos &&
         op.rfind("ld.", 0) != 0 && op.rfind("st.", 0) != 0) {
       // f16x2/bf16x2 fallback for non-memory ops: payload as i32
@@ -605,9 +1168,34 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
     }
 
     if (op.rfind("cvt.", 0) == 0) {
-      // cvt.<dst>.<src> %d, %s  (integer conversions; a few float cases for realism)
+      // cvt.<mod>.<dst>.<src> %d, %s  (integer conversions; a few float cases
+      // for realism)
       if (A.size() < 2) { if (error) *error = "bad cvt in " + fn.name; return 0; }
-      std::string spec = op.substr(4);  // "<dst>.<src>"
+      const std::string full = op.substr(4);  // "<mod>.<dst>.<src>"
+
+      // Saturating and explicitly-rounded conversions (cvt.sat.*, cvt.rz/rn/
+      // ru/rp/rm/rzi.*) are deliberately not emulated: they need PTX's
+      // saturation and rounding rules, so fail loudly instead of silently
+      // handing back the source bits. ".rn" stays legal for the f16/bf16
+      // narrowing handled below.
+      {
+        std::stringstream mods(full);
+        std::string mt;
+        while (std::getline(mods, mt, '.')) {
+          const bool is_round = mt == "rn" || mt == "rz" || mt == "rm" ||
+                                mt == "rp" || mt == "ru" || mt == "rzi";
+          if (mt != "sat" && !is_round) continue;
+          if (mt == "rn" && (op.find(".f16") != std::string::npos ||
+                             op.find(".bf16") != std::string::npos))
+            continue;
+          if (error)
+            *error = "unsupported rounding/saturating conversion '" + op +
+                     "' in " + fn.name;
+          return 0;
+        }
+      }
+
+      std::string spec = full;
       if (spec.rfind("rn.", 0) == 0) spec = spec.substr(3);  // cvt.rn.f16.f32 etc.
       const size_t dot = spec.find('.');
       const std::string dst = dot == std::string::npos ? spec : spec.substr(0, dot);
@@ -637,15 +1225,95 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
         st.pc = next_pc;
         return 1;
       }
-      if (dst == "f32" && (src == "u32" || src == "s32" || src == "u16" || src == "s16")) {
-        const int32_t sv = (src[0] == 'u') ? static_cast<int32_t>(raw32)
-                                           : static_cast<int32_t>(raw);
-        st.setreg(A[0], bit_cast_v<uint32_t>(static_cast<float>(sv)));
+      if (dst == "f32" && (src == "u32" || src == "s32" || src == "b32" ||
+                           src == "u16" || src == "s16" || src == "b16")) {
+        // 32-bit source: signed/unsigned as written; 16-bit source: widened to
+        // 32 first (sign-extended for .s16) so the float value is exact.
+        float fv = 0.0f;
+        if (src == "s32") fv = static_cast<float>(static_cast<int32_t>(raw32));
+        else if (src == "u32" || src == "b32") fv = static_cast<float>(raw32);
+        else if (src == "s16")
+          fv = static_cast<float>(static_cast<int16_t>(static_cast<uint16_t>(raw)));
+        else fv = static_cast<float>(static_cast<uint16_t>(raw));
+        st.setreg(A[0], bit_cast_v<uint32_t>(fv));
         st.pc = next_pc;
         return 1;
       }
-      if (dst == "f32" && src == "u64") {
-        st.setreg(A[0], bit_cast_v<uint32_t>(static_cast<float>(raw)));
+      if (dst == "f32" && (src == "u64" || src == "s64" || src == "b64")) {
+        const float fv = (src == "u64")
+                             ? static_cast<float>(raw)
+                             : static_cast<float>(static_cast<int64_t>(raw));
+        st.setreg(A[0], bit_cast_v<uint32_t>(fv));
+        st.pc = next_pc;
+        return 1;
+      }
+      if (dst == "f64" && (src == "u32" || src == "s32" || src == "b32" ||
+                           src == "u16" || src == "s16" || src == "b16" ||
+                           src == "u64" || src == "s64" || src == "b64")) {
+        double dv = 0.0;
+        if (src == "s16")
+          dv = static_cast<double>(static_cast<int16_t>(static_cast<uint16_t>(raw)));
+        else if (src == "s32") dv = static_cast<double>(static_cast<int32_t>(raw32));
+        else if (src == "s64") dv = static_cast<double>(static_cast<int64_t>(raw));
+        else dv = static_cast<double>(raw);
+        st.setreg(A[0], bit_cast_v<uint64_t>(dv));
+        st.pc = next_pc;
+        return 1;
+      }
+      if (src == "f64" && (dst == "u32" || dst == "s32" || dst == "b32" ||
+                           dst == "u16" || dst == "s16" || dst == "b16" ||
+                           dst == "u64" || dst == "s64" || dst == "b64")) {
+        // float -> integer: round toward zero and saturate at the destination
+        // range (NaN -> 0), like the hardware fptosi/fptoui.
+        const int bits = int_type_bits("cvt." + dst);
+        st.setreg(A[0], width_mask(fp_to_int(bit_cast_v<double>(raw), bits,
+                                             dst[0] == 's'),
+                                   bits));
+        st.pc = next_pc;
+        return 1;
+      }
+      if (src == "f32" && (dst == "u64" || dst == "s64" || dst == "b64")) {
+        st.setreg(A[0], fp_to_int(bit_cast_v<float>(raw32), 64, dst[0] == 's'));
+        st.pc = next_pc;
+        return 1;
+      }
+      if (dst == "f32" && src == "f64") {
+        st.setreg(A[0], bit_cast_v<uint32_t>(static_cast<float>(bit_cast_v<double>(raw))));
+        st.pc = next_pc;
+        return 1;
+      }
+      if (dst == "f64" && src == "f32") {
+        st.setreg(A[0], bit_cast_v<uint64_t>(static_cast<double>(bit_cast_v<float>(raw32))));
+        st.pc = next_pc;
+        return 1;
+      }
+      // 16-bit destinations keep the low halfword whatever the source width.
+      if ((dst == "u16" || dst == "s16" || dst == "b16") &&
+          (src == "u16" || src == "s16" || src == "b16" ||
+           src == "u32" || src == "s32" || src == "b32" ||
+           src == "u64" || src == "s64" || src == "b64")) {
+        st.setreg(A[0], raw & 0xffffu);
+        st.pc = next_pc;
+        return 1;
+      }
+      // 16 -> 32: zero-extend for .u16/.b16, sign-extend for .s16.
+      if ((dst == "u32" || dst == "s32" || dst == "b32") &&
+          (src == "u16" || src == "s16" || src == "b16")) {
+        st.setreg(A[0], width_mask(src == "s16" ? sext64(raw, 16) : raw, 32));
+        st.pc = next_pc;
+        return 1;
+      }
+      // 64 -> 32: PTX narrows to the destination width, so .s64 keeps the sign
+      // in bit 31 of the result.
+      if ((dst == "u32" || dst == "s32") && src == "s64") {
+        st.setreg(A[0], static_cast<uint32_t>(sext64(raw, 32)));
+        st.pc = next_pc;
+        return 1;
+      }
+      // 16 -> 64: zero-extend for .u16, sign-extend for .s16.
+      if ((dst == "u64" || dst == "s64" || dst == "b64") &&
+          (src == "u16" || src == "s16" || src == "b16")) {
+        st.setreg(A[0], src == "s16" ? sext64(raw, 16) : (raw & 0xffffu));
         st.pc = next_pc;
         return 1;
       }
@@ -732,11 +1400,33 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       else if (op.rfind("ld.global.", 0) == 0) pref = "ld.global.";
       else pref = "ld.shared.";
       const std::string ty = op.substr(pref.size());
-      if (ty == "f32" || ty == "b32" || ty == "u32" || ty == "s32") {
+      if (ty == "v2.u32" || ty == "v2.s32" || ty == "v2.b32" || ty == "v2.f32") {
+        // 64-bit vector load. Operands are split on ',', so a destination
+        // list "{%r2, %r3}" arrives as A[0]="{%r2", A[1]="r3}" and the
+        // address moves to A[2]; a plain "%rd" destination keeps two operands.
+        const uintptr_t vaddr = mem_addr(fn, st, A.size() >= 3 ? A[2] : A[1]);
+        const uint64_t v64 = read_mem(reinterpret_cast<const uint8_t*>(vaddr), 8);
+        if (A.size() >= 3) {
+          st.setreg(vector_reg_name(A[0]), v64 & 0xffffffffu);
+          st.setreg(vector_reg_name(A[1]), static_cast<uint32_t>(v64 >> 32));
+        } else {
+          st.setreg(A[0], v64);
+        }
+      } else if (ty == "u8" || ty == "s8" || ty == "b8") {
+        // 1-byte load; .s8 sign-extends into the destination register.
+        const uint8_t b8 = *reinterpret_cast<const uint8_t*>(addr);
+        st.setreg(A[0], (ty == "s8")
+                           ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(b8)))
+                           : static_cast<uint32_t>(b8));
+      } else if (ty == "f32" || ty == "b32" || ty == "u32" || ty == "s32") {
         st.setreg(A[0], read_mem(reinterpret_cast<const uint8_t*>(addr), 4) & 0xffffffffu);
       } else if (ty == "u64" || ty == "b64" || ty == "s64") {
         st.setreg(A[0], read_mem(reinterpret_cast<const uint8_t*>(addr), 8));
-      } else if (ty == "f16" || ty == "b16" || ty == "u16" || ty == "s16" ||
+      } else if (ty == "s16") {
+        // 16-bit signed load: sign-extend (PTX .s16 carries the sign).
+        const uint16_t h = static_cast<uint16_t>(read_mem(reinterpret_cast<const uint8_t*>(addr), 2));
+        st.setreg(A[0], static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(h))));
+      } else if (ty == "f16" || ty == "b16" || ty == "u16" ||
                  ty == "bf16" || ty == "f16x2" || ty == "bf16x2") {
         const int bytes = (ty == "f16x2" || ty == "bf16x2") ? 4 : 2;
         st.setreg(A[0], read_mem(reinterpret_cast<const uint8_t*>(addr), bytes) & 0xffffffffu);
@@ -757,7 +1447,19 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       const std::string ty = op.substr(pref.size());
       const uint64_t v = st.reg(A[1]);
       auto* p = reinterpret_cast<uint8_t*>(addr);
-      if (ty == "f32") {
+      if (ty == "v2.u32" || ty == "v2.s32" || ty == "v2.b32" || ty == "v2.f32") {
+        // 64-bit vector store: the source list "{%r2, %r3}" is split into
+        // A[1]="{%r2", A[2]="r3}" (low word first, as in memory).
+        uint64_t v64 = v;
+        if (A.size() >= 3) {
+          v64 = static_cast<uint64_t>(static_cast<uint32_t>(st.reg(vector_reg_name(A[1])))) |
+                (static_cast<uint64_t>(static_cast<uint32_t>(st.reg(vector_reg_name(A[2])))) << 32);
+        }
+        std::memcpy(p, &v64, 8);
+      } else if (ty == "u8" || ty == "s8" || ty == "b8") {
+        const uint8_t b8 = static_cast<uint8_t>(v);
+        std::memcpy(p, &b8, 1);
+      } else if (ty == "f32") {
         const uint32_t bits = static_cast<uint32_t>(v);
         std::memcpy(p, &bits, 4);
       } else if (ty == "u32" || ty == "b32" || ty == "s32") {
@@ -943,7 +1645,18 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
         if (error) *error = "bad " + op + " in " + fn.name;
         return 0;
       }
-      const std::string dst = A[0];
+      // The destination may be predicated: "shfl.sync.down.b32 %r10|%p1, ..."
+      // writes %r10 only when %p1 holds. Split it and honour the guard.
+      std::string dst = A[0];
+      std::string writePred;
+      {
+        const size_t bar = dst.find('|');
+        if (bar != std::string::npos) {
+          writePred = dst.substr(bar + 1);
+          dst = dst.substr(0, bar);
+          if (!writePred.empty() && writePred[0] == '%') writePred = writePred.substr(1);
+        }
+      }
       const std::string src = A[1];
       const bool is_idx = op.find(".idx.") != std::string::npos;
       const bool is_bfly = op.find(".bfly.") != std::string::npos;
@@ -988,7 +1701,8 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
         }
       }
       if (oob) val = st.reg(src);
-      st.setreg(dst, val);
+      // Predicated write: leave the destination untouched when the guard is false.
+      if (writePred.empty() || st.preds[writePred]) st.setreg(dst, val);
       st.pc = next_pc;
       return 1;
     }

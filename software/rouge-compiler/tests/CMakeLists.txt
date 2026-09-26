@@ -93,6 +93,22 @@ if(CLANG_EXECUTABLE)
   target_link_libraries(test_aot_shfl_reduce PRIVATE rouge-runtime)
   add_test(NAME aot_native_shfl_reduce COMMAND test_aot_shfl_reduce)
 
+  # ---- Test 4: real NVIDIA PTX (vendor input, not our own .ptx files) ----
+  # Compiles real CUDA C with nvcc and pushes the vendor PTX through the whole
+  # ptx2ir -> clang chain. Skips cleanly when nvcc is absent.
+  find_program(NVCC_EXECUTABLE nvcc)
+  if(NVCC_EXECUTABLE)
+    add_executable(test_nvcc_ptx test_nvcc_ptx.cpp)
+    target_compile_definitions(test_nvcc_ptx PRIVATE
+      "RougeTestDir=\"${CMAKE_CURRENT_SOURCE_DIR}\""
+      "RougePtx2Ir=\"$<TARGET_FILE:ptx2ir>\"")
+    add_test(NAME compiler_nvcc_ptx COMMAND test_nvcc_ptx ${NVCC_EXECUTABLE}
+             ${CLANG_EXECUTABLE})
+    set_tests_properties(compiler_nvcc_ptx PROPERTIES SKIP_RETURN_CODE 77)
+  else()
+    message(STATUS "rouge-compiler: nvcc not found — vendor-PTX test disabled")
+  endif()
+
   # ---- Test 3 (informational): same IR through the RISC-V backend ----
   # Compiles the IR for riscv64 with the vector extension (rv64gcv). Reports
   # status; skipped gracefully when this LLVM build lacks a riscv target.

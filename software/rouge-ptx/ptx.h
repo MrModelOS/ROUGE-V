@@ -32,6 +32,18 @@ struct PtxSharedVar {
   int offset = 0;     // byte offset in the block scratchpad
 };
 
+// A module-scope global: ".global .align 4 .b32 arr[4096];"
+// Real nvcc output declares every __device__ variable this way, and
+// "cvta.to.global.u64 %rd, arr" needs the symbol's real address, so the
+// declaration has to be carried into the backend.
+struct PtxGlobalVar {
+  std::string name;
+  int align = 4;
+  int elemBytes = 4;  // 1, 2, 4 or 8
+  int count = 1;      // [N] elements
+  bool isConst = false;
+};
+
 struct PtxFunction {
   std::string name;
   std::vector<PtxParam> params;
@@ -51,6 +63,8 @@ struct PtxFunction {
 struct PtxProgram {
   std::vector<PtxFunction> functions;
   std::unordered_map<std::string, int> functionIndex;  // name -> index
+  std::vector<PtxGlobalVar> globals;                    // .global/.const decls
+  std::unordered_map<std::string, int> globalIndex;    // name -> index
 };
 
 // Parse PTX assembly text into a program.
