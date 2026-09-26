@@ -4,14 +4,13 @@ on:
   push:
   pull_request:
 
-# Pinned rather than "latest": ubuntu-latest is migrating to Ubuntu 26 in
-# October 2026 and an implicit image change should never break the build.
-env:
-  RUNNER: ubuntu-24.04
-
+# The runner image is pinned rather than "latest": ubuntu-latest is migrating
+# to Ubuntu 26 in October 2026, and an implicit image change should never be
+# able to break the build. (Note: runs-on cannot read the `env` context, so
+# this has to be spelled out per job.)
 jobs:
   rouge-compiler:
-    runs-on: ${{ env.RUNNER }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -30,7 +29,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   rouge-cuda:
-    runs-on: ${{ env.RUNNER }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
