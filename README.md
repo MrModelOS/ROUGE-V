@@ -9,6 +9,12 @@
 <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0%20WITH%20LLVM--exception-blue?style=flat-square">
 </p>
 
+<p align="center">
+<a href="README.md">English</a> ·
+<a href="README.ru.md">Русский</a> ·
+<a href="README.zh.md">中文</a>
+</p>
+
 ---
 
 `nvcc` does not produce machine code for a GPU. It produces **PTX** — a textual
