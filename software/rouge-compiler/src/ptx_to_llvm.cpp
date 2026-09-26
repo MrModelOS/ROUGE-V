@@ -60,6 +60,16 @@ int spec_offset(const std::string& name) {
   return -1;
 }
 
+// Address space named by the instruction itself ("ld.global", "st.shared").
+// The opcode outranks the register mark: a register that once held a shared
+// address may later hold a global one (gemm_tile reuses %rd3 for the C tile
+// store), and only the instruction knows which access this one is.
+std::string op_space(const std::string& op) {
+  if (op.find(".shared") != std::string::npos) return "shared";
+  if (op.find(".global") != std::string::npos) return "global";
+  return "";
+}
+
 bool is_register(const std::string& tok) {
   if (tok.empty() || !std::isalpha(static_cast<unsigned char>(tok[0]))) return false;
   for (char c : tok)
@@ -1570,7 +1580,7 @@ class LlvmGen {
     if (is_cas) {
       if (!has_dst) return fail("red.cas not supported '" + op + "' @ " + std::to_string(idx));
       if (A.size() < 4) return fail("bad atomic operands @ " + std::to_string(idx));
-      const std::string addr = resolve_addr(A[1]);
+      const std::string addr = resolve_addr(A[1], op_space(op));
       const std::string cmp = operand(A[2]);
       const std::string nw = operand(A[3]);
       if (wf32) {
@@ -1604,7 +1614,7 @@ class LlvmGen {
     if (is_exch) {
       if (!has_dst) return fail("red.exch not supported '" + op + "' @ " + std::to_string(idx));
       if (A.size() < 3) return fail("bad atomic operands @ " + std::to_string(idx));
-      const std::string addr = resolve_addr(A[1]);
+      const std::string addr = resolve_addr(A[1], op_space(op));
       const std::string val = operand(A[2]);
       const std::string old = fresh("%old");
       if (wf32) {
@@ -1624,7 +1634,7 @@ class LlvmGen {
     if (is_min || is_max) {
       const size_t ai = has_dst ? 1 : 0;
       if (A.size() < ai + 2) return fail("bad atomic operands @ " + std::to_string(idx));
-      const std::string addr = resolve_addr(A[ai]);
+      const std::string addr = resolve_addr(A[ai], op_space(op));
       const std::string val = operand(A[ai + 1]);
       const std::string old = fresh("%old");
       if (wf32) {
@@ -1670,7 +1680,7 @@ class LlvmGen {
       return fail("unsupported atomic '" + op + "' @ " + std::to_string(idx) +
                   " (an f64 add would have to be a real double atomicrmw, not"
                   " the integer add below; atom.min/max.f64 are supported)");
-    const std::string addr = resolve_addr(A[ai]);
+    const std::string addr = resolve_addr(A[ai], op_space(op));
     const int align = w64 ? 8 : 4;
     const char* llTy = w64 ? "i64" : "i32";
     const std::string old = fresh("%old");
@@ -2057,7 +2067,7 @@ class LlvmGen {
     return shared_addr_regs_.count(reg) != 0;
   }
 
-  std::string addr_of(const std::string& reg_tok) {
+  std::string addr_of(const std::string& reg_tok, const std::string& space = "") {
     std::string a = load_reg(reg_tok);
     // A 32-bit address register is legal PTX (nvcc uses it for a demoted local
     // array: "mov.u32 %r, sym; add.s32 %r, %r, %off; st.shared.f32 [%r], %f"),
@@ -2067,7 +2077,8 @@ class LlvmGen {
       line("  " + w + " = zext " + reg_type(reg_tok) + " " + a + " to i64");
       a = w;
     }
-    if (is_shared_addr_reg(reg_tok)) return inttoptr_as(a, shared_ptr_ty());
+    if (space == "shared" || (space.empty() && is_shared_addr_reg(reg_tok)))
+      return inttoptr_as(a, shared_ptr_ty());
     return inttoptr_as(a, global_ptr_ty());
   }
 
@@ -2130,7 +2141,7 @@ class LlvmGen {
 
   // Resolve a memory operand ("[%rd1]", "[smem]", "[smem+4]") to a `ptr` SSA:
   // shared symbols are scratchpad-relative, registers hold addresses as-is.
-  std::string resolve_addr(const std::string& tok) {
+  std::string resolve_addr(const std::string& tok, const std::string& space = "") {
     const std::string inner = strip_brackets(tok);
     int varOffset = 0, constOff = 0;
     if (shared_symbol(inner, &varOffset, &constOff)) {
@@ -2160,10 +2171,12 @@ class LlvmGen {
         line("  " + sum + " = add i64 " + w + ", " + std::to_string(off));
       }
       const std::string ptrTy =
-          is_shared_addr_reg(base) ? shared_ptr_ty() : global_ptr_ty();
+          (space == "shared" || (space.empty() && is_shared_addr_reg(base)))
+              ? shared_ptr_ty()
+              : global_ptr_ty();
       return inttoptr_as(sum, ptrTy);
     }
-    return addr_of(inner);
+    return addr_of(inner, space);
   }
 
   bool is_16bit_ty(const std::string& op) const {
@@ -2201,7 +2214,7 @@ class LlvmGen {
       // as A[0]="{%r2", A[1]="r3}" and the address moves to A[2]; a plain
       // 64-bit destination keeps the usual two operands.
       const bool list = A.size() >= 3;
-      const std::string addr = resolve_addr(list ? A[2] : A[1]);
+      const std::string addr = resolve_addr(list ? A[2] : A[1], op_space(ins.op));
       const std::string v = fresh("%v");
       line("  " + v + " = load i64, " + pt(addr) + " " + addr + ", align 8");
       if (!list) {
@@ -2226,7 +2239,7 @@ class LlvmGen {
                      ins.op.rfind(".s64") != std::string::npos ||
                      ins.op.rfind(".b64") != std::string::npos ||
                      ins.op.rfind(".f64") != std::string::npos;
-    std::string addr = resolve_addr(A[1]);
+    std::string addr = resolve_addr(A[1], op_space(ins.op));
     if (ins.op.find("x2") != std::string::npos) {
       // f16x2/bf16x2: 32-bit payload (2×half) as i32
       const std::string v = fresh("%v");
@@ -2291,7 +2304,7 @@ class LlvmGen {
                     " (implemented: v2.{f32,u32,s32,b32} as one 64-bit access)");
       if (A.size() < 2)
         return fail("bad " + ins.op + " operands @ " + std::to_string(idx));
-      const std::string addr = resolve_addr(A[0]);
+      const std::string addr = resolve_addr(A[0], op_space(ins.op));
       if (A.size() < 3) {  // plain 64-bit source register
         line("  store i64 " + operand(A[1]) + ", " + pt(addr) + " " + addr + ", align 8");
         return true;
@@ -2326,7 +2339,7 @@ class LlvmGen {
                      ins.op.rfind(".s64") != std::string::npos ||
                      ins.op.rfind(".b64") != std::string::npos ||
                      ins.op.rfind(".f64") != std::string::npos;
-    std::string addr = resolve_addr(A[0]);
+    std::string addr = resolve_addr(A[0], op_space(ins.op));
     if (ins.op.find("x2") != std::string::npos) {
       // f16x2/bf16x2: 32-bit payload as i32
       line("  store i32 " + operand(A[1]) + ", " + pt(addr) + " " + addr + ", align 4");
