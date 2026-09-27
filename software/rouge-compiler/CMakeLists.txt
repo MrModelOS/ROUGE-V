@@ -28,6 +28,14 @@ target_link_libraries(ptx2ir PRIVATE rouge-compiler-lib)
 add_executable(rouge-run src/rouge_run_main.cpp)
 target_link_libraries(rouge-run PRIVATE rouge-compiler-lib)
 
+# User-facing tools install to bin; the test runners stay build-local
+# (they need libcuda and make no sense outside a checkout).
+include(GNUInstallDirs)
+install(TARGETS ptx2ir rouge-run RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../../LICENSE
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}/rouge-v
+        RENAME copyright)
+
 # ---- Host runtime: C-API helpers for AOT kernels (barriers, launch state) ----
 # Seed of the libcudart/libcuda replacement; host pthread backend.
 find_package(Threads REQUIRED)

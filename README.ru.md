@@ -40,6 +40,16 @@ ctest --test-dir build --output-on-failure
 
 ### Использование
 
+Без сборки — два бинарника без зависимостей, кроме системного libc:
+
+```sh
+curl -fsSL https://github.com/MrModelOS/ROUGE-V/releases/download/v0.1/rouge-v-0.1-linux-x86_64.tar.gz | tar xz -C ~/.local
+export PATH="$HOME/.local/bin:$PATH"
+ptx2ir kernel.ptx kernel.ll
+```
+
+(Arch Linux: `packaging/PKGBUILD` для AUR. `packaging/install.sh` делает то же самое.)
+
 ```sh
 ./build/rouge-compiler/ptx2ir \
     software/rouge-compiler/tests/kernels/vadd.ptx /tmp/vadd.ll

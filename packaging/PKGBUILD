@@ -1,0 +1,29 @@
+# Maintainer: MrModel <145706616+MrModelOS@users.noreply.github.com>
+pkgname=rouge-v
+pkgver=0.1
+pkgrel=1
+pkgdesc='Open PTX-to-LLVM IR compiler: run CUDA kernels on x86, RISC-V, AMD and NVIDIA GPUs'
+arch=('x86_64')
+url='https://github.com/MrModelOS/ROUGE-V'
+license=('Apache-2.0')
+depends=('gcc-libs')
+makedepends=('cmake' 'ninja' 'clang')
+optdepends=('clang: backend that consumes the emitted IR (needed for rouge-run -o)'
+            'cuda: nvcc for compiling .cu sources to PTX input')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('f9e027b97d1a5b955cb8828fd34f9f5d09a68195b95f8cb95df6d1f8a98cb44a')
+
+build() {
+  cmake -S "$pkgname-$pkgver/software/rouge-compiler" -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release
+  cmake --build build
+}
+
+check() {
+  # GPU execution tests report SKIP without an sm_75+ NVIDIA card, never fail.
+  ctest --test-dir build --output-on-failure
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+}

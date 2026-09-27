@@ -39,6 +39,16 @@ ctest --test-dir build --output-on-failure
 
 ### 使用
 
+无需构建 —— 两个二进制文件，除系统 libc 外无其他依赖：
+
+```sh
+curl -fsSL https://github.com/MrModelOS/ROUGE-V/releases/download/v0.1/rouge-v-0.1-linux-x86_64.tar.gz | tar xz -C ~/.local
+export PATH="$HOME/.local/bin:$PATH"
+ptx2ir kernel.ptx kernel.ll
+```
+
+（Arch Linux：AUR 用 `packaging/PKGBUILD`。`packaging/install.sh` 做同样的事。）
+
 ```sh
 ./build/rouge-compiler/ptx2ir \
     software/rouge-compiler/tests/kernels/vadd.ptx /tmp/vadd.ll

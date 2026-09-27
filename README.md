@@ -40,6 +40,16 @@ enables the vendor-PTX test.
 
 ### Use
 
+No build needed — two binaries with no dependencies beyond system libc:
+
+```sh
+curl -fsSL https://github.com/MrModelOS/ROUGE-V/releases/download/v0.1/rouge-v-0.1-linux-x86_64.tar.gz | tar xz -C ~/.local
+export PATH="$HOME/.local/bin:$PATH"
+ptx2ir kernel.ptx kernel.ll
+```
+
+(Arch Linux: see `packaging/PKGBUILD` for AUR. `packaging/install.sh` does the above.)
+
 The question a user has is "will you translate my kernel?". One command answers it:
 
 ```sh
