@@ -902,6 +902,12 @@ class LlvmGen {
     if (op.rfind("shfl", 0) == 0) {
       std::string kind;
       bool sync = false;
+      // A predicated destination has no NVVM counterpart wired here: refusing
+      // loudly beats silently computing the wrong lanes on hardware.
+      if (is_nvptx() && op.rfind("shfl", 0) == 0 && ins.args.size() > 0 &&
+          ins.args[0].find('|') != std::string::npos)
+        return fail("unsupported predicated " + op + " on NVPTX @ " +
+                    std::to_string(idx) + " (unpredicated shfl is supported)");
       if (nvptx_shfl(ins, &kind, &sync)) {
         // A = [dst, src, b, c] legacy or [dst, src, b, c, mask] .sync.
         // Immediates arrive in PTX spelling ("0x1f"), which LLVM IR does not
@@ -975,6 +981,12 @@ class LlvmGen {
     // ---- vote.{any,all,uni}.pred and vote.sync.* ----
     if (op.rfind("vote", 0) == 0) {
       if (A.size() < 2) return fail("bad " + op + " operands @ " + std::to_string(idx));
+      // A warp collective has no meaning one lane at a time: the scalar
+      // fallback is host-only. On a GPU it would silently answer wrong, so
+      // refuse instead of emitting it.
+      if (is_nvptx())
+        return fail("unsupported " + op + " on NVPTX @ " + std::to_string(idx) +
+                    " (warp-collective lowering not implemented yet)");
       line("  ; scalar fallback: vote.{any,all,uni} -> pred identity (warp collective in MLIR)");
       std::string srcPred = A[1];
       bool neg = false;
@@ -995,6 +1007,9 @@ class LlvmGen {
     // ---- activemask.b32 ----
     if (op.rfind("activemask", 0) == 0) {
       if (A.empty()) return fail("bad " + op + " operands @ " + std::to_string(idx));
+      if (is_nvptx())
+        return fail("unsupported " + op + " on NVPTX @ " + std::to_string(idx) +
+                    " (warp-collective lowering not implemented yet)");
       line("  ; scalar fallback: activemask -> all lanes active (0xffffffff)");
       // b32 destination is i32; -1 == 0xffffffff
       store_reg(A[0], "-1");
