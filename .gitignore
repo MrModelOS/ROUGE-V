@@ -43,3 +43,6 @@ internal/
 
 # Случайная папка в корне (переехала в software/rouge-compiler/tests/kernels)
 kernels/
+
+# Pitch & publishing (not part of the project)
+pitch/
