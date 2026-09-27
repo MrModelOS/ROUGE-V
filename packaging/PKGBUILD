@@ -1,4 +1,6 @@
 # Maintainer: MrModel <145706616+MrModelOS@users.noreply.github.com>
+# NOTE for AUR publishing: take this file from the main branch, not from the
+# tag tarball — the tag predates its own checksum by construction.
 pkgname=rouge-v
 pkgver=0.1
 pkgrel=1
@@ -11,7 +13,7 @@ makedepends=('cmake' 'ninja' 'clang')
 optdepends=('clang: backend that consumes the emitted IR (needed for rouge-run -o)'
             'cuda: nvcc for compiling .cu sources to PTX input')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('f9e027b97d1a5b955cb8828fd34f9f5d09a68195b95f8cb95df6d1f8a98cb44a')
+sha256sums=('a018c85686d121ca613755e2b2b734f27d5fbbdd36b95173a8eb2f00680062b4')
 
 build() {
   cmake -S "$pkgname-$pkgver/software/rouge-compiler" -B build -G Ninja \
