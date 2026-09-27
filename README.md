@@ -48,7 +48,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ptx2ir kernel.ptx kernel.ll
 ```
 
-(Arch Linux: see `packaging/PKGBUILD` for AUR. `packaging/install.sh` does the above.)
+(Arch Linux: `packaging/PKGBUILD` for a manual build. `packaging/install.sh` does the above.)
 
 The question a user has is "will you translate my kernel?". One command answers it:
 

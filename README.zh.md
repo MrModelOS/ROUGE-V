@@ -47,7 +47,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ptx2ir kernel.ptx kernel.ll
 ```
 
-（Arch Linux：AUR 用 `packaging/PKGBUILD`。`packaging/install.sh` 做同样的事。）
+（Arch Linux：用 `packaging/PKGBUILD` 手动构建。`packaging/install.sh` 做同样的事。）
 
 ```sh
 ./build/rouge-compiler/ptx2ir \
