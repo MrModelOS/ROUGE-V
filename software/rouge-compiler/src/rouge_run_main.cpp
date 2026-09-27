@@ -8,6 +8,8 @@
 //   rouge-run kernel.ptx              report: shared memory, atomics, sizes
 //   rouge-run kernel.ptx -o kernel.o  also emit a native object
 //   rouge-run kernel.ptx --print-ir   also write the translated IR
+//   rouge-run kernel.ptx --target nvptx64-nvidia-cuda -o kernel.o
+//                                     translate for an NVIDIA GPU instead
 //
 // Exit codes: 0 ok, 1 translation refused (unsupported op), 2 bad usage or I/O.
 
@@ -37,22 +39,58 @@ bool write_file(const std::string& path, const std::string& data) {
   return static_cast<bool>(o);
 }
 
+// Quote a path for sh: wrap in single quotes, escaping embedded ones.
+std::string sh_quote(const std::string& s) {
+  std::string r = "'";
+  for (char c : s) {
+    if (c == '\'')
+      r += "'\\''";
+    else
+      r += c;
+  }
+  return r + "'";
+}
+
+// Backend flags matching a ptx2ir --target triple, so -o verifies the IR with
+// the compiler that would actually consume it.
+std::string backend_flags(const std::string& target) {
+  if (target.rfind("riscv", 0) == 0)
+    return "--target=riscv64-unknown-elf -march=rv64gcv";
+  if (target.rfind("amdgcn", 0) == 0)
+    return "--target=amdgcn-amd-amdhsa -mcpu=gfx1100";
+  if (target.rfind("nvptx", 0) == 0)
+    return "--target=nvptx64-nvidia-cuda -march=sm_75";
+  return "";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string inPath, objPath, irPath;
+  std::string target = "x86_64-pc-linux-gnu";
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "-h" || a == "--help") {
       std::printf(
-          "usage: rouge-run <kernel.ptx> [-o <kernel.o>] [--print-ir]\n"
+          "usage: rouge-run <kernel.ptx> [-o <kernel.o>] [--print-ir] [--target <triple>]\n"
           "\n"
           "Translate a PTX kernel and verify the result compiles.\n"
           "  -o, --object <path>   write a native object file\n"
-          "      --print-ir [path]  also write the translated LLVM IR\n");
+          "      --print-ir [path]  also write the translated LLVM IR\n"
+          "      --target <triple>  translate for another platform\n"
+          "                         (also --target=<triple>); known triples:\n"
+          "                         x86_64-pc-linux-gnu, riscv64-unknown-elf,\n"
+          "                         amdgcn-amd-amdhsa, nvptx64-nvidia-cuda\n");
       return 0;
     }
-    if (a == "-o" || a == "--object") {
+    if (a == "--target") {
+      if (++i >= argc) { std::fprintf(stderr, "rouge-run: --target needs a value\n"); return 2; }
+      target = argv[i];
+    } else if (a.rfind("--target=", 0) == 0) {
+      target = a.substr(9);
+      if (target.empty()) { std::fprintf(stderr, "rouge-run: --target needs a value\n"); return 2; }
+    }
+    else if (a == "-o" || a == "--object") {
       if (++i >= argc) { std::fprintf(stderr, "rouge-run: %s needs a path\n", a.c_str()); return 2; }
       objPath = argv[i];
     } else if (a == "--print-ir") {
@@ -106,8 +144,10 @@ int main(int argc, char** argv) {
     std::printf("  shared memory: none\n");
   }
 
+  std::printf("target: %s\n", target.c_str());
+
   err.clear();
-  const std::string ir = rougecomp::ptx_to_llvm_ir(*prog, 0, &err);
+  const std::string ir = rougecomp::ptx_to_llvm_ir(*prog, 0, &err, target);
   if (ir.empty()) {
     std::fprintf(stderr, "\nrouge-run: REFUSED: %s\n", err.c_str());
     std::fprintf(stderr,
@@ -133,7 +173,9 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "rouge-run: cannot write %s\n", ll.c_str());
       return 2;
     }
-    const std::string cmd = "clang -O2 -c " + ll + " -o " + objPath + " 2>&1";
+    const std::string flags = backend_flags(target);
+    const std::string cmd = "clang " + flags + " -O2 -c " + sh_quote(ll) +
+                            " -o " + sh_quote(objPath) + " 2>&1";
     const int rc = std::system(cmd.c_str());
     std::remove(ll.c_str());
     if (rc != 0) {
