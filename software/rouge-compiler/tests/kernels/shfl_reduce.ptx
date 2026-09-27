@@ -5,10 +5,11 @@
 // ROUGE-V test kernel: warp reduction via shfl.bfly.
 // Each warp (32 threads) loads data[globalIdx] and reduces via butterfly
 // shuffle + fadd. The sum of the warp is written by lane 0 to out[blockIdx].
-// Exercises shfl.bfly.b32 fallback (warp=32, lane=tid.x%32) in both paths:
-// interpreter does cross-lane copy, AOT is scalar identity (doubling) — verified
-// only via structural/interpreter path; the PTX itself is the correctness
-// reference for the future MLIR vectorizer.
+// Exercises shfl.bfly.b32 (warp=32, lane=tid.x%32) in both paths: the
+// interpreter does cross-lane copy, the host AOT path stays scalar identity
+// (shfl is identity before vectorization; MLIR will vectorize), and the NVPTX
+// path emits a real llvm.nvvm.shfl.sync.bfly — verified bit-exactly against a
+// butterfly-order host reference on a real GPU (compiler_nvptx_gpu_exec).
 
 .visible .entry shfl_reduce(
     .param .u64 shfl_param_0,

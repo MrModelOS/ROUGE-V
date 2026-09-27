@@ -65,36 +65,36 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | собирается в нативный объект — не исполнялось |
 | `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | собирается **и исполняется на настоящей видеокарте** — см. ниже |
 
-Под все четыре тройки собираются пять канонических ядер из
+Под все четыре тройки собираются семь канонических ядер из
 `software/rouge-compiler/tests/kernels/`: `vadd`, `block_reduce`,
-`atomic_reduce`, `fp16_reduce`, `gemm_tile`.
+`atomic_reduce`, `fp16_reduce`, `gemm_tile`, `shfl_reduce`, `atom_cas`.
 
 ### Исполнено на реальном железе
 
 Ядра для NVIDIA не только собираются: `ctest compiler_nvptx_gpu_exec*`
 загружает полученный PTX через CUDA Driver API (JIT на стороне драйвера) на
 настоящей GeForce MX450 (sm_75) и сверяет каждый выход побитово с хост-эталоном:
-два набора данных для `fp16_reduce`/`gemm_tile` плюс сетка из двух блоков,
-проверяющая многоблочный путь. На машинах без NVIDIA GPU sm_75+ тесты дают
-SKIP, а не провал.
+все семь канонических ядер, два набора данных для `fp16_reduce`/`gemm_tile`
+плюс сетка из двух блоков, проверяющая многоблочный путь. `compiler_nvcc_gpu_exec`
+дополнительно гоняет настоящее вендорное ядро (`nvcc real_nvcc.cu`) насквозь. На
+машинах без NVIDIA GPU sm_75+ тесты дают SKIP, а не провал.
 
-Две GPU-строки — утверждение о **сборке**, и только о ней. Видеокарты AMD или
-NVIDIA в проекте нет, поэтому из этих строк не выполнялось ничего и никаких цифр
-производительности из них не следует. Настоящее исполнение проверено только на
-x86-64; RISC-V, AMD и NVIDIA проверены как объекты, которые принимает настоящий
-бэкенд LLVM. Цель меняет адресные пространства в эмитимом IR — именно поэтому
-эти бэкенды печатают `global_load`/`global_store`, а не скалярные обращения;
-подробности в [docs/06-compiler-architecture.md](docs/06-compiler-architecture.md).
+Строка AMD остаётся утверждением о **сборке**: AMD-видеокарты в проекте нет.
+Ни та ни другая строка ничего не говорят о производительности: мерялась только
+бит-идентичность хост-эталону. Цель меняет адресные пространства в эмитимом IR —
+именно поэтому эти бэкенды печатают `global_load`/`global_store`, а не скалярные
+обращения; подробности в
+[docs/06-compiler-architecture.md](docs/06-compiler-architecture.md).
 
 ```
 $ ctest --test-dir build
 ...
- 5/16 aot_native_block_reduce ..............   Passed   smem 1024B 16x256
- 6/16 aot_native_atomic_reduce .............   Passed   sum=4608 count=4096
- 7/16 aot_native_fp16_reduce ...............   Passed   32x32 f16/bf16
- 8/16 aot_native_gemm_tile .................   Passed   2x2 blocks 16x16
-13/16 compiler_nvcc_ptx ....................   Passed   nvcc -> ptx2ir -> clang
-100% tests passed out of 16
+ 7/21 aot_native_block_reduce ..............   Passed
+ 8/21 aot_native_atomic_reduce .............   Passed
+13/21 compiler_nvcc_ptx ....................   Passed
+19/21 compiler_nvptx_gpu_exec ..............   Passed
+21/21 compiler_nvcc_gpu_exec ...............   Passed
+100% tests passed out of 21
 ```
 
 > [!NOTE]

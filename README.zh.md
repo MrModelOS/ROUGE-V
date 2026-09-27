@@ -63,9 +63,9 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | 构建为原生目标文件 —— 从未执行 |
 | `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | 构建**并在真实 GPU 上执行** —— 见下文 |
 
-`software/rouge-compiler/tests/kernels/` 中全部五个标准内核 —— `vadd`、
-`block_reduce`、`atomic_reduce`、`fp16_reduce`、`gemm_tile` —— 都能在四种
-三元组下构建。
+`software/rouge-compiler/tests/kernels/` 中全部七个标准内核 —— `vadd`、
+`block_reduce`、`atomic_reduce`、`fp16_reduce`、`gemm_tile`、`shfl_reduce`、
+`atom_cas` —— 都能在四种三元组下构建。
 
 ### 在真实硬件上执行
 

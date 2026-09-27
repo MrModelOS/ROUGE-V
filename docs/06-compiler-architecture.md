@@ -260,8 +260,9 @@ claim-проверки без гонок.
 | RVV-кросс-проверка (`rv64gcv`) — 3 ядра | ✅ | `ctest compiler_rvv_backend_*` |
 | Выбор цели в `ptx2ir` (`--target`) + адресные пространства global/shared | ✅ | `ptx2ir --target amdgcn-amd-amdhsa vadd.ptx` — `addrspace(1)`/`addrspace(5)` |
 | Сборка под AMD GPU (`amdgcn-amd-amdhsa -mcpu=gfx1100`) — 5 ядер | ✅ сборка | `ptx2ir --target amdgcn-amd-amdhsa … && clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c` |
-| Сборка под NVIDIA GPU (`nvptx64-nvidia-cuda -march=sm_75`) — 5 ядер | ✅ сборка | `ptx2ir --target nvptx64-nvidia-cuda … && clang --target=nvptx64-nvidia-cuda -march=sm_75 -c` |
-| Исполнение кернела на AMD/NVIDIA GPU | ⛔ не проверялось | требуется реальная видеокарта; сейчас подтверждена только сборка объекта |
+| Сборка под NVIDIA GPU (`nvptx64-nvidia-cuda -march=sm_75`) — 7 ядер | ✅ сборка | `ptx2ir --target nvptx64-nvidia-cuda … && clang --target=nvptx64-nvidia-cuda -march=sm_75 -c` |
+| Исполнение на NVIDIA GPU (GeForce MX450, sm_75) — 7 ядер + вендорное ядро | ✅ побитово | `ctest compiler_nvptx_gpu_exec* compiler_nvcc_gpu_exec` (SKIP без sm_75+) |
+| Исполнение кернела на AMD GPU | ⛔ не проверялось | требуется реальная AMD-видеокарта; сейчас подтверждена только сборка объекта |
 | MLIR-контур: `rouge-simt-access-report` (GPU→Vector) | ✅ контур | `cmake -DROUGE_ENABLE_MLIR=ON` + `rouge-opt --rouge-simt-access-report` |
 | MLIR Dialect Conversion GPU→Vector/Linalg→ROUGE (векторизация) | 📋 план | — |
 | Hardware-Aware Passes (tiling/coalescing/double-buffer) | 📋 план | — |

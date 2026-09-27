@@ -200,8 +200,8 @@ if(CLANG_EXECUTABLE AND CUDA_DRIVER_INCLUDE_DIR AND CUDA_DRIVER_LIBRARY)
   target_include_directories(gpu_exec_runreal PRIVATE ${CUDA_DRIVER_INCLUDE_DIR})
   target_link_libraries(gpu_exec_runreal PRIVATE ${CUDA_DRIVER_LIBRARY})
 
-  # kernel.selector cells: dataset A for fp16/gemm, dataset B, and a two-block
-  # grid proving the nctaid path on hardware.
+  # kernel.selector cells: dataset A for fp16/gemm, dataset B, a two-block grid
+  # proving the nctaid path, warp shuffles, and cas/exch/min/max atomics.
   add_test(NAME compiler_nvptx_gpu_exec
     COMMAND ${CMAKE_COMMAND}
       -DCLANG=${CLANG_EXECUTABLE}
@@ -209,7 +209,7 @@ if(CLANG_EXECUTABLE AND CUDA_DRIVER_INCLUDE_DIR AND CUDA_DRIVER_LIBRARY)
       -DRUNNER=$<TARGET_FILE:gpu_exec_rungpu>
       -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
       -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/gpu-exec
-      "-DCELLS=vadd.vadd,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2"
+      "-DCELLS=vadd.vadd,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2,shfl_reduce.shfl_reduce,atom_cas.atom_cas"
       -DSM=sm_75
       -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_exec.cmake)
   set_tests_properties(compiler_nvptx_gpu_exec PROPERTIES

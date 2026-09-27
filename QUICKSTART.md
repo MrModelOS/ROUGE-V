@@ -113,8 +113,9 @@ clang --target=nvptx64-nvidia-cuda -march=sm_75 -c /tmp/kernel-sm75.ll -o /tmp/k
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | собирается в нативный объект, **не исполнялось** |
 | `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | собирается **и исполняется на настоящей видеокарте** — см. ниже |
 
-Собираются все пять канонических ядер из `software/rouge-compiler/tests/kernels/`:
-`vadd`, `block_reduce`, `atomic_reduce`, `fp16_reduce`, `gemm_tile`.
+Собираются все семь канонических ядер из `software/rouge-compiler/tests/kernels/`:
+`vadd`, `block_reduce`, `atomic_reduce`, `fp16_reduce`, `gemm_tile`,
+`shfl_reduce`, `atom_cas`.
 
 Об ограничении стоит сказать прямо: строка AMD — утверждение о **сборке**, а не о
 работе (такой видеокарты в проекте нет). А строка NVIDIA — уже про исполнение:

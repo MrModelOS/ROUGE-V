@@ -50,16 +50,18 @@ ctest --test-dir build --output-on-failure
 | `aot_native_fp16_reduce` | **FP16/BF16 в AOT**: half/bfloat, cvt, fma, f16-тайл в shared + `bar.sync` (бит-идентично интерпретатору) |
 | `compiler_rvv_backend_*` | тот же IR собирается бэкендом RISC-V `rv64gcv` (информационные) |
 | `compiler_amdgpu_backend` | IR собирается бэкендом AMD `gfx1100` (5 ядер, информационный; SKIP без ROCm) |
-| `compiler_nvptx_backend` | IR собирается бэкендом NVIDIA `sm_75` (5 ядер, информационный) |
-| `compiler_nvptx_gpu_exec` | ядра исполняются на настоящей NVIDIA GPU и сверяются побитово (7 конфигураций: 5 ядер, fp16/gemm по двум наборам данных + сетка 2×1; SKIP без sm_75+) |
+| `compiler_nvptx_backend` | IR собирается бэкендом NVIDIA `sm_75` (7 ядер, информационный) |
+| `compiler_nvptx_gpu_exec` | ядра исполняются на настоящей NVIDIA GPU и сверяются побитово (9 конфигураций: 7 ядер, fp16/gemm по двум наборам данных + сетка 2×1; SKIP без sm_75+) |
 | `compiler_nvptx_gpu_exec_atomic` | атомики `red`/`atom` исполняются на настоящей NVIDIA GPU (SKIP без sm_75+) |
-| AMD-бэкенд — кросс-сборка | тот же IR с `addrspace(1)` (global) и `addrspace(5)` (shared) собирается в нативный объект `amdgcn-amd-amdhsa -mcpu=gfx1100` (5 ядер). Объект получен, но **ни разу не исполнялся** — GPU в проекте нет |
-| NVIDIA-бэкенд — кросс-сборка | тот же IR с `addrspace(1)` (global) и `addrspace(3)` (shared) собирается в нативный объект `nvptx64-nvidia-cuda -march=sm_75` (5 ядер). Собирается, но **ни разу не исполнялось** — GPU в проекте нет |
+| `compiler_nvcc_gpu_exec` | вендорный PTX (`nvcc real_nvcc.cu`) сквозь ptx2ir исполняется на настоящей NVIDIA GPU (SKIP без nvcc или sm_75+) |
+| AMD-бэкенд — кросс-сборка | тот же IR с `addrspace(1)` (global) и `addrspace(5)` (shared) собирается в нативный объект `amdgcn-amd-amdhsa -mcpu=gfx1100` (5 ядер). Объект получен, но **ни разу не исполнялся** — AMD-видеокарты в проекте нет |
+| NVIDIA-бэкенд — кросс-сборка и исполнение | тот же IR с `addrspace(1)` (global) и `addrspace(3)` (shared) собирается в нативный объект `nvptx64-nvidia-cuda -march=sm_75` (7 ядер) и **исполняется на GeForce MX450** — см. `compiler_nvptx_gpu_exec*` выше |
 | `mlir_simt_access_report` | MLIR-контур: `rouge-opt --rouge-simt-access-report` (только с `-DROUGE_ENABLE_MLIR=ON` + MLIR) |
 
-Цель выбирается флагом `--target` (см. ниже). Две строки GPU-бэкендов — это
-проверка **сборки**: бэкенд LLVM принял IR и выдал объект. Исполнения на реальном
-железе не было, поэтому строки ничего не говорят о производительности.
+Цель выбирается флагом `--target` (см. ниже). Строки `*_backend` — это проверка
+**сборки**: бэкенд LLVM принял IR и выдал объект. Строки `*_gpu_exec` — проверка
+**исполнения** на настоящей GeForce MX450. Ни те ни другие ничего не говорят о
+производительности: мерялась только бит-идентичность результату хост-эталона.
 
 ## Четыре цели сборки
 
@@ -72,7 +74,7 @@ ctest --test-dir build --output-on-failure
 | *(по умолчанию)* `x86_64-pc-linux-gnu` | хост x86-64 | — | собирается и исполняется (`aot_native_*`) |
 | `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | собирается в объект |
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | собирается в объект, не исполнялось |
-| `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | собирается в объект, не исполнялось |
+| `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | собирается в объект **и исполняется на GeForce MX450** (`compiler_nvptx_gpu_exec*`) |
 
 ```sh
 ./build/rouge-compiler/ptx2ir --target amdgcn-amd-amdhsa   kernel.ptx kernel-amd.ll

@@ -614,6 +614,19 @@ class LlvmGen {
       intrinsics_.insert("declare void @llvm.nvvm.barrier0()");
       intrinsics_.insert("declare void @llvm.nvvm.barrier0.aligned(i32, i32)");
     }
+    // Real warp shuffles need their declares up front with the signature: the
+    // body that calls them is emitted afterwards. Same predicate as the call
+    // site below, so the two cannot disagree.
+    for (const auto& ins : body_) {
+      if (ins.op.rfind("shfl", 0) != 0) continue;
+      std::string kind;
+      bool sync = false;
+      if (!nvptx_shfl(ins, &kind, &sync)) continue;
+      // Always the .sync form: the legacy (mask-less) NVVM intrinsic crashes
+      // this LLVM backend, so legacy PTX passes member mask -1 (full warp).
+      intrinsics_.insert("declare i32 @llvm.nvvm.shfl.sync." + kind +
+                         ".i32(i32, i32, i32, i32)");
+    }
   }
 
   // Emit (once) a read of the named special register and return the intrinsic.
@@ -621,6 +634,34 @@ class LlvmGen {
     const std::string fn = "llvm.nvvm.read.ptx.sreg." + name;
     intrinsics_.insert("declare i32 @" + fn + "()");
     return fn;
+  }
+
+  // NVVM warp-shuffle kind named by the opcode, or "" when this shfl must stay
+  // on the scalar path. `sync` reports whether the opcode already carries the
+  // .sync form (with an explicit member mask as its last operand).
+  std::string shfl_nvvm_kind(const std::string& op, bool* sync) {
+    *sync = op.find(".sync.") != std::string::npos;
+    if (op.find(".idx.") != std::string::npos) return "idx";
+    if (op.find(".up.") != std::string::npos) return "up";
+    if (op.find(".down.") != std::string::npos) return "down";
+    if (op.find(".bfly.") != std::string::npos) return "bfly";
+    return "";
+  }
+
+  // True when this shfl instruction can go through a real NVVM shuffle:
+  // NVPTX target, known kind, plain (unpredicated) i32 destination and
+  // source, and the operand count of its form (4 legacy, 5 .sync).
+  bool nvptx_shfl(const rouge::PtxInstruction& ins, std::string* kind, bool* sync) {
+    if (!is_nvptx()) return false;
+    const std::string k = shfl_nvvm_kind(ins.op, sync);
+    if (k.empty()) return false;
+    const size_t want = *sync ? 5 : 4;
+    if (ins.args.size() != want) return false;
+    if (ins.args[0].find('|') != std::string::npos) return false;
+    if (reg_type(ins.args[0]) != "i32") return false;
+    if (is_register(ins.args[1]) && reg_type(ins.args[1]) != "i32") return false;
+    *kind = k;
+    return true;
   }
 
   static std::string param_llvm_type(const rouge::PtxParam& p) {
@@ -852,8 +893,37 @@ class LlvmGen {
     }
 
     // ---- warp shuffles: shfl.sync.<kind>.b32 (and legacy shfl.<kind>.b32) ----
-    // Scalar fallback: shfl is identity before vectorization, MLIR will vectorize.
+    // On a real GPU a shuffle exchanges lanes, so the scalar identity fallback
+    // below would silently compute the wrong answer there. NVPTX therefore
+    // goes through the NVVM intrinsic (always the .sync form: the legacy
+    // mask-less intrinsic crashes this LLVM backend, so legacy PTX passes
+    // member mask -1, i.e. the full warp). Host targets keep the scalar
+    // fallback: shfl is identity before vectorization, MLIR will vectorize.
     if (op.rfind("shfl", 0) == 0) {
+      std::string kind;
+      bool sync = false;
+      if (nvptx_shfl(ins, &kind, &sync)) {
+        // A = [dst, src, b, c] legacy or [dst, src, b, c, mask] .sync.
+        // Immediates arrive in PTX spelling ("0x1f"), which LLVM IR does not
+        // accept as an i32 literal: spell them decimal.
+        const auto imm = [](const std::string& t) -> std::string {
+          if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X'))
+            return std::to_string(
+                static_cast<long long>(std::strtoll(t.c_str(), nullptr, 16)));
+          return t;
+        };
+        const std::string src = is_register(A[1]) ? operand(A[1]) : imm(A[1]);
+        const std::string b = is_register(A[2]) ? operand(A[2]) : imm(A[2]);
+        const std::string c = is_register(A[3]) ? operand(A[3]) : imm(A[3]);
+        const std::string mask =
+            sync ? (is_register(A[4]) ? operand(A[4]) : imm(A[4])) : "-1";
+        const std::string v = fresh("%sh");
+        line("  " + v + " = call i32 @llvm.nvvm.shfl.sync." + kind +
+             ".i32(i32 " + mask + ", i32 " + src + ", i32 " + b + ", i32 " + c +
+             ")");
+        store_reg(A[0], v);
+        return true;
+      }
       if (A.size() < 2) return fail("bad " + op + " operands @ " + std::to_string(idx));
       line("  ; scalar fallback: shfl is identity before vectorization, MLIR will vectorize");
       // The destination may be predicated: "shfl.sync.down.b32 %r10|%p1, a, b, ..."
@@ -1644,7 +1714,7 @@ class LlvmGen {
         const std::string f = fresh("%f");
         line("  " + f + " = bitcast i32 " + val + " to float");
         const char* llOp = is_min ? "fmin" : "fmax";
-        line("  " + old + " = atomicrmw " + llOp + " ptr " + addr + ", float " + f + " monotonic, align 4");
+        line("  " + old + " = atomicrmw " + llOp + " " + pt(addr) + " " + addr + ", float " + f + " monotonic, align 4");
         if (has_dst) {
           const std::string bits = fresh("%b");
           line("  " + bits + " = bitcast float " + old + " to i32");
@@ -1656,7 +1726,7 @@ class LlvmGen {
         const std::string f = fresh("%f");
         line("  " + f + " = bitcast i64 " + val + " to double");
         const char* llOp = is_min ? "fmin" : "fmax";
-        line("  " + old + " = atomicrmw " + llOp + " ptr " + addr + ", double " + f + " monotonic, align 8");
+        line("  " + old + " = atomicrmw " + llOp + " " + pt(addr) + " " + addr + ", double " + f + " monotonic, align 8");
         if (has_dst) {
           const std::string bits = fresh("%b");
           line("  " + bits + " = bitcast double " + old + " to i64");
@@ -1670,7 +1740,7 @@ class LlvmGen {
       else return fail("unsupported atomic type '" + ty + "' @ " + std::to_string(idx));
       const char* llTy = w64 ? "i64" : "i32";
       const int align = w64 ? 8 : 4;
-      line("  " + old + " = atomicrmw " + llOp + " ptr " + addr + ", " + llTy + " " + val +
+      line("  " + old + " = atomicrmw " + llOp + " " + pt(addr) + " " + addr + ", " + llTy + " " + val +
            " monotonic, align " + std::to_string(align));
       if (has_dst) store_reg(A[0], old);
       return true;

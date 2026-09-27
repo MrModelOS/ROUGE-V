@@ -9,6 +9,35 @@
 #include <cuda.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+
+
+// Create a context, retrying once: the driver occasionally answers the first
+// cuCtxCreate after a burst of launches with a transient CUDA_ERROR_UNKNOWN.
+// One bounded retry with a pause distinguishes that from a real failure; the
+// retry is always reported, never silent.
+static int make_ctx(CUcontext* ctx, CUdevice dev) {
+  CUresult r = cuCtxCreate(ctx, 0, dev, 0);
+  if (r != CUDA_SUCCESS) {
+    const char* n_;
+    cuGetErrorName(r, &n_);
+    printf("  (cuCtxCreate retry after %s, pausing 5 s)\n", n_);
+    CUresult r2 = cuCtxSynchronize();
+    (void)r2;
+    struct timespec ts;
+    ts.tv_sec = 5;
+    ts.tv_nsec = 0;
+    nanosleep(&ts, 0);
+    r = cuCtxCreate(ctx, 0, dev, 0);
+  }
+  if (r != CUDA_SUCCESS) {
+    const char* n_;
+    cuGetErrorName(r, &n_);
+    printf("FAIL cuCtxCreate: %s\n", n_);
+    return 1;
+  }
+  return 0;
+}
 
 #define CK(x)                                                            \
   do {                                                                   \
@@ -59,7 +88,7 @@ int main(int argc, char** argv) {
     }
   }
   CUcontext ctx;
-  CK(cuCtxCreate(&ctx, 0, dev, 0));
+  if (make_ctx(&ctx, dev)) return 1;
   CUmodule mod;
   CK(cuModuleLoadData(&mod, buf));
   CUfunction fn;

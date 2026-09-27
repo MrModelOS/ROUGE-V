@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // ---------------------------------------------------------------------------
 // CUDA error plumbing
@@ -51,6 +52,34 @@ static void ck(CUresult r, const char* what, int line) {
     exit(2);
   }
 }
+
+// Create a context, retrying once: the driver occasionally answers the first
+// cuCtxCreate after a burst of launches with a transient CUDA_ERROR_UNKNOWN.
+// One bounded retry with a pause distinguishes that from a real failure; the
+// retry is always reported, never silent.
+static int make_ctx(CUcontext* ctx, CUdevice dev) {
+  CUresult r = cuCtxCreate(ctx, 0, dev, 0);
+  if (r != CUDA_SUCCESS) {
+    const char* n_;
+    cuGetErrorName(r, &n_);
+    printf("  (cuCtxCreate retry after %s, pausing 5 s)\n", n_);
+    CUresult r2 = cuCtxSynchronize();
+    (void)r2;
+    struct timespec ts;
+    ts.tv_sec = 5;
+    ts.tv_nsec = 0;
+    nanosleep(&ts, 0);
+    r = cuCtxCreate(ctx, 0, dev, 0);
+  }
+  if (r != CUDA_SUCCESS) {
+    const char* n_;
+    cuGetErrorName(r, &n_);
+    printf("FAIL cuCtxCreate: %s\n", n_);
+    return 1;
+  }
+  return 0;
+}
+
 #define CK(x) ck((x), #x, __LINE__)
 
 // ---------------------------------------------------------------------------
@@ -618,9 +647,140 @@ static int test_gemm_tile(CUmodule mod, int gx, int gy, int dataset) {
 }
 
 // ---------------------------------------------------------------------------
+// kernel: shfl_reduce -- out[ctaid.x] = warp-0 butterfly sum, written by tid 0
+//
+// Only thread 0 of each block writes, but its value is the full 32-lane
+// butterfly reduction, so this test proves real cross-lane exchange: the
+// scalar-identity fallback our host path uses would leave lane 0 holding just
+// data[b*256]. The reference replays the tree order (offsets 16,8,4,2,1 with
+// simultaneous exchange inside each step), which is the only order that is
+// bit-exact for f32 rounding. N is a multiple of 32, so every warp is full
+// and no lane is inactive during the exchange.
+// ---------------------------------------------------------------------------
+static int test_shfl_reduce(CUmodule mod) {
+  const int threads = 256, blocks = 4, N = threads * blocks;
+  printf("  config: N=%d blockDim=(%d,1,1) gridDim=(%d,1,1), out[ctaid.x]=butterfly sum of warp 0\n",
+         N, threads, blocks);
+
+  CUfunction fn;
+  CK(cuModuleGetFunction(&fn, mod, "shfl_reduce"));
+
+  float* hd = malloc(N * 4);
+  for (int i = 0; i < N; ++i) hd[i] = (float)(((i % 9) + 1) * 0.5f);
+  float* ho = malloc(blocks * 4);
+  for (int i = 0; i < blocks; ++i) ho[i] = -1.f;
+  float* he = malloc(blocks * 4);
+  for (int b = 0; b < blocks; ++b) {
+    float lane[32], next[32];
+    for (int l = 0; l < 32; ++l) lane[l] = hd[b * threads + l];
+    const int offs[5] = {16, 8, 4, 2, 1};
+    for (int s = 0; s < 5; ++s) {
+      for (int l = 0; l < 32; ++l) next[l] = lane[l] + lane[l ^ offs[s]];
+      for (int l = 0; l < 32; ++l) lane[l] = next[l];
+    }
+    he[b] = lane[0];
+  }
+
+  CUdeviceptr dd, dout;
+  CK(cuMemAlloc(&dd, N * 4));
+  CK(cuMemAlloc(&dout, blocks * 4));
+  CK(cuMemcpyHtoD(dd, hd, N * 4));
+  CK(cuMemcpyHtoD(dout, ho, blocks * 4));
+
+  int n = N;
+  void* args[] = {&dd, &dout, &n};
+  CK(cuLaunchKernel(fn, blocks, 1, 1, threads, 1, 1, 0, 0, args, 0));
+  CUresult r = cuCtxSynchronize();
+  if (r != CUDA_SUCCESS) {
+    printf("  MISMATCH: launch/sync failed: %s (%s) -- the kernel faulted on the device\n",
+           cuerr(r), cuerrstr(r));
+    return 3;
+  }
+  CK(cuMemcpyDtoH(ho, dout, blocks * 4));
+
+  int bad = 0;
+  for (int b = 0; b < blocks; ++b)
+    if (ho[b] != he[b]) {
+      printf("  out[%d]: got %g want %g\n", b, ho[b], he[b]);
+      bad = 1;
+    }
+  printf(bad ? "  MISMATCH\n" : "  OK: %d blocks, lane-0 butterfly sums verified bit-exactly\n",
+         blocks);
+  return bad;
+}
+
+// ---------------------------------------------------------------------------
+// kernel: atom_cas -- per-thread slots for cas/exch/min/max with old-value
+// buffers. Every thread owns its slot (g = ctaid*ntid+tid), so no two threads
+// race and the outcome is fully deterministic: both the returned old values
+// and the final memory contents are checked.
+// ---------------------------------------------------------------------------
+static int test_atom_cas(CUmodule mod) {
+  const int threads = 256, blocks = 1, N = threads * blocks;
+  printf("  config: N=%d blockDim=(%d,1,1) gridDim=(%d,1,1), private slots\n",
+         N, threads, blocks);
+
+  CUfunction fn;
+  CK(cuModuleGetFunction(&fn, mod, "atom_cas"));
+
+  uint32_t *hm[4], *ho[4];
+  const uint32_t init[4] = {42, 11, 50, 20};
+  const uint32_t want_mem[4] = {100, 55, 10, 90};
+  for (int k = 0; k < 4; ++k) {
+    hm[k] = malloc(N * 4);
+    ho[k] = malloc(N * 4);
+    for (int i = 0; i < N; ++i) {
+      hm[k][i] = init[k];
+      ho[k][i] = 0xdeadbeef;
+    }
+  }
+
+  CUdeviceptr dm[4], dout[4];
+  for (int k = 0; k < 4; ++k) {
+    CK(cuMemAlloc(&dm[k], N * 4));
+    CK(cuMemAlloc(&dout[k], N * 4));
+    CK(cuMemcpyHtoD(dm[k], hm[k], N * 4));
+    CK(cuMemcpyHtoD(dout[k], ho[k], N * 4));
+  }
+
+  int n = N;
+  void* args[] = {&dm[0], &dm[1], &dm[2], &dm[3],
+                  &dout[0], &dout[1], &dout[2], &dout[3], &n};
+  CK(cuLaunchKernel(fn, blocks, 1, 1, threads, 1, 1, 0, 0, args, 0));
+  CUresult r = cuCtxSynchronize();
+  if (r != CUDA_SUCCESS) {
+    printf("  MISMATCH: launch/sync failed: %s (%s) -- the kernel faulted on the device\n",
+           cuerr(r), cuerrstr(r));
+    return 3;
+  }
+  for (int k = 0; k < 4; ++k) {
+    CK(cuMemcpyDtoH(hm[k], dm[k], N * 4));
+    CK(cuMemcpyDtoH(ho[k], dout[k], N * 4));
+  }
+
+  static const char* const what[4] = {"cas 42->100", "exch 11->55",
+                                      "min.s32 50/10", "max.u32 20/90"};
+  int bad = 0;
+  for (int k = 0; k < 4; ++k)
+    for (int i = 0; i < N; ++i) {
+      if (ho[k][i] != init[k]) {
+        if (bad < 4) printf("  %s: old[%d] got %u want %u\n", what[k], i, ho[k][i], init[k]);
+        bad = 1;
+      }
+      if (hm[k][i] != want_mem[k]) {
+        if (bad < 4) printf("  %s: mem[%d] got %u want %u\n", what[k], i, hm[k][i], want_mem[k]);
+        bad = 1;
+      }
+    }
+  printf(bad ? "  MISMATCH\n" : "  OK: %d threads, old values and final memory verified exactly\n",
+         N);
+  return bad;
+}
+
+// ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
   if (argc < 3) {
-    printf("usage: %s <file.ptx> <vadd|block_reduce|fp16_reduce|gemm_tile|all>\n", argv[0]);
+    printf("usage: %s <file.ptx> <vadd|block_reduce|fp16_reduce|gemm_tile|shfl_reduce|atom_cas|all>\n", argv[0]);
     return 2;
   }
   const char* ptx = argv[1];
@@ -677,7 +837,7 @@ int main(int argc, char** argv) {
   printf("ptx   : %s (%ld bytes)\n", ptx, sz);
 
   CUcontext ctx;
-  CK(cuCtxCreate(&ctx, 0, dev, 0));
+  if (make_ctx(&ctx, dev)) return 1;
   CUmodule mod;
   CUresult mr = cuModuleLoadData(&mod, buf);
   if (mr != CUDA_SUCCESS) {
@@ -732,6 +892,18 @@ int main(int argc, char** argv) {
     printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
     if (rc && g_exit_code == 0) g_exit_code = rc;
   }
+  if (all || strcmp(kname, "shfl_reduce") == 0) {
+    printf("== shfl_reduce ==\n");
+    rc = test_shfl_reduce(mod);
+    printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
+    if (rc && g_exit_code == 0) g_exit_code = rc;
+  }
+  if (all || strcmp(kname, "atom_cas") == 0) {
+    printf("== atom_cas ==\n");
+    rc = test_atom_cas(mod);
+    printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
+    if (rc && g_exit_code == 0) g_exit_code = rc;
+  }
   if (!all && strcmp(kname, "fp16_reduceB") == 0) {
     printf("== fp16_reduce (dataset B only) ==\n");
     rc = test_fp16_reduce(mod, 1);
@@ -755,6 +927,7 @@ int main(int argc, char** argv) {
   }
   if (!all && strcmp(kname, "vadd") && strcmp(kname, "block_reduce") &&
       strcmp(kname, "fp16_reduce") && strcmp(kname, "gemm_tile") &&
+      strcmp(kname, "shfl_reduce") && strcmp(kname, "atom_cas") &&
       strcmp(kname, "fp16_reduceB") && strcmp(kname, "gemm_tileB") &&
       strcmp(kname, "gemm_tile2")) {
     printf("unknown kernel '%s'\n", kname);
