@@ -93,11 +93,20 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 | *(default)* `x86_64-pc-linux-gnu` | host x86-64 | — | compiles **and executes** — the `aot_native_*` ctest suite |
 | `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | compiles to a native object — `ctest compiler_rvv_backend_*` |
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | compiles to a native object — never executed |
-| `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | compiles to a native object — never executed |
+| `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | compiles **and executes on a real GPU** — see below |
 
 All five canonical kernels in `software/rouge-compiler/tests/kernels/` — `vadd`,
 `block_reduce`, `atomic_reduce`, `fp16_reduce`, `gemm_tile` — build for all four
 triples.
+
+### Executed on real hardware
+
+The NVIDIA kernels do not just compile: `ctest compiler_nvptx_gpu_exec*`
+loads the generated PTX through the CUDA Driver API (driver-side JIT) on a
+real GeForce MX450 (sm_75) and checks every output bit-exactly against a host
+reference — two datasets for `fp16_reduce`/`gemm_tile`, plus a two-block grid
+proving the multi-block path. On machines without an sm_75+ NVIDIA GPU the
+tests report SKIP, never failure.
 
 The two GPU rows are a **compile-time** claim, and only that. No AMD or NVIDIA
 device is involved anywhere in the project, so nothing from those rows has been

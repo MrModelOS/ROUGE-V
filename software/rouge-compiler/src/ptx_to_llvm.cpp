@@ -1152,10 +1152,13 @@ class LlvmGen {
   // i64 (register addresses are i64 everywhere in this file and are turned
   // back into pointers with inttoptr at the point of use).
   bool emit_symbol_address(const std::string& reg, const std::string& sym) {
-    const std::string p = fresh("%gp");
-    line("  " + p + " = load ptr, ptr @" + sym + ", align 8");
+    // The symbol's own address, not a load through it: "@g = external global
+    // [N x i8]" names the storage itself, so "load ptr, ptr @g" would read the
+    // first eight bytes OF the array as if they were a pointer. On the host
+    // that silently produced garbage; on a GPU it aimed an atomic at address
+    // zero and faulted (found by executing real nvcc output on hardware).
     const std::string i = fresh("%gi");
-    line("  " + i + " = ptrtoint ptr " + p + " to i64");
+    line("  " + i + " = ptrtoint ptr @" + sym + " to i64");
     store_reg(reg, i);
     return true;
   }

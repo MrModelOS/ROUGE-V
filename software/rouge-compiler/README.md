@@ -51,6 +51,8 @@ ctest --test-dir build --output-on-failure
 | `compiler_rvv_backend_*` | тот же IR собирается бэкендом RISC-V `rv64gcv` (информационные) |
 | `compiler_amdgpu_backend` | IR собирается бэкендом AMD `gfx1100` (5 ядер, информационный; SKIP без ROCm) |
 | `compiler_nvptx_backend` | IR собирается бэкендом NVIDIA `sm_75` (5 ядер, информационный) |
+| `compiler_nvptx_gpu_exec` | ядра исполняются на настоящей NVIDIA GPU и сверяются побитово (7 конфигураций: 5 ядер, fp16/gemm по двум наборам данных + сетка 2×1; SKIP без sm_75+) |
+| `compiler_nvptx_gpu_exec_atomic` | атомики `red`/`atom` исполняются на настоящей NVIDIA GPU (SKIP без sm_75+) |
 | AMD-бэкенд — кросс-сборка | тот же IR с `addrspace(1)` (global) и `addrspace(5)` (shared) собирается в нативный объект `amdgcn-amd-amdhsa -mcpu=gfx1100` (5 ядер). Объект получен, но **ни разу не исполнялся** — GPU в проекте нет |
 | NVIDIA-бэкенд — кросс-сборка | тот же IR с `addrspace(1)` (global) и `addrspace(3)` (shared) собирается в нативный объект `nvptx64-nvidia-cuda -march=sm_75` (5 ядер). Собирается, но **ни разу не исполнялось** — GPU в проекте нет |
 | `mlir_simt_access_report` | MLIR-контур: `rouge-opt --rouge-simt-access-report` (только с `-DROUGE_ENABLE_MLIR=ON` + MLIR) |

@@ -176,3 +176,74 @@ if(CLANG_EXECUTABLE)
       -DPLATFORMS=nvptx|${ROUGE_NVPTX_TRIPLE}|${NVPTX_FLAGS_SPEC}
       -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_targets.cmake)
 endif()
+
+# ---- Tests 7 + 8: on-device execution on a real NVIDIA GPU ----
+# The kernels our translator produced are loaded through the CUDA Driver API
+# (driver-side JIT) and checked bit-exactly against a host reference. Needs
+# the CUDA driver headers + libcuda at build time and a real sm_75+ NVIDIA GPU
+# at test time; everywhere else the tests report SKIP and never fail the run.
+find_path(CUDA_DRIVER_INCLUDE_DIR cuda.h
+  PATHS /opt/cuda/targets/x86_64-linux/include /usr/local/cuda/include
+  NO_DEFAULT_PATH)
+find_library(CUDA_DRIVER_LIBRARY NAMES cuda
+  PATHS /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu)
+if(CLANG_EXECUTABLE AND CUDA_DRIVER_INCLUDE_DIR AND CUDA_DRIVER_LIBRARY)
+  # The project is CXX-only; the runners are plain C.
+  enable_language(C)
+  add_executable(gpu_exec_rungpu gpu_exec_rungpu.c)
+  target_include_directories(gpu_exec_rungpu PRIVATE ${CUDA_DRIVER_INCLUDE_DIR})
+  target_link_libraries(gpu_exec_rungpu PRIVATE ${CUDA_DRIVER_LIBRARY} m)
+  add_executable(gpu_exec_runatomic gpu_exec_runatomic.c)
+  target_include_directories(gpu_exec_runatomic PRIVATE ${CUDA_DRIVER_INCLUDE_DIR})
+  target_link_libraries(gpu_exec_runatomic PRIVATE ${CUDA_DRIVER_LIBRARY} m)
+  add_executable(gpu_exec_runreal gpu_exec_runreal.c)
+  target_include_directories(gpu_exec_runreal PRIVATE ${CUDA_DRIVER_INCLUDE_DIR})
+  target_link_libraries(gpu_exec_runreal PRIVATE ${CUDA_DRIVER_LIBRARY})
+
+  # kernel.selector cells: dataset A for fp16/gemm, dataset B, and a two-block
+  # grid proving the nctaid path on hardware.
+  add_test(NAME compiler_nvptx_gpu_exec
+    COMMAND ${CMAKE_COMMAND}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DPTX2IR=$<TARGET_FILE:ptx2ir>
+      -DRUNNER=$<TARGET_FILE:gpu_exec_rungpu>
+      -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
+      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/gpu-exec
+      "-DCELLS=vadd.vadd,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2"
+      -DSM=sm_75
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_exec.cmake)
+  set_tests_properties(compiler_nvptx_gpu_exec PROPERTIES
+    SKIP_REGULAR_EXPRESSION "NO-DEVICE|SKIP-OLD-ARCH")
+
+  add_test(NAME compiler_nvptx_gpu_exec_atomic
+    COMMAND ${CMAKE_COMMAND}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DPTX2IR=$<TARGET_FILE:ptx2ir>
+      -DRUNNER=$<TARGET_FILE:gpu_exec_runatomic>
+      -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
+      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/gpu-exec
+      -DCELLS=atomic_reduce.atomic_reduce
+      -DSM=sm_75
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_exec.cmake)
+  set_tests_properties(compiler_nvptx_gpu_exec_atomic PROPERTIES
+    SKIP_REGULAR_EXPRESSION "NO-DEVICE|SKIP-OLD-ARCH")
+
+  # Vendor end-to-end: nvcc -> ptx2ir -> GPU, bit-exact. Needs nvcc at test
+  # time; without it (or without a usable GPU) the script reports SKIP.
+  find_program(NVCC_EXECUTABLE nvcc)
+  add_test(NAME compiler_nvcc_gpu_exec
+    COMMAND ${CMAKE_COMMAND}
+      -DNVCC=${NVCC_EXECUTABLE}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DPTX2IR=$<TARGET_FILE:ptx2ir>
+      -DRUNNER=$<TARGET_FILE:gpu_exec_runreal>
+      -DCU_SRC=${CMAKE_CURRENT_SOURCE_DIR}/real_nvcc.cu
+      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/nvcc-gpu-exec
+      -DSM=sm_75
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/nvcc_gpu_exec.cmake)
+  set_tests_properties(compiler_nvcc_gpu_exec PROPERTIES
+    SKIP_REGULAR_EXPRESSION "NO-DEVICE|SKIP-OLD-ARCH")
+else()
+  message(STATUS "[rouge-compiler] GPU exec tests disabled: need clang plus "
+                 "the CUDA driver headers and libcuda")
+endif()
