@@ -48,6 +48,14 @@ export PATH="$HOME/.local/bin:$PATH"
 ptx2ir kernel.ptx kernel.ll
 ```
 
+Запуск на NVIDIA GPU (sm_75+, нужен только драйвер, тулкит на запуске не нужен):
+
+```sh
+rouge-run --target nvptx64-nvidia-cuda kernel.ptx --emit-ptx kernel_gpu.ptx
+# дальше 3 точки EDIT в software/rouge-compiler/examples/run_on_gpu.c
+# (путь к PTX, имя ядра, буферы/запуск) и сборка против libcuda
+```
+
 (Arch Linux: `packaging/PKGBUILD` для ручной сборки. `packaging/install.sh` делает то же самое.)
 
 ```sh

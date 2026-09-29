@@ -66,17 +66,20 @@ std::string backend_flags(const std::string& target) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string inPath, objPath, irPath;
+  std::string inPath, objPath, irPath, gpuPtxPath;
   std::string target = "x86_64-pc-linux-gnu";
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "-h" || a == "--help") {
       std::printf(
-          "usage: rouge-run <kernel.ptx> [-o <kernel.o>] [--print-ir] [--target <triple>]\n"
+          "usage: rouge-run <kernel.ptx> [-o <kernel.o>] [--print-ir] [--target <triple>] [--emit-ptx <kernel.ptx>]\n"
           "\n"
           "Translate a PTX kernel and verify the result compiles.\n"
           "  -o, --object <path>   write a native object file\n"
           "      --print-ir [path]  also write the translated LLVM IR\n"
+          "      --emit-ptx <path>  with --target nvptx64-nvidia-cuda: write the\n"
+          "                         GPU-loadable PTX text (clang -S) for\n"
+          "                         cuModuleLoadData + cuLaunchKernel\n"
           "      --target <triple>  translate for another platform\n"
           "                         (also --target=<triple>); known triples:\n"
           "                         x86_64-pc-linux-gnu, riscv64-unknown-elf,\n"
@@ -95,6 +98,9 @@ int main(int argc, char** argv) {
       objPath = argv[i];
     } else if (a == "--print-ir") {
       irPath = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[++i] : "";
+    } else if (a == "--emit-ptx") {
+      if (++i >= argc) { std::fprintf(stderr, "rouge-run: --emit-ptx needs a path\n"); return 2; }
+      gpuPtxPath = argv[i];
     } else if (!a.empty() && a[0] == '-') {
       std::fprintf(stderr, "rouge-run: unknown option '%s'\n", a.c_str());
       return 2;
@@ -185,6 +191,38 @@ int main(int argc, char** argv) {
       return 1;
     }
     std::printf("wrote %s (backend accepted the IR)\n", objPath.c_str());
+  }
+
+  if (!gpuPtxPath.empty()) {
+    // GPU-loadable PTX text for cuModuleLoadData. Only the NVPTX target
+    // produces something a CUDA driver accepts; anything else is a user
+    // error, not a silent odd file.
+    if (target.rfind("nvptx", 0) != 0) {
+      std::fprintf(stderr,
+                   "rouge-run: --emit-ptx needs --target nvptx64-nvidia-cuda "
+                   "(got '%s')\n",
+                   target.c_str());
+      return 2;
+    }
+    const std::string ll = inPath + ".rouge.ll";
+    if (!write_file(ll, ir)) {
+      std::fprintf(stderr, "rouge-run: cannot write %s\n", ll.c_str());
+      return 2;
+    }
+    const std::string cmd = "clang " + backend_flags(target) + " -S " +
+                            sh_quote(ll) + " -o " + sh_quote(gpuPtxPath) +
+                            " 2>&1";
+    const int rc = std::system(cmd.c_str());
+    std::remove(ll.c_str());
+    if (rc != 0) {
+      std::fprintf(stderr,
+                   "\nrouge-run: translation emitted IR that the NVPTX "
+                   "backend rejected — this is a compiler bug, please report "
+                   "it.\n");
+      return 1;
+    }
+    std::printf("wrote %s (load it with cuModuleLoadData)\n",
+                gpuPtxPath.c_str());
   }
 
   std::printf("\nOK\n");

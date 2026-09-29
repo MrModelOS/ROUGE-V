@@ -47,6 +47,14 @@ export PATH="$HOME/.local/bin:$PATH"
 ptx2ir kernel.ptx kernel.ll
 ```
 
+在 NVIDIA GPU 上运行（sm_75+，运行时仅需驱动，无需 toolkit）：
+
+```sh
+rouge-run --target nvptx64-nvidia-cuda kernel.ptx --emit-ptx kernel_gpu.ptx
+# 然后填写 software/rouge-compiler/examples/run_on_gpu.c 中的 3 处 EDIT
+#（PTX 路径、kernel 名、缓冲/启动参数），链接 libcuda 构建
+```
+
 （Arch Linux：用 `packaging/PKGBUILD` 手动构建。`packaging/install.sh` 做同样的事。）
 
 ```sh

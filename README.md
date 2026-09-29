@@ -48,6 +48,14 @@ export PATH="$HOME/.local/bin:$PATH"
 ptx2ir kernel.ptx kernel.ll
 ```
 
+Run it on an NVIDIA GPU (sm_75+, driver only, no toolkit needed at run time):
+
+```sh
+rouge-run --target nvptx64-nvidia-cuda kernel.ptx --emit-ptx kernel_gpu.ptx
+# then fill the 3 EDIT points in software/rouge-compiler/examples/run_on_gpu.c
+# (PTX path, kernel name, buffers/launch) and build it against libcuda
+```
+
 (Arch Linux: `packaging/PKGBUILD` for a manual build. `packaging/install.sh` does the above.)
 
 The question a user has is "will you translate my kernel?". One command answers it:
