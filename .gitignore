@@ -46,3 +46,6 @@ kernels/
 
 # Pitch & publishing (not part of the project)
 pitch/
+
+# CTest output
+Testing/
