@@ -28,8 +28,12 @@ struct PtxSharedVar {
   std::string name;
   int align = 4;      // declared alignment (e.g. .align 4)
   int elemBytes = 4;  // element size: .b8=1, .b16=2, .b32/.f32=4, .b64/.f64=8
-  int count = 1;      // [N] elements
+  int count = 1;      // [N] elements; 0 when dynamic (unsized extern)
   int offset = 0;     // byte offset in the block scratchpad
+  // Unsized ".extern .shared" (dynamic shared, size fixed at launch):
+  // offset marks the dynamic region base (after the static scratchpad),
+  // the byte size is a launch parameter, not a compile-time constant.
+  bool dynamic = false;
 };
 
 // A module-scope global: ".global .align 4 .b32 arr[4096];"
@@ -57,6 +61,18 @@ struct PtxFunction {
   std::vector<PtxSharedVar> sharedVars;
   std::unordered_map<std::string, int> sharedIndex;  // name -> index in sharedVars
   int sharedSize = 0;
+  // .local variables: per-thread spill depot (nvcc emits one "__local_depotN"
+  // byte array per kernel that spills). Unlike .shared, each thread owns its
+  // copy; offset lays them out inside one per-thread depot of localSize bytes.
+  struct PtxLocalVar {
+    std::string name;
+    int bytes = 0;
+    int align = 1;
+    int offset = 0;
+  };
+  std::vector<PtxLocalVar> localVars;
+  std::unordered_map<std::string, int> localIndex;  // name -> index in localVars
+  int localSize = 0;
   int paramsBlobSize = 0;
 };
 

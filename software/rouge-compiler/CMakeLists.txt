@@ -28,10 +28,13 @@ target_link_libraries(ptx2ir PRIVATE rouge-compiler-lib)
 add_executable(rouge-run src/rouge_run_main.cpp)
 target_link_libraries(rouge-run PRIVATE rouge-compiler-lib)
 
+# ---- CLI: rouge-cc — nvcc-compatible driver (nvcc -> ptx2ir -> clang) ----
+add_executable(rouge-cc src/rouge_cc_main.cpp)
+
 # User-facing tools install to bin; the test runners stay build-local
 # (they need libcuda and make no sense outside a checkout).
 include(GNUInstallDirs)
-install(TARGETS ptx2ir rouge-run RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS ptx2ir rouge-run rouge-cc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../../LICENSE
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/rouge-v
         RENAME copyright)

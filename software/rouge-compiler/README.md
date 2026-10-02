@@ -89,22 +89,39 @@ global — `addrspace(1)` у обоих GPU-бэкендов, shared — `addrsp
 печатает скалярные обращения вместо `global_load`/`global_store`. Подробности —
 `docs/06-compiler-architecture.md`.
 
+## `rouge-cc` — drop-in замена nvcc
+
+```sh
+./build/rouge-compiler/rouge-cc -arch=sm_75 --target nvptx -c kernel.ptx -o kernel.o
+./build/rouge-compiler/rouge-cc -arch=sm_75 -ptx kernel.cu -o kernel.ptx
+```
+
+Подмножество CLI nvcc (`-arch=sm_XX|native`, `-ptx`, `-c`, `-o`, `-I/-L/-D`,
+`-O0…-O3`, `-g`, `-v`, `-n`) + расширение `--target host|riscv|amd|nvptx`.
+`.cu` собирает только настоящий `nvcc` из PATH как чёрный ящик (`.cu → .ptx`),
+своего CUDA-C фронтенда нет: без nvcc вход `.cu` — честная ошибка. `.ptx`
+работает без nvcc. Линковка — только `--target host` (для device-целей `-c`
+или `-ptx): device-линкера здесь нет.
+
 ## Поддерживаемое подмножество PTX
 
 | Группа | Инструкции |
 |---|---|
 | Параметры | `ld.param.{u32,u64}` (+s/b) |
-| Пересылки | `mov.{u32,u64,f32,u16,f16,bf16}`, `cvta.to.global.*`, `cvta.to.shared.*` |
+| Пересылки | `mov.{u32,u64,f32,u16,f16,bf16}`, `cvta.to.global.*`, `cvta.to.shared.*`, `cvta.local.*` (депо `.local`) |
 | Арифметика | `add/sub/mul.{u32,s64,…}`, `add/sub/mul/div.f32`, `mul.wide.{u,s}32`, `add/sub/mul/div.f16`, `add/sub/mul.rn.bf16`, `fma.rn.{f16,bf16}` |
 | Преобразования | `cvt.{u64.u32,u32.u64,s64.s32,s32.s64}`, `cvt.{f32↔u32/s32}`, `cvt.{f32↔f16, f32↔bf16, f16↔bf16, f16/bf16↔int}` (`rn`-квалификатор) |
 | Сравнения | `setp.{ge,gt,lt,le,eq,ne}.u32` |
 | Предикаты/ветвления | `@p bra`, `bra`, `ret`, `exit` |
-| Память global | `ld.global.{f32,u32,u64,f16,bf16,b16}` (+nc), `st.global.{f32,u32,u64,f16,bf16,b16}` |
-| Память shared | `.shared` (раскладка, `ld/st.shared.{f32,u32,u64,f16,bf16,b16}`, `[sym±const]`), scratchpad на launch-дескрипторе + экспорт `@__rouge_*_query` |
-| Синхронизация | `bar.sync [N[, count]]` → `__rouge_syncthreads` |
+| Память global | `ld.global.{f32,u32,u64,f16,bf16,b16}` (+nc), `st.global.{f32,u32,u64,f16,bf16,b16}`, generic `ld/st` без пробела, `.volatile` |
+| Память shared | `.shared` + динамический `.shared` (unsized `.extern`), `ld/st.shared.*`, `[sym±const]`, scratchpad на launch-дескрипторе + экспорт `@__rouge_*_query` |
+| Память local | `.local`-депо спиллов (`cvta.local`, `mov` адреса, generic доступы через `%SP`) |
+| Синхронизация | `bar.sync` / `barrier.sync` / `bar.warp.sync` → `__rouge_syncthreads` (хост) / `llvm.nvvm.barrier0` (NVPTX) |
+| Варп-шаффлы | `shfl.sync.*` + легаси `shfl.*`, включая предикатную форму `d\|p` (NVPTX: NVVM-интринсик + предикат из `%laneid`; хост: скаляр) |
 | Атомики | `atom.add.{u32,s32,u64,s64,f32}` (→ `atomicrmw`, возвращает старое), `red.add.*` (без возврата), `monotonic` |
 
-Неподдерживаемое (warp-shuffle, `atom.exch`/`cas`/`min/max`, `.f16x2`/`.bf16x2`, тензорные инструкции)
+Неподдерживаемое (`mma.*`, `vote`/`activemask` на NVPTX, split-фазные
+`arrive`/`red`/`mbarrier.*`, `%clock64` на хосте)
 транслятор **отклоняет с ошибкой** — честный отказ, а не тихий мискомпил.
 
 ## Почему alloca-стиль

@@ -58,8 +58,12 @@ function(rouge_exec_cell kernel selector)
     message(FATAL_ERROR "gpu exec: FAILED - ${kernel}: ptx2ir exited ${rc}: ${err}")
   endif()
 
+  # NOTE: -O2 matters, not just for speed: at -O0 the backend spills every
+  # alloca to local memory, which used to hide address-space bugs behind
+  # working-but-slow code. -O2 is also what any perf comparison against nvcc
+  # (-O3) must use as the baseline; without it our side runs unoptimised.
   execute_process(
-    COMMAND "${CLANG}" --target=nvptx64-nvidia-cuda -march=${SM} -S
+    COMMAND "${CLANG}" --target=nvptx64-nvidia-cuda -march=${SM} -O2 -S
             "${ll}" -o "${ptx}"
     RESULT_VARIABLE rc
     OUTPUT_VARIABLE out

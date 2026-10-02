@@ -60,7 +60,7 @@ if(NOT rc EQUAL 0)
 endif()
 
 execute_process(
-  COMMAND "${CLANG}" --target=nvptx64-nvidia-cuda -march=${SM} -S
+  COMMAND "${CLANG}" --target=nvptx64-nvidia-cuda -march=${SM} -O2 -S
           "${ll}" -o "${ptx}"
   RESULT_VARIABLE rc
   OUTPUT_VARIABLE out

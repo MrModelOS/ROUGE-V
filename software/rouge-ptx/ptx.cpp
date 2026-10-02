@@ -76,10 +76,21 @@ bool parse_instruction(const std::string& raw, PtxInstruction* out) {
   }
 
   const size_t sp = rest.find(' ');
+  std::string op;
   if (sp == std::string::npos) {
-    out->op = rest;
+    op = rest;
   } else {
-    out->op = rest.substr(0, sp);
+    op = rest.substr(0, sp);
+  }
+  // The .volatile qualifier only forbids caching/reordering across the
+  // access; neither lowering path caches, so both are already effectively
+  // volatile. Stripping it once in the parser keeps every consumer honest
+  // without a qualifier check at each dispatch site.
+  for (size_t v = op.find(".volatile"); v != std::string::npos;
+       v = op.find(".volatile"))
+    op.erase(v, 9);
+  out->op = op;
+  if (sp != std::string::npos) {
     const std::string argstr = trim(rest.substr(sp + 1));
     if (!argstr.empty()) {
       std::stringstream ss(argstr);
@@ -223,10 +234,14 @@ bool parse_param_entry(const std::string& entry, PtxFunction* fn, int lineNo,
 // Parse ".shared .align 4 .b32 smem[256];" (or a comma list of vars) and lay
 // them out in the block scratchpad: successive variables get alignment-padded
 // byte offsets; PtxFunction::sharedSize is the total scratchpad size.
+// A leading ".extern" is tolerated (nvcc puts dynamic .shared at module
+// scope); an empty "[]" means dynamic shared: size fixed at launch, offset
+// marks the dynamic region base after the static scratchpad.
 void parse_shared_decl(const std::string& line, PtxFunction* fn) {
   std::string s = trim(line);
   const size_t semi = s.find(';');
   if (semi != std::string::npos) s = s.substr(0, semi);
+  if (s.rfind(".extern", 0) == 0) s = trim(s.substr(7));
   std::stringstream ss(s);
   std::string tok;
   int align = 0;
@@ -248,10 +263,16 @@ void parse_shared_decl(const std::string& line, PtxFunction* fn) {
         const size_t rb = t.find(']', lb);
         if (rb != std::string::npos) {
           v.name = t.substr(0, lb);
-          v.count = std::atoi(t.substr(lb + 1, rb - lb - 1).c_str());
+          if (rb == lb + 1) {
+            v.dynamic = true;  // unsized "name[]": dynamic shared
+            v.count = 0;
+          } else {
+            v.count = std::atoi(t.substr(lb + 1, rb - lb - 1).c_str());
+          }
         }
       }
       if (v.name.empty()) continue;
+      if (fn->sharedIndex.find(v.name) != fn->sharedIndex.end()) continue;
       v.elemBytes = elemBytes;
       v.align = align > 0 ? align : (elemBytes >= 8 ? 8 : elemBytes);
       v.offset = align_up(fn->sharedSize, v.align);
@@ -261,6 +282,51 @@ void parse_shared_decl(const std::string& line, PtxFunction* fn) {
     }
   }
   fn->sharedSize = align_up(fn->sharedSize, 16);  // scratchpad base alignment
+}
+
+// Parse ".local .align 8 .b8 __local_depot0[120];": per-thread spill depot.
+// Unlike .shared (one copy per block), each thread owns its copy; offset lays
+// the variables out inside one per-thread depot of localSize bytes.
+void parse_local_decl(const std::string& line, PtxFunction* fn) {
+  std::string s = trim(line);
+  const size_t semi = s.find(';');
+  if (semi != std::string::npos) s = s.substr(0, semi);
+  std::stringstream ss(s);
+  std::string tok;
+  int align = 0;
+  int elemBytes = 1;
+  ss >> tok;  // ".local"
+  while (ss >> tok) {
+    if (tok == ".align") {
+      ss >> tok;
+      align = std::atoi(tok.c_str());
+    } else if (!tok.empty() && tok[0] == '.') {
+      elemBytes = shared_elem_bytes(tok);
+    } else {
+      std::string t = tok;
+      if (!t.empty() && t.back() == ',') t.pop_back();
+      if (t.empty()) continue;
+      PtxFunction::PtxLocalVar v;
+      const size_t lb = t.find('[');
+      if (lb != std::string::npos) {
+        const size_t rb = t.find(']', lb);
+        if (rb != std::string::npos) {
+          v.name = t.substr(0, lb);
+          v.bytes = elemBytes * std::atoi(t.substr(lb + 1, rb - lb - 1).c_str());
+        }
+      } else {
+        v.name = t;
+        v.bytes = elemBytes;
+      }
+      if (v.name.empty()) continue;
+      if (fn->localIndex.find(v.name) != fn->localIndex.end()) continue;
+      v.align = align > 0 ? align : elemBytes;
+      v.offset = align_up(fn->localSize, v.align);
+      fn->localSize = v.offset + v.bytes;
+      fn->localIndex[v.name] = static_cast<int>(fn->localVars.size());
+      fn->localVars.push_back(std::move(v));
+    }
+  }
 }
 
 template <typename To, typename From>
@@ -351,6 +417,9 @@ std::unique_ptr<PtxProgram> parse_ptx(const std::string& text, std::string* erro
   PtxFunction* cur = nullptr;
   bool inParams = false;
   int lineNo = 0;
+  // Module-scope ".extern .shared" lines (dynamic shared, nvcc puts them
+  // before the entries): stashed here, attached to every function below.
+  std::vector<std::string> externShared;
 
   while (std::getline(ss, line)) {
     ++lineNo;
@@ -393,6 +462,19 @@ std::unique_ptr<PtxProgram> parse_ptx(const std::string& text, std::string* erro
     if (!cur) {  // module-scope: .version/.target/.address_size and .global
       if (s.rfind(".global", 0) == 0 || s.rfind(".const", 0) == 0)
         parse_global_decl(s, prog.get());
+      // ".extern .shared ..." (dynamic shared) applies to every kernel in
+      // the module; stashed and attached to each function after the loop.
+      if (s.rfind(".extern", 0) == 0 && s.find(".shared") != std::string::npos)
+        externShared.push_back(s);
+      // ".extern .global/.const ..." (nvcc emits these for unused C++ markers):
+      // record like a normal global so a use resolves to a real external
+      // symbol (link/JIT fails loudly if nobody defines it) instead of
+      // silently reading address zero.
+      if (s.rfind(".extern", 0) == 0 &&
+          (s.find(".global") != std::string::npos ||
+           s.find(".const") != std::string::npos) &&
+          s.find(".shared") == std::string::npos)
+        parse_global_decl(s.substr(7), prog.get());
       continue;
     }
 
@@ -431,6 +513,10 @@ std::unique_ptr<PtxProgram> parse_ptx(const std::string& text, std::string* erro
       parse_shared_decl(s, cur);
       continue;
     }
+    if (s.rfind(".local", 0) == 0) {
+      parse_local_decl(s, cur);
+      continue;
+    }
     if (!s.empty() && s[0] == '.') continue;  // .align/... directives
 
     std::string label;
@@ -446,6 +532,11 @@ std::unique_ptr<PtxProgram> parse_ptx(const std::string& text, std::string* erro
     }
     cur->body.push_back(std::move(instr));
   }
+
+  // Attach stashed module-scope ".extern .shared" decls to every function:
+  // dynamic region base lands after each kernel's static scratchpad.
+  for (const std::string& decl : externShared)
+    for (auto& fn : prog->functions) parse_shared_decl(decl, &fn);
 
   return prog;
 }
@@ -471,6 +562,8 @@ struct ExecState {
     return it == regs.end() ? 0 : it->second;
   }
   void setreg(const std::string& n, uint64_t v) { regs[n] = v; }
+  std::vector<uint8_t> local;  // per-thread .local depot (spill slots)
+  uintptr_t localBase = 0;     // host address of this thread's depot
 
   bool spec_reg(const std::string& n, uint64_t* out) const {
     if (n == "tid.x") { *out = tid[0]; return true; }
@@ -488,6 +581,13 @@ struct ExecState {
     return false;
   }
 };
+
+// Hardware cycle/id registers (no host equivalent; notably %clock64: CPU
+// wall time is not GPU cycles, so emulation would silently lie about units).
+bool is_hw_sreg(const std::string& n) {
+  return n == "clock" || n == "clock64" || n == "warpid" || n == "nwarpid" ||
+         n == "smid" || n == "nsmid" || n == "gridid" || n == "laneid";
+}
 
 uint64_t read_mem(const uint8_t* p, int width) {
   uint64_t v = 0;
@@ -540,6 +640,27 @@ bool split_reg_offset(const std::string& inner, std::string* base,
   return true;
 }
 
+// If the operand names a .local variable (bare or with a +/-Const byte
+// suffix), return its host depot address. Each thread owns its depot copy.
+bool local_symbol_addr(const PtxFunction& fn, const ExecState& st,
+                       const std::string& tok, uintptr_t* out) {
+  std::string inner = strip_brackets(tok);
+  int64_t constOff = 0;
+  std::string base;
+  int64_t off = 0;
+  if (split_reg_offset(inner, &base, &off)) {
+    inner = base;
+    constOff = off;
+  }
+  const auto it = fn.localIndex.find(inner);
+  if (it == fn.localIndex.end()) return false;
+  if (constOff < 0) return false;
+  *out = static_cast<uintptr_t>(st.localBase) +
+         static_cast<uintptr_t>(fn.localVars[it->second].offset) +
+         static_cast<uintptr_t>(constOff);
+  return true;
+}
+
 // Resolve a memory operand: shared symbol first, then a shared symbol with a
 // constant offset, then a GPR holding an address (global, or a shared address
 // produced by cvta.to.shared), then a GPR plus a constant offset.
@@ -547,6 +668,8 @@ uintptr_t mem_addr(const PtxFunction& fn, const ExecState& st,
                    const std::string& tok) {
   uintptr_t shared = 0;
   if (shared_symbol_addr(fn, st, tok, &shared)) return shared;
+  uintptr_t local = 0;
+  if (local_symbol_addr(fn, st, tok, &local)) return local;
   const std::string inner = strip_brackets(tok);
   std::string base;
   int64_t off = 0;
@@ -731,16 +854,21 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
     }
 
     if (op.rfind("cvta.", 0) == 0) {
-      // Host virtual addresses in emulation -> identity, except shared symbols
-      // which resolve to the block scratchpad base + laid-out offset.
+      // Host virtual addresses in emulation -> identity, except shared/local
+      // symbols which resolve to the block scratchpad / thread depot address.
       if (A.size() >= 2) {
         uintptr_t shared = 0;
         if (shared_symbol_addr(fn, st, A[1], &shared))
           st.setreg(A[0], static_cast<uint64_t>(shared));
         else {
-          uint64_t v = 0;
-          if (!st.spec_reg(A[1], &v)) v = st.reg(A[1]);
-          st.setreg(A[0], v);
+          uintptr_t local = 0;
+          if (local_symbol_addr(fn, st, A[1], &local))
+            st.setreg(A[0], static_cast<uint64_t>(local));
+          else {
+            uint64_t v = 0;
+            if (!st.spec_reg(A[1], &v)) v = st.reg(A[1]);
+            st.setreg(A[0], v);
+          }
         }
       }
       st.pc = next_pc;
@@ -749,7 +877,20 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
 
     if (op.rfind("mov.", 0) == 0) {
       if (A.size() < 2) { if (error) *error = "bad mov in " + fn.name; return 0; }
-      st.setreg(A[0], operand_u64(st, A[1]));
+      // Hardware cycle/id registers have no host equivalent: refuse loudly
+      // instead of reading an uninitialised zero (clock.ptx caught this).
+      if (is_hw_sreg(A[1])) {
+        if (error)
+          *error = "unsupported mov of %" + A[1] + " in the interpreter in " +
+                   fn.name + " (no host equivalent of this hardware register)";
+        return 0;
+      }
+      // "mov.b64 %SPL, __local_depot0": materialise the thread depot address.
+      uintptr_t local = 0;
+      if (local_symbol_addr(fn, st, A[1], &local))
+        st.setreg(A[0], static_cast<uint64_t>(local));
+      else
+        st.setreg(A[0], operand_u64(st, A[1]));
       st.pc = next_pc;
       return 1;
     }
@@ -1391,14 +1532,19 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       return 1;
     }
 
-    if (op.rfind("ld.global.", 0) == 0 || op.rfind("ld.shared.", 0) == 0) {
-      // ld.global.f32 %r, [%rd] (also ld.global.nc.*); ld.shared.f32 %r, [%rd]
+    // ld.global / ld.shared / ld.local / generic ld (no space qualifier):
+    // the address resolves through mem_addr either way (registers hold real
+    // host addresses in emulation, including the .local depot pointer).
+    if ((op.rfind("ld.", 0) == 0 && op.rfind("ld.param.", 0) != 0)) {
+      // ld.global.f32 %r, [%rd] (also ld.global.nc.*, ld.local.*, generic ld)
       if (A.size() < 2) { if (error) *error = "bad " + op + " in " + fn.name; return 0; }
       const uintptr_t addr = mem_addr(fn, st, A[1]);
       std::string pref;
       if (op.rfind("ld.global.nc.", 0) == 0) pref = "ld.global.nc.";
       else if (op.rfind("ld.global.", 0) == 0) pref = "ld.global.";
-      else pref = "ld.shared.";
+      else if (op.rfind("ld.shared.", 0) == 0) pref = "ld.shared.";
+      else if (op.rfind("ld.local.", 0) == 0) pref = "ld.local.";
+      else pref = "ld.";
       const std::string ty = op.substr(pref.size());
       if (ty == "v2.u32" || ty == "v2.s32" || ty == "v2.b32" || ty == "v2.f32") {
         // 64-bit vector load. Operands are split on ',', so a destination
@@ -1438,12 +1584,15 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       return 1;
     }
 
-    if (op.rfind("st.global.", 0) == 0 || op.rfind("st.shared.", 0) == 0) {
-      // st.global.f32 [%rd], %r ; st.shared.f32 [%rd], %r
+    if (op.rfind("st.", 0) == 0) {
+      // st.global.f32 [%rd], %r ; st.shared.f32 ; st.local.* ; generic st
       if (A.size() < 2) { if (error) *error = "bad " + op + " in " + fn.name; return 0; }
       const uintptr_t addr = mem_addr(fn, st, A[0]);
-      const std::string pref =
-          op.rfind("st.global.", 0) == 0 ? "st.global." : "st.shared.";
+      std::string pref;
+      if (op.rfind("st.global.", 0) == 0) pref = "st.global.";
+      else if (op.rfind("st.shared.", 0) == 0) pref = "st.shared.";
+      else if (op.rfind("st.local.", 0) == 0) pref = "st.local.";
+      else pref = "st.";
       const std::string ty = op.substr(pref.size());
       const uint64_t v = st.reg(A[1]);
       auto* p = reinterpret_cast<uint8_t*>(addr);
@@ -1823,9 +1972,11 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       return 1;
     }
 
-    if (op == "bar.sync" || op.rfind("bar.", 0) == 0) {
-      // Block-wide barrier: the CTA scheduler keeps the thread parked until all
-      // live threads of the block reach this point (see execute_kernel).
+    // Block-wide barrier (bar.sync, its new spelling barrier.sync, and the
+    // warp-scoped bar.warp.sync): the CTA scheduler keeps the thread parked
+    // until all live threads of the block reach this point (see
+    // execute_kernel).
+    if (op == "bar.sync" || op == "bar.warp.sync" || op == "barrier.sync") {
       st.pc = next_pc;
       return 2;
     }
@@ -1849,6 +2000,17 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
   }
   const PtxFunction& fn = prog.functions[fnIndex];
 
+  // Dynamic .shared (unsized ".extern .shared") has no launch-time backing in
+  // the interpreter: refusing loudly beats a scratchpad overrun.
+  for (const auto& sv : fn.sharedVars)
+    if (sv.dynamic) {
+      if (error)
+        *error = "kernel '" + fn.name + "' uses dynamic .shared '" + sv.name +
+                 "' (extern, unsized): launch-time size is not supported by " +
+                 "the interpreter";
+      return false;
+    }
+
   // CTA-sized thread states for one block, stepped in lockstep (SIMT).
   const size_t threadsPerBlock = static_cast<size_t>(bz) * by * bx;
 
@@ -1868,6 +2030,10 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
             for (uint64_t tx = 0; tx < bx; ++tx) {
               ExecState& st = states[n++];
               st.sharedBase = sharedBase;
+              if (fn.localSize > 0) {
+                st.local.assign(static_cast<size_t>(fn.localSize), 0);
+                st.localBase = reinterpret_cast<uintptr_t>(st.local.data());
+              }
               st.tid[0] = static_cast<uint32_t>(tx);
               st.tid[1] = static_cast<uint32_t>(ty);
               st.tid[2] = static_cast<uint32_t>(tz);

@@ -558,13 +558,31 @@ class LlvmGen {
     if (is_nvptx() && !fn_->sharedVars.empty()) {
       smem_global();
       line(smem_decl_);
+      // One extern window per dynamic (extern, unsized) variable: the same
+      // shape CUDA clang emits for `extern __shared__`, storage provided by
+      // the launch's dynamic-shared allocation.
+      for (const auto& sv : fn_->sharedVars) {
+        if (!sv.dynamic) continue;
+        line("@" + dsmem_sym(sv.name) +
+             " = external addrspace(3) global [0 x i8], align " +
+             std::to_string(std::max(sv.align, 1)));
+      }
     }
+  }
+
+  // True for every barrier mnemonic we lower: bar.sync, its new spelling
+  // barrier.sync, and the warp-scoped bar.warp.sync (implied by the
+  // block-wide barrier: stronger, still correct). Split-phase arrive/red
+  // forms (bar.arrive, barrier.red, mbarrier.*) are NOT matched: they do
+  // not block and lowering them to a full barrier would be wrong.
+  static bool is_barrier_op(const std::string& op) {
+    return op == "bar.sync" || op == "bar.warp.sync" || op == "barrier.sync";
   }
 
   void emit_signature() {
     // Module-level declare for the block barrier runtime helper (bar.sync).
     for (const auto& ins : body_)
-      if (ins.op == "bar.sync" || ins.op.rfind("bar.", 0) == 0) use_sync_ = true;
+      if (is_barrier_op(ins.op)) use_sync_ = true;
     // On a real GPU the barrier is a hardware instruction reached through
     // NVVM, not a call into a host pthread barrier.
     if (use_sync_ && !is_nvptx()) line("declare void @__rouge_syncthreads(ptr)");
@@ -606,7 +624,9 @@ class LlvmGen {
   void emit_gpu_intrinsics() {
     for (const auto& ins : body_) {
       if (ins.args.size() < 2) continue;
-      if (spec_offset(ins.args[1]) < 0) continue;
+      if (spec_offset(ins.args[1]) < 0 &&
+          sreg_llvm_ty(ins.args[1]).empty())
+        continue;
       if (!ins.args[1].empty() && ins.args[1][0] == '%') continue;
       nvvm_sreg(ins.args[1]);
     }
@@ -635,10 +655,26 @@ class LlvmGen {
   }
 
   // Emit (once) a read of the named special register and return the intrinsic.
+  // Most sregs are i32; clock64 is i64 (sreg_llvm_ty knows).
   std::string nvvm_sreg(const std::string& name) {
+    const std::string ty =
+        sreg_llvm_ty(name).empty() ? "i32" : sreg_llvm_ty(name);
     const std::string fn = "llvm.nvvm.read.ptx.sreg." + name;
-    intrinsics_.insert("declare i32 @" + fn + "()");
+    intrinsics_.insert("declare " + ty + " @" + fn + "()");
     return fn;
+  }
+
+  // Cycle/id special registers outside the launch descriptor: the LLVM type
+  // they read as, or "" when the name is not one. NVPTX serves them from real
+  // hardware sregs; the host has no equivalent (notably %clock64: CPU wall
+  // time is not GPU cycles, so a host fallback would silently lie about units).
+  static std::string sreg_llvm_ty(const std::string& name) {
+    if (name == "clock64") return "i64";
+    if (name == "clock" || name == "warpid" || name == "nwarpid" ||
+        name == "smid" || name == "nsmid" || name == "gridid" ||
+        name == "laneid")
+      return "i32";
+    return "";
   }
 
   // NVVM warp-shuffle kind named by the opcode, or "" when this shfl must stay
@@ -728,6 +764,10 @@ class LlvmGen {
       return labels_.find(tok) != labels_.end();
     };
     const auto add_reg = [&used, &is_label](const std::string& tok) {
+      // Hardware special registers (%clock64, %warpid, ...) are read from
+      // intrinsics, never from an alloca: allocating one would silently feed
+      // garbage into the kernel (clock.ptx caught this).
+      if (!sreg_llvm_ty(tok).empty()) return;
       if (is_register(tok) && !is_label(tok)) used.insert(tok);
       // Predicated destinations arrive as "r10|p1" — allocate the guard too.
       const size_t bar = tok.find('|');
@@ -767,6 +807,16 @@ class LlvmGen {
       if (ty == "i1")
         line("  store i1 false, " + selfTy + " %" + r + ", align 1");
     }
+    // Per-thread .local spill depots (nvcc "__local_depotN" arrays): one
+    // generic alloca each, addressed with ptrtoint like any other stack slot.
+    for (const auto& lv : fn_->localVars) {
+      const std::string as = is_amdgpu() ? ", addrspace(5)" : "";
+      const std::string selfTy = is_amdgpu() ? "ptr addrspace(5)" : "ptr";
+      line("  %" + lv.name + " = alloca [" + std::to_string(lv.bytes) +
+           " x i8], align " + std::to_string(lv.align > 0 ? lv.align : 1) +
+           as);
+      ptr_ty_["%" + lv.name] = selfTy;
+    }
     if (!block_name_.empty() && block_name_[0] != "entry") {
       // First instruction is a branch target: jump to its block.
       line("  br label %" + block_name_[0]);
@@ -798,6 +848,20 @@ class LlvmGen {
         store_reg(A[0], load_spec(A[1]));
         return true;
       }
+      // Cycle/id special registers (%clock64, %warpid, ...): NVPTX reads the
+      // real hardware counter; the host has no equivalent and fails loudly
+      // instead of wiring an uninitialised alloca (clock.ptx caught this).
+      const std::string sregTy = sreg_llvm_ty(A[1]);
+      if (!sregTy.empty()) {
+        if (!is_nvptx())
+          return fail("unsupported " + op + " of %" + A[1] + " on host @ " +
+                      std::to_string(idx) +
+                      " (no host equivalent of this hardware register)");
+        const std::string v = fresh("%v");
+        line("  " + v + " = call " + sregTy + " @" + nvvm_sreg(A[1]) + "()");
+        store_reg(A[0], fit_reg(A[0], v, sregTy));
+        return true;
+      }
       // "mov.u64 %rd, arr" — nvcc also materialises a __device__ address with
       // a plain mov, not only with cvta.to.global.
       if (is_global_symbol(A[1])) return emit_symbol_address(A[0], A[1]);
@@ -806,21 +870,27 @@ class LlvmGen {
       // destination register takes the low 32 bits, as the hardware does.
       int symOff = 0, symConst = 0;
       if (shared_symbol(A[1], &symOff, &symConst)) {
-        const std::string base = load_smem_base();
+        const std::string base = shared_base_for(A[1]);
         const std::string addr = fresh("%sa");
         line("  " + addr + " = add i64 " + base + ", " +
              std::to_string(symOff + symConst));
+        shared_addr_regs_.insert(A[0]);  // result is a shared-memory address
         store_reg(A[0], fit_reg(A[0], addr, "i64"));
         return true;
       }
-      // Width mismatch (e.g. mov.b16 %h, %r32) -> truncate the bit pattern.
+      // "mov.b64 %SPL, __local_depot0" materialises the thread depot address
+      // (the form nvcc emits for spilled stack frames).
+      if (find_local(A[1])) {
+        store_reg(A[0], fit_reg(A[0], local_addr(A[1]), "i64"));
+        return true;
+      }
+      // Width mismatch (e.g. mov.b16 %h, %r32): fit the bit pattern,
+      // growing with zext and shrinking with trunc, like the interpreter's
+      // width_mask (an unconditional trunc miscompiles i32 -> i64 moves).
       const std::string dstTy = reg_type(A[0]);
       std::string val = operand(A[1]);  // register or numeric immediate
-      if (is_register(A[1]) && reg_type(A[1]) != dstTy) {
-        const std::string t = fresh("%t");
-        line("  " + t + " = trunc " + reg_type(A[1]) + " " + val + " to " + dstTy);
-        val = t;
-      }
+      if (is_register(A[1]) && reg_type(A[1]) != dstTy)
+        val = fit_reg(A[0], val, reg_type(A[1]));
       store_reg(A[0], val);
       return true;
     }
@@ -838,7 +908,7 @@ class LlvmGen {
       if (!shared_symbol(A[1], &off, &c))
         return fail("cvta.to.shared of non-shared symbol '" + A[1] + "' @" +
                     std::to_string(idx));
-      const std::string base = load_smem_base();
+      const std::string base = shared_base_for(A[1]);
       const std::string addr = fresh("%sa");
       line("  " + addr + " = add i64 " + base + ", " + std::to_string(off + c));
       shared_addr_regs_.insert(A[0]);  // result is a shared-memory address
@@ -852,6 +922,14 @@ class LlvmGen {
       // yield the symbol's address, not the value of a register of that name.
       if (is_global_symbol(A[1])) return emit_symbol_address(A[0], A[1]);
       store_reg(A[0], load_reg(A[1]));
+      return true;
+    }
+    if (op.rfind("cvta.local.", 0) == 0) {
+      // cvta.local.u64 %SP, %SPL: the source register already holds the depot
+      // address (materialised by mov from the .local symbol above); the
+      // conversion is an identity copy, width-fitted like the interpreter.
+      if (A.size() != 2) return fail("bad " + op + " operands @ " + std::to_string(idx));
+      store_reg(A[0], fit_reg(A[0], operand(A[1]), reg_type(A[1])));
       return true;
     }
 
@@ -894,10 +972,10 @@ class LlvmGen {
       return emit_setp(ins, idx);
     }
 
-    if (op.rfind("ld.global", 0) == 0 || op.rfind("ld.shared", 0) == 0) {
+    if (op.rfind("ld.", 0) == 0 && op.rfind("ld.param.", 0) != 0) {
       return emit_ld_mem(ins, idx);
     }
-    if (op.rfind("st.global", 0) == 0 || op.rfind("st.shared", 0) == 0) {
+    if (op.rfind("st.", 0) == 0) {
       return emit_st_mem(ins, idx);
     }
 
@@ -977,22 +1055,12 @@ class LlvmGen {
       // A[0]=dst, A[1]=src (value to shuffle); A[2]=lane/offset, A[3]=clamp.
       // dst/setPred already split above; the value is always written and the
       // predicate is SET per PTX ISA 9.7.10.6.
+      // Width mismatch (e.g. an immediate): fit the bit pattern, growing
+      // with zext and shrinking with trunc, like the interpreter's width_mask.
       const std::string dstTy = reg_type(dst);
       std::string srcVal = operand(A[1]);
-      // Handle width mismatch (e.g. immediate)
-      if (is_register(A[1]) && reg_type(A[1]) != dstTy) {
-        const std::string t = fresh("%t");
-        const std::string srcTy = reg_type(A[1]);
-        // Generic: trunc or zext depending on widths; for shfl b32 both are i32.
-        if (dstTy == "i32" && srcTy == "i64") {
-          line("  " + t + " = trunc i64 " + srcVal + " to i32");
-        } else if (dstTy == "i64" && srcTy == "i32") {
-          line("  " + t + " = zext i32 " + srcVal + " to i64");
-        } else {
-          line("  " + t + " = trunc " + srcTy + " " + srcVal + " to " + dstTy);
-        }
-        srcVal = t;
-      }
+      if (is_register(A[1]) && reg_type(A[1]) != dstTy)
+        srcVal = fit_reg(dst, srcVal, reg_type(A[1]));
       // Always write the value; SET the predicate per PTX ISA 9.7.10.6.
       store_reg(dst, srcVal);
       if (!setPred.empty()) {
@@ -1067,7 +1135,7 @@ class LlvmGen {
       return true;
     }
 
-    if (op == "bar.sync" || op.rfind("bar.", 0) == 0) {
+    if (is_barrier_op(op)) {
       // Block-wide barrier. On the host this is __rouge_syncthreads (a
       // pthread barrier); on a GPU it is the hardware barrier instruction,
       // which needs no operand and no argument block.
@@ -1075,7 +1143,8 @@ class LlvmGen {
         line("  call void @llvm.nvvm.barrier0()");
         return true;
       }
-      // bar.sync 0[, count] — ignore barrier id for now (single barrier).
+      // bar.sync 0[, count] / barrier.sync 0 — ignore barrier id for now
+      // (single barrier).
       line("  call void @__rouge_syncthreads(ptr %launch)");
       return true;
     }
@@ -2238,16 +2307,20 @@ class LlvmGen {
     return v;
   }
 
-  // The GPU block scratchpad. Its size is fixed at compile time by the .shared
-  // declaration, so a static global is enough; the address space is the one
+  // The GPU block scratchpad. Its size is fixed at compile time by the
+  // static .shared declarations, so a static global is enough; dynamic
+  // (extern, unsized) variables are skipped here — they get a dedicated
+  // extern global each (see emit_header). The address space is the one
   // NVPTX uses for .shared.
   std::string smem_global() {
     if (!smem_sym_.empty()) return smem_sym_;
     size_t bytes = 1;
-    for (const auto& sv : fn_->sharedVars)
+    for (const auto& sv : fn_->sharedVars) {
+      if (sv.dynamic) continue;
       bytes = std::max(bytes, static_cast<size_t>(sv.offset) +
                                       static_cast<size_t>(sv.elemBytes) *
                                           static_cast<size_t>(sv.count));
+    }
     smem_sym_ = "__rouge_" + fn_->name + "_smem";
     // A global's alignment follows the initialiser, comma-separated. 16 bytes
     // is the widest shared access a kernel may perform.
@@ -2256,8 +2329,27 @@ class LlvmGen {
     return smem_sym_;
   }
 
+  // A .local spill-depot variable by operand name, or nullptr. Unlike
+  // .shared (one copy per block), each thread owns its depot copy, lowered
+  // to a plain function alloca.
+  const rouge::PtxFunction::PtxLocalVar* find_local(
+      const std::string& inner) const {
+    const auto it = fn_->localIndex.find(inner);
+    if (it == fn_->localIndex.end()) return nullptr;
+    return &fn_->localVars[static_cast<size_t>(it->second)];
+  }
+
+  // Address of a .local depot variable as i64 (ptrtoint of its alloca).
+  std::string local_addr(const std::string& name) {
+    const std::string a = fresh("%la");
+    line("  " + a + " = ptrtoint " + pt("%" + name) + " %" + name + " to i64");
+    return a;
+  }
+
   // If the operand names a .shared var (optionally with a +/-Const byte
-  // suffix), return its offset and the constant part.
+  // suffix), return its offset and the constant part. Dynamic (extern,
+  // unsized) vars resolve the same way; their base is separate (see
+  // load_dsmem_base).
   bool shared_symbol(const std::string& inner, int* varOffset, int* constOff) const {
     for (const auto& sv : fn_->sharedVars) {
       if (inner == sv.name) {
@@ -2278,18 +2370,64 @@ class LlvmGen {
     return false;
   }
 
+  // The .shared var named by an operand (with the same +/-Const suffix rule
+  // as shared_symbol), or nullptr. Lets resolve_addr and the mov/cvta
+  // address-takers pick the dynamic base for extern unsized variables.
+  const rouge::PtxSharedVar* find_shared(const std::string& inner) const {
+    for (const auto& sv : fn_->sharedVars) {
+      if (inner == sv.name) return &sv;
+      if (inner.size() > sv.name.size() &&
+          inner.compare(0, sv.name.size(), sv.name) == 0) {
+        const char c = inner[sv.name.size()];
+        if (c == '+' || c == '-') return &sv;
+      }
+    }
+    return nullptr;
+  }
+
+  // Dynamic .shared base as i64. On the host the dynamic region follows the
+  // static scratchpad (sv.offset, laid out by the parser); on NVPTX it is a
+  // dedicated extern addrspace(3) global whose storage the driver provides
+  // from the launch's dynamic-shared allocation.
+  std::string dsmem_sym(const std::string& name) const {
+    return "__rouge_" + fn_->name + "_dsmem_" + name;
+  }
+  std::string load_dsmem_base(const rouge::PtxSharedVar& sv) {
+    if (is_nvptx()) {
+      const std::string a = fresh("%a");
+      line("  " + a + " = ptrtoint ptr addrspace(3) @" + dsmem_sym(sv.name) +
+           " to i64");
+      return a;
+    }
+    const std::string base = load_smem_base();
+    const std::string d = fresh("%db");
+    line("  " + d + " = add i64 " + base + ", " + std::to_string(sv.offset));
+    return d;
+  }
+
+  // If the operand (e.g. "[smem]" or "smem") names a .shared variable, return its
+  // scratchpad base: the static window, or the dynamic base for extern unsized
+  // variables.
+  std::string shared_base_for(const std::string& inner) {
+    const rouge::PtxSharedVar* sv = find_shared(inner);
+    if (sv && sv->dynamic) return load_dsmem_base(*sv);
+    return load_smem_base();
+  }
+
   // Resolve a memory operand ("[%rd1]", "[smem]", "[smem+4]") to a `ptr` SSA:
   // shared symbols are scratchpad-relative, registers hold addresses as-is.
   std::string resolve_addr(const std::string& tok, const std::string& space = "") {
     const std::string inner = strip_brackets(tok);
     int varOffset = 0, constOff = 0;
     if (shared_symbol(inner, &varOffset, &constOff)) {
-      const std::string base = load_smem_base();
+      const std::string base = shared_base_for(inner);
       const std::string off = fresh("%a");
       line("  " + off + " = add i64 " + base + ", " +
            std::to_string(varOffset + constOff));
       return inttoptr_as(off, shared_ptr_ty());
     }
+    // Bare .local depot reference ("[__local_depot0]"): ptrtoint of its alloca.
+    if (find_local(inner)) return inttoptr_as(local_addr(inner), pt("%" + inner));
     // Register plus a constant byte offset: "[%r6+512]", "[%rd2-4]". This is
     // how nvcc indexes shared memory (and nearly every global access), so it
     // must lower to a real address computation, never to a pointer named
