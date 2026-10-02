@@ -1,0 +1,61 @@
+.version 8.0
+.target sm_80
+.address_size 64
+
+// ROUGE-V test kernel: predicated shfl.sync.down with SET-predicate.
+// Each thread loads data[globalIdx], shuffles down by 16 (clamp 31, full mask)
+// and writes both the shuffled value and the predicate as 0/1.
+// Per PTX ISA 9.7.10.6 p is SET, not a guard: p is True when the computed
+// source lane (lane+16) is in [0,31], False otherwise; the value is always
+// written (out-of-range lanes keep their own value on real hardware,
+// verified with nvcc on sm_75).
+// Exercises the "d|p" form in both paths: the host AOT scalar fallback
+// (identity value + computed predicate) and the NVPTX path (a real
+// llvm.nvvm.shfl.sync.down + a laneid-based predicate) — verified
+// bit-exactly against a host reference on a real GPU (compiler_nvptx_gpu_exec).
+
+.visible .entry shfl_pred(
+    .param .u64 shfl_pred_param_0,
+    .param .u64 shfl_pred_param_1,
+    .param .u64 shfl_pred_param_2,
+    .param .u32 shfl_pred_param_3
+)
+{
+    .reg .b32 %r<14>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [shfl_pred_param_0];
+    ld.param.u64 %rd2, [shfl_pred_param_1];
+    ld.param.u64 %rd5, [shfl_pred_param_2];
+    ld.param.u32 %r1, [shfl_pred_param_3];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mul.wide.u32 %rd3, %r2, %r3;
+    mov.u32 %r4, %tid.x;
+    cvt.u64.u32 %rd4, %r4;
+    add.s64 %rd3, %rd3, %rd4;
+    cvt.u32.u64 %r5, %rd3;
+
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_RET;
+
+    mul.wide.u32 %rd4, %r5, 4;
+    add.s64 %rd1, %rd1, %rd4;
+    ld.global.b32 %r7, [%rd1];
+
+    // down by 16, clamp 31, full warp mask; predicate SET per ISA 9.7.10.6
+    shfl.sync.down.b32 %r8|%p1, %r7, 16, 31, -1;
+
+    mul.wide.u32 %rd4, %r5, 4;
+    add.s64 %rd2, %rd2, %rd4;
+    st.global.b32 [%rd2], %r8;
+
+    selp.b32 %r9, 1, 0, %p1;
+    add.s64 %rd5, %rd5, %rd4;
+    st.global.b32 [%rd5], %r9;
+
+L_RET:
+    ret;
+}

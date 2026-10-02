@@ -1645,16 +1645,18 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
         if (error) *error = "bad " + op + " in " + fn.name;
         return 0;
       }
-      // The destination may be predicated: "shfl.sync.down.b32 %r10|%p1, ..."
-      // writes %r10 only when %p1 holds. Split it and honour the guard.
+      // The destination may carry a predicate: "shfl.sync.down.b32 %r10|%p1, ..."
+      // Per PTX ISA 9.7.10.6, p is SET (not a guard): True if the computed
+      // source lane is in range [0,31], False otherwise. The value is always
+      // written to d.
       std::string dst = A[0];
-      std::string writePred;
+      std::string setPred;
       {
         const size_t bar = dst.find('|');
         if (bar != std::string::npos) {
-          writePred = dst.substr(bar + 1);
+          setPred = dst.substr(bar + 1);
           dst = dst.substr(0, bar);
-          if (!writePred.empty() && writePred[0] == '%') writePred = writePred.substr(1);
+          if (!setPred.empty() && setPred[0] == '%') setPred = setPred.substr(1);
         }
       }
       const std::string src = A[1];
@@ -1663,26 +1665,48 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       const bool is_up = op.find(".up.") != std::string::npos;
       const bool is_down = op.find(".down.") != std::string::npos;
       const uint32_t sel = static_cast<uint32_t>(operand_u64(st, A[2]));
+      // Operand c (clamp / segmask) is parsed to validate the form but does
+      // not redirect out-of-range lanes on real hardware (verified on sm_75):
+      // they keep their own value with p=False.
+      if (A.size() >= 4) (void)operand_u64(st, A[3]);
       const uint32_t linear = st.tid[0] + st.tid[1] * st.ntid[0] + st.tid[2] * st.ntid[0] * st.ntid[1];
       const uint32_t lane = linear % 32;
       const uint32_t warpBase = linear - lane;
       uint32_t targetLane = 0;
-      bool oob = false;
-      if (is_idx) targetLane = sel & 0x1f;
-      else if (is_bfly) targetLane = lane ^ (sel & 0x1f);
-      else if (is_up) {
+      bool inRange = true;
+      if (is_idx) {
+        targetLane = sel & 0x1f;
+        inRange = true;
+      } else if (is_bfly) {
+        targetLane = lane ^ (sel & 0x1f);
+        inRange = true;
+      } else if (is_up) {
         const uint32_t off = sel & 0x1f;
-        if (lane < off) oob = true;
-        else targetLane = lane - off;
+        if (lane < off) {
+          // Out of range: the thread keeps its own value (confirmed against
+          // nvcc on real sm_75 hardware); the clamp lane is not read.
+          targetLane = lane;
+          inRange = false;
+        } else {
+          targetLane = lane - off;
+          inRange = true;
+        }
       } else if (is_down) {
         const uint32_t off = sel & 0x1f;
         targetLane = lane + off;
-        if (targetLane >= 32) oob = true;
+        if (targetLane >= 32) {
+          // Same as above: own value, p=False.
+          targetLane = lane;
+          inRange = false;
+        } else {
+          inRange = true;
+        }
       } else {
         targetLane = sel & 0x1f;
+        inRange = true;
       }
       uint64_t val = st.reg(src);
-      if (!oob && g_block_states) {
+      if (g_block_states) {
         const size_t targetLinear = static_cast<size_t>(warpBase + targetLane);
         if (targetLinear < g_block_states->size()) {
           // For partial warps (block size not multiple of 32) the target lane
@@ -1697,12 +1721,14 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
             if (srcState.spec_reg(src, &v)) val = v;
           }
         } else {
-          oob = true;
+          inRange = false;
+          val = st.reg(src);
         }
       }
-      if (oob) val = st.reg(src);
-      // Predicated write: leave the destination untouched when the guard is false.
-      if (writePred.empty() || st.preds[writePred]) st.setreg(dst, val);
+      if (!inRange) val = st.reg(src);
+      // Always write the value; set the predicate per PTX ISA.
+      st.setreg(dst, val);
+      if (!setPred.empty()) st.preds[setPred] = inRange;
       st.pc = next_pc;
       return 1;
     }

@@ -113,16 +113,16 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | compiles to a native object — never executed |
 | `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | compiles **and executes on a real GPU** — see below |
 
-All seven canonical kernels in `software/rouge-compiler/tests/kernels/` — `vadd`,
+All eight canonical kernels in `software/rouge-compiler/tests/kernels/` — `vadd`,
 `block_reduce`, `atomic_reduce`, `fp16_reduce`, `gemm_tile`, `shfl_reduce`,
-`atom_cas` — build for all four triples.
+`atom_cas`, `shfl_pred` — build for all four triples.
 
 ### Executed on real hardware
 
 The NVIDIA kernels do not just compile: `ctest compiler_nvptx_gpu_exec*`
 loads the generated PTX through the CUDA Driver API (driver-side JIT) on a
 real GeForce MX450 (sm_75) and checks every output bit-exactly against a host
-reference — all seven canonical kernels, two datasets for `fp16_reduce`/`gemm_tile`,
+reference — all eight canonical kernels, two datasets for `fp16_reduce`/`gemm_tile`,
 plus a two-block grid proving the multi-block path. `compiler_nvcc_gpu_exec`
 additionally runs genuine vendor output (`nvcc real_nvcc.cu`) end to end. On
 machines without an sm_75+ NVIDIA GPU the tests report SKIP, never failure.
@@ -147,12 +147,12 @@ driver needed to launch a translated kernel.
 ```
 $ ctest --test-dir build
 ...
- 7/21 aot_native_block_reduce ..............   Passed
- 8/21 aot_native_atomic_reduce .............   Passed
-13/21 compiler_nvcc_ptx ....................   Passed
-19/21 compiler_nvptx_gpu_exec ..............   Passed
-21/21 compiler_nvcc_gpu_exec ...............   Passed
-100% tests passed out of 21
+ 7/22 aot_native_block_reduce ..............   Passed
+ 8/22 aot_native_atomic_reduce .............   Passed
+14/22 compiler_nvcc_ptx ....................   Passed
+20/22 compiler_nvptx_gpu_exec ..............   Passed
+22/22 compiler_nvcc_gpu_exec ...............   Passed
+100% tests passed out of 22
 ```
 
 > [!NOTE]

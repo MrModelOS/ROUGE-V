@@ -778,9 +778,75 @@ static int test_atom_cas(CUmodule mod) {
 }
 
 // ---------------------------------------------------------------------------
+// kernel: shfl_pred -- predicated shfl.sync.down.b32 with SET-predicate.
+//   params: (const u32* in, u32* out, u32* outPred, u32 n), 1 block x 32 threads.
+//   out[i] = shuffled value, outPred[i] = 1/0. Reference: lane l reads
+//   in[l+16] with p=1 when l+16 <= 31, else the clamp lane 31 with p=0.
+//   Non-uniform data proves real cross-lane exchange (an identity fallback
+//   would leave out[i] == in[i]).
+// ---------------------------------------------------------------------------
+static int test_shfl_pred(CUmodule mod) {
+  const int threads = 32, blocks = 1, N = 32;
+  printf("  config: N=%d blockDim=(%d,1,1) gridDim=(%d,1,1), shfl.sync.down offset 16 clamp 31\n",
+         N, threads, blocks);
+
+  CUfunction fn;
+  CK(cuModuleGetFunction(&fn, mod, "shfl_pred"));
+
+  uint32_t hd[32], ho[32], hp[32], he[32], hep[32];
+  for (int i = 0; i < 32; ++i) hd[i] = 1000u + (uint32_t)i * 17u;
+  for (int i = 0; i < 32; ++i) {
+    ho[i] = 0xdeadbeefu;
+    hp[i] = 0xdeadbeefu;
+  }
+  // Ground truth, confirmed by nvcc on a real sm_75 (MX450): in-range lanes
+  // read in[l+16] with p=1; out-of-range lanes keep their OWN value with p=0.
+  // The clamp operand does not redirect the value on this hardware.
+  for (int l = 0; l < 32; ++l) {
+    const int inRange = (l + 16 <= 31);
+    hep[l] = inRange ? 1u : 0u;
+    he[l] = inRange ? hd[l + 16] : hd[l];
+  }
+
+  CUdeviceptr dd, dout, dpred;
+  CK(cuMemAlloc(&dd, N * 4));
+  CK(cuMemAlloc(&dout, N * 4));
+  CK(cuMemAlloc(&dpred, N * 4));
+  CK(cuMemcpyHtoD(dd, hd, N * 4));
+  CK(cuMemcpyHtoD(dout, ho, N * 4));
+  CK(cuMemcpyHtoD(dpred, hp, N * 4));
+
+  unsigned int n = N;
+  void* args[] = {&dd, &dout, &dpred, &n};
+  CK(cuLaunchKernel(fn, blocks, 1, 1, threads, 1, 1, 0, 0, args, 0));
+  CUresult r = cuCtxSynchronize();
+  if (r != CUDA_SUCCESS) {
+    printf("  MISMATCH: launch/sync failed: %s (%s) -- the kernel faulted on the device\n",
+           cuerr(r), cuerrstr(r));
+    return 3;
+  }
+  CK(cuMemcpyDtoH(ho, dout, N * 4));
+  CK(cuMemcpyDtoH(hp, dpred, N * 4));
+
+  int bad = 0;
+  for (int i = 0; i < 32; ++i) {
+    if (ho[i] != he[i]) {
+      printf("  out[%d]: got %u want %u\n", i, ho[i], he[i]);
+      bad = 1;
+    }
+    if (hp[i] != hep[i]) {
+      printf("  outPred[%d]: got %u want %u\n", i, hp[i], hep[i]);
+      bad = 1;
+    }
+  }
+  printf(bad ? "  MISMATCH\n" : "  OK: 32 lanes, shuffled values and SET-predicates verified bit-exactly\n");
+  return bad;
+}
+
+// ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
   if (argc < 3) {
-    printf("usage: %s <file.ptx> <vadd|block_reduce|fp16_reduce|gemm_tile|shfl_reduce|atom_cas|all>\n", argv[0]);
+    printf("usage: %s <file.ptx> <vadd|block_reduce|fp16_reduce|gemm_tile|shfl_reduce|atom_cas|shfl_pred|all>\n", argv[0]);
     return 2;
   }
   const char* ptx = argv[1];
@@ -904,6 +970,12 @@ int main(int argc, char** argv) {
     printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
     if (rc && g_exit_code == 0) g_exit_code = rc;
   }
+  if (all || strcmp(kname, "shfl_pred") == 0) {
+    printf("== shfl_pred ==\n");
+    rc = test_shfl_pred(mod);
+    printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
+    if (rc && g_exit_code == 0) g_exit_code = rc;
+  }
   if (!all && strcmp(kname, "fp16_reduceB") == 0) {
     printf("== fp16_reduce (dataset B only) ==\n");
     rc = test_fp16_reduce(mod, 1);
@@ -928,6 +1000,7 @@ int main(int argc, char** argv) {
   if (!all && strcmp(kname, "vadd") && strcmp(kname, "block_reduce") &&
       strcmp(kname, "fp16_reduce") && strcmp(kname, "gemm_tile") &&
       strcmp(kname, "shfl_reduce") && strcmp(kname, "atom_cas") &&
+      strcmp(kname, "shfl_pred") &&
       strcmp(kname, "fp16_reduceB") && strcmp(kname, "gemm_tileB") &&
       strcmp(kname, "gemm_tile2")) {
     printf("unknown kernel '%s'\n", kname);

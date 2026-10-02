@@ -626,6 +626,11 @@ class LlvmGen {
       // this LLVM backend, so legacy PTX passes member mask -1 (full warp).
       intrinsics_.insert("declare i32 @llvm.nvvm.shfl.sync." + kind +
                          ".i32(i32, i32, i32, i32)");
+      // A predicated destination ("d|p") needs the lane id up front too:
+      // the predicate is computed from laneid + offset in the body below.
+      if (ins.args[0].find('|') != std::string::npos &&
+          (kind == "down" || kind == "up"))
+        nvvm_sreg("laneid");
     }
   }
 
@@ -640,7 +645,7 @@ class LlvmGen {
   // on the scalar path. `sync` reports whether the opcode already carries the
   // .sync form (with an explicit member mask as its last operand).
   std::string shfl_nvvm_kind(const std::string& op, bool* sync) {
-    *sync = op.find(".sync.") != std::string::npos;
+    if (sync) *sync = op.find(".sync.") != std::string::npos;
     if (op.find(".idx.") != std::string::npos) return "idx";
     if (op.find(".up.") != std::string::npos) return "up";
     if (op.find(".down.") != std::string::npos) return "down";
@@ -649,16 +654,20 @@ class LlvmGen {
   }
 
   // True when this shfl instruction can go through a real NVVM shuffle:
-  // NVPTX target, known kind, plain (unpredicated) i32 destination and
-  // source, and the operand count of its form (4 legacy, 5 .sync).
+  // NVPTX target, known kind, i32 destination (with optional SET-predicate
+  // "d|p" per PTX ISA 9.7.10.6) and source, and the operand count of its
+  // form (4 legacy, 5 .sync).
   bool nvptx_shfl(const rouge::PtxInstruction& ins, std::string* kind, bool* sync) {
     if (!is_nvptx()) return false;
     const std::string k = shfl_nvvm_kind(ins.op, sync);
     if (k.empty()) return false;
     const size_t want = *sync ? 5 : 4;
     if (ins.args.size() != want) return false;
-    if (ins.args[0].find('|') != std::string::npos) return false;
-    if (reg_type(ins.args[0]) != "i32") return false;
+    // Strip the optional destination SET-predicate before checking the type.
+    std::string dst = ins.args[0];
+    const size_t bar = dst.find('|');
+    if (bar != std::string::npos) dst = dst.substr(0, bar);
+    if (reg_type(dst) != "i32") return false;
     if (is_register(ins.args[1]) && reg_type(ins.args[1]) != "i32") return false;
     *kind = k;
     return true;
@@ -902,12 +911,22 @@ class LlvmGen {
     if (op.rfind("shfl", 0) == 0) {
       std::string kind;
       bool sync = false;
-      // A predicated destination has no NVVM counterpart wired here: refusing
-      // loudly beats silently computing the wrong lanes on hardware.
-      if (is_nvptx() && op.rfind("shfl", 0) == 0 && ins.args.size() > 0 &&
-          ins.args[0].find('|') != std::string::npos)
-        return fail("unsupported predicated " + op + " on NVPTX @ " +
-                    std::to_string(idx) + " (unpredicated shfl is supported)");
+      // The destination may carry a SET-predicate: "shfl.sync.down.b32 %r10|%p1, ...".
+      // Per PTX ISA 9.7.10.6 p is SET, not a guard: True when the computed
+      // source lane is in [0,31], False otherwise. The value is always written.
+      std::string dst = A[0];
+      std::string setPred;
+      {
+        const size_t bar = dst.find('|');
+        if (bar != std::string::npos) {
+          setPred = dst.substr(bar + 1);
+          dst = dst.substr(0, bar);
+          if (!setPred.empty() && setPred[0] == '%') setPred = setPred.substr(1);
+          if (setPred.empty() || !is_register(setPred))
+            return fail("bad shfl set predicate '" + A[0] + "' @ " +
+                        std::to_string(idx));
+        }
+      }
       if (nvptx_shfl(ins, &kind, &sync)) {
         // A = [dst, src, b, c] legacy or [dst, src, b, c, mask] .sync.
         // Immediates arrive in PTX spelling ("0x1f"), which LLVM IR does not
@@ -927,26 +946,37 @@ class LlvmGen {
         line("  " + v + " = call i32 @llvm.nvvm.shfl.sync." + kind +
              ".i32(i32 " + mask + ", i32 " + src + ", i32 " + b + ", i32 " + c +
              ")");
-        store_reg(A[0], v);
+        store_reg(dst, v);
+        // SET-predicate per PTX ISA 9.7.10.6: True when the computed source
+        // lane is in [0,31]. .bfly/.idx always are; .up/.down compare
+        // laneid against the (5-bit masked) offset. Out-of-range lanes keep
+        // their own value on real hardware (verified with nvcc on sm_75).
+        if (!setPred.empty()) {
+          if (kind == "bfly" || kind == "idx") {
+            store_reg(setPred, "true");
+          } else {
+            const std::string lane = fresh("%v");
+            line("  " + lane + " = call i32 @" + nvvm_sreg("laneid") + "()");
+            const std::string off5 = fresh("%shoff");
+            line("  " + off5 + " = and i32 " + b + ", 31");
+            const std::string pred = fresh("%shp");
+            if (kind == "down") {
+              const std::string sum = fresh("%shsum");
+              line("  " + sum + " = add i32 " + lane + ", " + off5);
+              line("  " + pred + " = icmp ule i32 " + sum + ", 31");
+            } else {  // up
+              line("  " + pred + " = icmp uge i32 " + lane + ", " + off5);
+            }
+            store_reg(setPred, pred);
+          }
+        }
         return true;
       }
       if (A.size() < 2) return fail("bad " + op + " operands @ " + std::to_string(idx));
       line("  ; scalar fallback: shfl is identity before vectorization, MLIR will vectorize");
-      // The destination may be predicated: "shfl.sync.down.b32 %r10|%p1, a, b, ..."
-      // means "write %r10 only if %p1 is true". Split it and guard the store.
-      std::string dst = A[0];
-      std::string guard;
-      const size_t bar = dst.find('|');
-      if (bar != std::string::npos) {
-        guard = dst.substr(bar + 1);
-        dst = dst.substr(0, bar);
-        if (!guard.empty() && guard[0] == '!') guard = guard.substr(1);
-        if (!guard.empty() && guard[0] == '%') guard = guard.substr(1);
-        if (guard.empty() || !is_register(guard))
-          return fail("bad shfl write predicate '" + A[0] + "' @ " +
-                      std::to_string(idx));
-      }
-      // A[0]=dst, A[1]=src (value to shuffle); A[2]=lane/offset etc. ignored in scalar.
+      // A[0]=dst, A[1]=src (value to shuffle); A[2]=lane/offset, A[3]=clamp.
+      // dst/setPred already split above; the value is always written and the
+      // predicate is SET per PTX ISA 9.7.10.6.
       const std::string dstTy = reg_type(dst);
       std::string srcVal = operand(A[1]);
       // Handle width mismatch (e.g. immediate)
@@ -963,17 +993,38 @@ class LlvmGen {
         }
         srcVal = t;
       }
-      if (!guard.empty()) {
-        const std::string gv = load_reg(guard);
-        const std::string thenBl = fresh("bshfl");
-        const std::string endBl = fresh("bshfl_end");
-        line("  br i1 " + gv + ", label %" + thenBl + ", label %" + endBl);
-        emit_label(thenBl);
-        store_reg(dst, srcVal);
-        line("  br label %" + endBl);
-        emit_label(endBl);
-      } else {
-        store_reg(dst, srcVal);
+      // Always write the value; SET the predicate per PTX ISA 9.7.10.6.
+      store_reg(dst, srcVal);
+      if (!setPred.empty()) {
+        bool syncDummy = false;
+        const std::string k2 = shfl_nvvm_kind(op, &syncDummy);
+        if (k2 == "bfly" || k2 == "idx") {
+          store_reg(setPred, "true");
+        } else if (k2 == "down" || k2 == "up") {
+          // Host scalar path: one lane at a time, lane = tid.x mod 32.
+          const std::string tid = load_spec("tid.x");
+          const std::string laneMod = fresh("%shlm");
+          line("  " + laneMod + " = urem i32 " + tid + ", 32");
+          std::string offRaw =
+              is_register(A[2]) ? operand(A[2]) : normalize_literal(A[2]);
+          if (offRaw.size() > 2 && offRaw[0] == '0' &&
+              (offRaw[1] == 'x' || offRaw[1] == 'X'))
+            offRaw = std::to_string(
+                static_cast<long long>(std::strtoll(offRaw.c_str(), nullptr, 16)));
+          const std::string off5 = fresh("%shoff");
+          line("  " + off5 + " = and i32 " + offRaw + ", 31");
+          const std::string pred = fresh("%shp");
+          if (k2 == "down") {
+            const std::string sum = fresh("%shsum");
+            line("  " + sum + " = add i32 " + laneMod + ", " + off5);
+            line("  " + pred + " = icmp ule i32 " + sum + ", 31");
+          } else {  // up
+            line("  " + pred + " = icmp uge i32 " + laneMod + ", " + off5);
+          }
+          store_reg(setPred, pred);
+        } else {
+          store_reg(setPred, "true");
+        }
       }
       return true;
     }
