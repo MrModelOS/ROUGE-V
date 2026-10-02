@@ -127,6 +127,20 @@ if(CLANG_EXECUTABLE)
     message(STATUS "rouge-compiler: nvcc not found — vendor-PTX test disabled")
   endif()
 
+  # ---- Test: Tier-0 foreign-PTX subset sweep (no GPU, no nvcc needed) ----
+  # Small probes for vendor-PTX features (barrier.sync spelling, .volatile,
+  # generic ld/st, .local depots, dynamic .shared, %clock64 fail-loud) go
+  # through ptx2ir + clang for host and NVPTX. Any rejection is a bug,
+  # except probe_clock on host, which must refuse loudly by design.
+  add_test(NAME compiler_foreign_ptx
+    COMMAND ${CMAKE_COMMAND}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DPTX2IR=$<TARGET_FILE:ptx2ir>
+      -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
+      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/foreign-ptx
+      -DSM=sm_75
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/foreign_ptx.cmake)
+
   # ---- Test 3 (informational): same IR through the RISC-V backend ----
   # Compiles the IR for riscv64 with the vector extension (rv64gcv). Reports
   # status; skipped gracefully when this LLVM build lacks a riscv target.

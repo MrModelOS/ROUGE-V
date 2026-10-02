@@ -108,12 +108,12 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 ```
 $ ctest --test-dir build
 ...
- 7/24 aot_native_block_reduce ..............   Passed
- 8/24 aot_native_atomic_reduce .............   Passed
-16/24 compiler_nvcc_ptx ....................   Passed
-22/24 compiler_nvptx_gpu_exec ..............   Passed
-24/24 compiler_nvcc_gpu_exec ...............   Passed
-100% tests passed out of 24
+ 7/25 aot_native_block_reduce ..............   Passed
+ 8/25 aot_native_atomic_reduce .............   Passed
+17/25 compiler_foreign_ptx ....................   Passed
+23/25 compiler_nvptx_gpu_exec ..............   Passed
+25/25 compiler_nvcc_gpu_exec ...............   Passed
+100% tests passed out of 25
 ```
 
 > [!NOTE]

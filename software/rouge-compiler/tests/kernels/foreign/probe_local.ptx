@@ -1,0 +1,53 @@
+.version 8.0
+.target sm_80
+.address_size 64
+
+// Foreign-PTX probe: .local spill depot with mov/cvta.local address-takers
+// and generic spill roundtrips through the frame pointer.
+// Tier-0 only: translation + assembly.
+
+.visible .entry probe_local(
+    .param .u64 probe_local_param_0,
+    .param .u64 probe_local_param_1,
+    .param .u32 probe_local_param_2
+)
+{
+    .local .align 8 .b8 __local_depot0[64];
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<5>;
+    .reg .b64 %sp0, %spl0;
+    .reg .pred %p<2>;
+
+    mov.b64 %spl0, __local_depot0;
+    cvta.local.u64 %sp0, %spl0;
+
+    ld.param.u64 %rd1, [probe_local_param_0];
+    ld.param.u64 %rd2, [probe_local_param_1];
+    ld.param.u32 %r1, [probe_local_param_2];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mul.wide.u32 %rd3, %r2, %r3;
+    mov.u32 %r4, %tid.x;
+    cvt.u64.u32 %rd4, %r4;
+    add.s64 %rd3, %rd3, %rd4;
+    cvt.u32.u64 %r5, %rd3;
+
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_RET;
+
+    mul.wide.u32 %rd4, %r5, 4;
+    add.s64 %rd1, %rd1, %rd4;
+    ld.global.u32 %r6, [%rd1];
+
+    st.b32 [%sp0], %r6;
+    ld.b32 %r7, [%sp0];
+    st.b32 [%sp0+8], %r7;
+    ld.b32 %r8, [%sp0+8];
+
+    add.s64 %rd2, %rd2, %rd4;
+    st.global.b32 [%rd2], %r8;
+
+L_RET:
+    ret;
+}
