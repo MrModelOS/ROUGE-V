@@ -83,17 +83,17 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | собирается в нативный объект — не исполнялось |
 | `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | собирается **и исполняется на настоящей видеокарте** — см. ниже |
 
-Под все четыре тройки собираются девять канонических ядер из
+Под все четыре тройки собираются десять канонических ядер из
 `software/rouge-compiler/tests/kernels/`: `vadd`, `block_reduce`,
 `atomic_reduce`, `fp16_reduce`, `gemm_tile`, `shfl_reduce`, `atom_cas`,
-`shfl_pred`, `vote_pred`.
+`shfl_pred`, `vote_pred`, `shfl_pred_all`.
 
 ### Исполнено на реальном железе
 
 Ядра для NVIDIA не только собираются: `ctest compiler_nvptx_gpu_exec*`
 загружает полученный PTX через CUDA Driver API (JIT на стороне драйвера) на
 настоящей GeForce MX450 (sm_75) и сверяет каждый выход побитово с хост-эталоном:
-все девять канонических ядер, два набора данных для `fp16_reduce`/`gemm_tile`
+все десять канонических ядер, два набора данных для `fp16_reduce`/`gemm_tile`
 плюс сетка из двух блоков, проверяющая многоблочный путь. `compiler_nvcc_gpu_exec`
 дополнительно гоняет настоящее вендорное ядро (`nvcc real_nvcc.cu`) насквозь. На
 машинах без NVIDIA GPU sm_75+ тесты дают SKIP, а не провал.
@@ -108,12 +108,12 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 ```
 $ ctest --test-dir build
 ...
- 7/23 aot_native_block_reduce ..............   Passed
- 8/23 aot_native_atomic_reduce .............   Passed
-15/23 compiler_nvcc_ptx ....................   Passed
-21/23 compiler_nvptx_gpu_exec ..............   Passed
-23/23 compiler_nvcc_gpu_exec ...............   Passed
-100% tests passed out of 23
+ 7/24 aot_native_block_reduce ..............   Passed
+ 8/24 aot_native_atomic_reduce .............   Passed
+16/24 compiler_nvcc_ptx ....................   Passed
+22/24 compiler_nvptx_gpu_exec ..............   Passed
+24/24 compiler_nvcc_gpu_exec ...............   Passed
+100% tests passed out of 24
 ```
 
 > [!NOTE]

@@ -920,9 +920,78 @@ static int test_vote_pred(CUmodule mod) {
 }
 
 // ---------------------------------------------------------------------------
+// kernel: shfl_pred_all -- predicated up/bfly/idx + legacy predicated down.
+//   9 params (in + 8 out slots) + n, 1 block x 32 threads. Reference:
+//   up8: src=lane-8, p=(lane>=8); bfly4: src=lane^4, p=1; idx7: src=7, p=1;
+//   legacy down8: src=lane+8, p=(lane+8<=31). Out-of-range lanes keep their
+//   own value (verified with nvcc on sm_75 for .down; checked here for .up).
+// ---------------------------------------------------------------------------
+static int test_shfl_pred_all(CUmodule mod) {
+  const int threads = 32, blocks = 1, N = 32;
+  printf("  config: N=%d blockDim=(%d,1,1) gridDim=(%d,1,1), predicated up/bfly/idx + legacy down\n",
+         N, threads, blocks);
+
+  CUfunction fn;
+  CK(cuModuleGetFunction(&fn, mod, "shfl_pred_all"));
+
+  uint32_t hd[32];
+  uint32_t ho[8][32];
+  for (int i = 0; i < 32; ++i) hd[i] = 1000u + (uint32_t)i * 17u;
+  for (int k = 0; k < 8; ++k)
+    for (int i = 0; i < 32; ++i) ho[k][i] = 0xdeadbeefu;
+  uint32_t he[8][32];
+  for (int l = 0; l < 32; ++l) {
+    // Bound model (verified with nvcc on sm_75): up8/cl8 valid iff lane>=8
+    // and lane-8>=8, i.e. lanes 16..31.
+    const int upOk = (l >= 16);
+    he[0][l] = upOk ? hd[l - 8] : hd[l];
+    he[1][l] = upOk ? 1u : 0u;
+    he[2][l] = hd[l ^ 4];
+    he[3][l] = 1u;
+    he[4][l] = hd[7];
+    he[5][l] = 1u;
+    const int dnOk = (l + 8 <= 31);
+    he[6][l] = dnOk ? hd[l + 8] : hd[l];
+    he[7][l] = dnOk ? 1u : 0u;
+  }
+
+  CUdeviceptr dd, dout[8];
+  CK(cuMemAlloc(&dd, N * 4));
+  CK(cuMemcpyHtoD(dd, hd, N * 4));
+  for (int k = 0; k < 8; ++k) {
+    CK(cuMemAlloc(&dout[k], N * 4));
+    CK(cuMemcpyHtoD(dout[k], ho[k], N * 4));
+  }
+
+  unsigned int n = N;
+  void* args[] = {&dd, &dout[0], &dout[1], &dout[2], &dout[3],
+                  &dout[4], &dout[5], &dout[6], &dout[7], &n};
+  CK(cuLaunchKernel(fn, blocks, 1, 1, threads, 1, 1, 0, 0, args, 0));
+  CUresult r = cuCtxSynchronize();
+  if (r != CUDA_SUCCESS) {
+    printf("  MISMATCH: launch/sync failed: %s (%s) -- the kernel faulted on the device\n",
+           cuerr(r), cuerrstr(r));
+    return 3;
+  }
+  for (int k = 0; k < 8; ++k) CK(cuMemcpyDtoH(ho[k], dout[k], N * 4));
+
+  static const char* const what[8] = {"up", "upP", "bfly", "bflyP",
+                                      "idx", "idxP", "down", "downP"};
+  int bad = 0;
+  for (int k = 0; k < 8; ++k)
+    for (int i = 0; i < 32; ++i)
+      if (ho[k][i] != he[k][i]) {
+        if (bad < 8) printf("  %s[%d]: got %u want %u\n", what[k], i, ho[k][i], he[k][i]);
+        bad = 1;
+      }
+  printf(bad ? "  MISMATCH\n" : "  OK: 32 lanes, up/bfly/idx + legacy down values and predicates bit-exact\n");
+  return bad;
+}
+
+// ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
   if (argc < 3) {
-    printf("usage: %s <file.ptx> <vadd|block_reduce|fp16_reduce|gemm_tile|shfl_reduce|atom_cas|shfl_pred|vote_pred|all>\n", argv[0]);
+    printf("usage: %s <file.ptx> <vadd|block_reduce|fp16_reduce|gemm_tile|shfl_reduce|atom_cas|shfl_pred|vote_pred|shfl_pred_all|all>\n", argv[0]);
     return 2;
   }
   const char* ptx = argv[1];
@@ -1058,6 +1127,12 @@ int main(int argc, char** argv) {
     printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
     if (rc && g_exit_code == 0) g_exit_code = rc;
   }
+  if (all || strcmp(kname, "shfl_pred_all") == 0) {
+    printf("== shfl_pred_all ==\n");
+    rc = test_shfl_pred_all(mod);
+    printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
+    if (rc && g_exit_code == 0) g_exit_code = rc;
+  }
   if (!all && strcmp(kname, "fp16_reduceB") == 0) {
     printf("== fp16_reduce (dataset B only) ==\n");
     rc = test_fp16_reduce(mod, 1);
@@ -1083,6 +1158,7 @@ int main(int argc, char** argv) {
       strcmp(kname, "fp16_reduce") && strcmp(kname, "gemm_tile") &&
       strcmp(kname, "shfl_reduce") && strcmp(kname, "atom_cas") &&
       strcmp(kname, "shfl_pred") && strcmp(kname, "vote_pred") &&
+      strcmp(kname, "shfl_pred_all") &&
       strcmp(kname, "fp16_reduceB") && strcmp(kname, "gemm_tileB") &&
       strcmp(kname, "gemm_tile2")) {
     printf("unknown kernel '%s'\n", kname);

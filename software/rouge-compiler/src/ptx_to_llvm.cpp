@@ -1068,10 +1068,11 @@ class LlvmGen {
              ".i32(i32 " + mask + ", i32 " + src + ", i32 " + b + ", i32 " + c +
              ")");
         store_reg(dst, v);
-        // SET-predicate per PTX ISA 9.7.10.6: True when the computed source
-        // lane is in [0,31]. .bfly/.idx always are; .up/.down compare
-        // laneid against the (5-bit masked) offset. Out-of-range lanes keep
-        // their own value on real hardware (verified with nvcc on sm_75).
+        // SET-predicate per PTX ISA 9.7.10.6, hardware-verified on sm_75:
+        // the clamp operand (c) is a RANGE BOUND, not a fallback lane.
+        // .down: valid iff lane+off <= clamp; .up: valid iff lane>=off and
+        // lane-off >= clamp. .bfly/.idx are always in range. Out-of-range
+        // lanes keep their own value with p=False.
         if (!setPred.empty()) {
           if (kind == "bfly" || kind == "idx") {
             store_reg(setPred, "true");
@@ -1080,13 +1081,21 @@ class LlvmGen {
             line("  " + lane + " = call i32 @" + nvvm_sreg("laneid") + "()");
             const std::string off5 = fresh("%shoff");
             line("  " + off5 + " = and i32 " + b + ", 31");
+            const std::string cl5 = fresh("%shcl");
+            line("  " + cl5 + " = and i32 " + c + ", 31");
             const std::string pred = fresh("%shp");
             if (kind == "down") {
               const std::string sum = fresh("%shsum");
               line("  " + sum + " = add i32 " + lane + ", " + off5);
-              line("  " + pred + " = icmp ule i32 " + sum + ", 31");
+              line("  " + pred + " = icmp ule i32 " + sum + ", " + cl5);
             } else {  // up
-              line("  " + pred + " = icmp uge i32 " + lane + ", " + off5);
+              const std::string ok = fresh("%shok");
+              line("  " + ok + " = icmp uge i32 " + lane + ", " + off5);
+              const std::string src = fresh("%shsrc");
+              line("  " + src + " = sub i32 " + lane + ", " + off5);
+              const std::string inb = fresh("%shin");
+              line("  " + inb + " = icmp uge i32 " + src + ", " + cl5);
+              line("  " + pred + " = and i1 " + ok + ", " + inb);
             }
             store_reg(setPred, pred);
           }
@@ -1113,24 +1122,42 @@ class LlvmGen {
           store_reg(setPred, "true");
         } else if (k2 == "down" || k2 == "up") {
           // Host scalar path: one lane at a time, lane = tid.x mod 32.
+          // Bound model, hardware-verified: down valid iff lane+off<=clamp,
+          // up valid iff lane>=off and lane-off>=clamp (clamp defaults to
+          // 31 when the form carries none).
+          const auto dec = [](const std::string& t) -> std::string {
+            if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X'))
+              return std::to_string(
+                  static_cast<long long>(std::strtoll(t.c_str(), nullptr, 16)));
+            return t;
+          };
           const std::string tid = load_spec("tid.x");
           const std::string laneMod = fresh("%shlm");
           line("  " + laneMod + " = urem i32 " + tid + ", 32");
           std::string offRaw =
               is_register(A[2]) ? operand(A[2]) : normalize_literal(A[2]);
-          if (offRaw.size() > 2 && offRaw[0] == '0' &&
-              (offRaw[1] == 'x' || offRaw[1] == 'X'))
-            offRaw = std::to_string(
-                static_cast<long long>(std::strtoll(offRaw.c_str(), nullptr, 16)));
+          offRaw = dec(offRaw);
           const std::string off5 = fresh("%shoff");
           line("  " + off5 + " = and i32 " + offRaw + ", 31");
+          std::string clRaw("31");
+          if (A.size() >= 4)
+            clRaw = is_register(A[3]) ? operand(A[3])
+                                      : dec(normalize_literal(A[3]));
+          const std::string cl5 = fresh("%shcl");
+          line("  " + cl5 + " = and i32 " + clRaw + ", 31");
           const std::string pred = fresh("%shp");
           if (k2 == "down") {
             const std::string sum = fresh("%shsum");
             line("  " + sum + " = add i32 " + laneMod + ", " + off5);
-            line("  " + pred + " = icmp ule i32 " + sum + ", 31");
+            line("  " + pred + " = icmp ule i32 " + sum + ", " + cl5);
           } else {  // up
-            line("  " + pred + " = icmp uge i32 " + laneMod + ", " + off5);
+            const std::string ok = fresh("%shok");
+            line("  " + ok + " = icmp uge i32 " + laneMod + ", " + off5);
+            const std::string src = fresh("%shsrc");
+            line("  " + src + " = sub i32 " + laneMod + ", " + off5);
+            const std::string inb = fresh("%shin");
+            line("  " + inb + " = icmp uge i32 " + src + ", " + cl5);
+            line("  " + pred + " = and i1 " + ok + ", " + inb);
           }
           store_reg(setPred, pred);
         } else {

@@ -228,9 +228,9 @@ claim-проверки без гонок.
   (проверяется тестом `compiler_rvv_backend`).
 - **AMDGPU и NVPTX — штатные бэкенды LLVM, а не кастомный код:** собственный
   бэкенд проекту не нужен, достаточно корректных адресных пространств в IR
-  (см. выше). Проверено на девяти канонических ядрах (`vadd`, `block_reduce`,
+  (см. выше). Проверено на десяти канонических ядрах (`vadd`, `block_reduce`,
   `atomic_reduce`, `fp16_reduce`, `gemm_tile`, `shfl_reduce`, `atom_cas`,
-  `shfl_pred`, `vote_pred`): IR собирается в нативный объект
+  `shfl_pred`, `vote_pred`, `shfl_pred_all`): IR собирается в нативный объект
   под `amdgcn-amd-amdhsa -mcpu=gfx1100` и `nvptx64-nvidia-cuda -march=sm_75`.
   Сборка — утверждение о **сборке**: выводов о производительности из неё не
   следует. Но для NVPTX есть и исполнение: настоящее CUDA-ядро (конвенция вызова
@@ -262,8 +262,8 @@ claim-проверки без гонок.
 | RVV-кросс-проверка (`rv64gcv`) — 3 ядра | ✅ | `ctest compiler_rvv_backend_*` |
 | Выбор цели в `ptx2ir` (`--target`) + адресные пространства global/shared | ✅ | `ptx2ir --target amdgcn-amd-amdhsa vadd.ptx` — `addrspace(1)`/`addrspace(5)` |
 | Сборка под AMD GPU (`amdgcn-amd-amdhsa -mcpu=gfx1100`) — 5 ядер | ✅ сборка | `ptx2ir --target amdgcn-amd-amdhsa … && clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c` |
-| Сборка под NVIDIA GPU (`nvptx64-nvidia-cuda -march=sm_75`) — 9 ядер | ✅ сборка | `ptx2ir --target nvptx64-nvidia-cuda … && clang --target=nvptx64-nvidia-cuda -march=sm_75 -c` |
-| Исполнение на NVIDIA GPU (GeForce MX450, sm_75) — 9 ядер + вендорное ядро | ✅ побитово | `ctest compiler_nvptx_gpu_exec* compiler_nvcc_gpu_exec` (SKIP без sm_75+) |
+| Сборка под NVIDIA GPU (`nvptx64-nvidia-cuda -march=sm_75`) — 10 ядер | ✅ сборка | `ptx2ir --target nvptx64-nvidia-cuda … && clang --target=nvptx64-nvidia-cuda -march=sm_75 -c` |
+| Исполнение на NVIDIA GPU (GeForce MX450, sm_75) — 10 ядер + вендорное ядро | ✅ побитово | `ctest compiler_nvptx_gpu_exec* compiler_nvcc_gpu_exec` (SKIP без sm_75+) |
 | Исполнение кернела на AMD GPU | ⛔ не проверялось | требуется реальная AMD-видеокарта; сейчас подтверждена только сборка объекта |
 | MLIR-контур: `rouge-simt-access-report` (GPU→Vector) | ✅ контур | `cmake -DROUGE_ENABLE_MLIR=ON` + `rouge-opt --rouge-simt-access-report` |
 | MLIR Dialect Conversion GPU→Vector/Linalg→ROUGE (векторизация) | 📋 план | — |
@@ -278,8 +278,8 @@ claim-проверки без гонок.
 16-битные векторные формы (`.f16x2`/`.bf16x2`) поддержаны (пейлоад как i32).
 Из варп-коллективов на NVPTX покрыты `shfl.sync` (включая предикатную форму
 `d|p`), `vote.sync.{any,all,uni}` и `activemask.b32` — все через настоящие
-NVVM-интринсики, проверены `shfl_reduce`, `shfl_pred` и `vote_pred` на реальной
-GPU, MX450 sm_75, побитово.
+NVVM-интринсики, проверены `shfl_reduce`, `shfl_pred`, `vote_pred` и `shfl_pred_all`
+(все виды shfl + легаси-форма) на реальной GPU, MX450 sm_75, побитово.
 Барьеры: `bar.sync`, новое написание `barrier.sync` и `bar.warp.sync`
 (как блок-барьер; split-фазные `arrive`/`red`, `mbarrier.*` — отказ).
 Память: `.volatile`-квалификатор (lowering и так не кеширует), generic

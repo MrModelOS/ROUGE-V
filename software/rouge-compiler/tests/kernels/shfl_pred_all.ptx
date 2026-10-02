@@ -1,0 +1,95 @@
+.version 8.0
+.target sm_80
+.address_size 64
+
+// ROUGE-V test kernel: predicated shfl.sync.up / .bfly / .idx plus the
+// legacy (mask-less) predicated shfl.down — all with SET-predicates.
+// Per PTX ISA 9.7.10.6 p is SET, not a guard: True when the computed source
+// lane is in [0,31] (.bfly/.idx always are); out-of-range lanes keep their
+// own value with p=False (verified with nvcc on sm_75 for .down, checked
+// here for .up and legacy .down).
+// NVPTX goes through real llvm.nvvm.shfl.sync.* + a laneid predicate;
+// the host AOT path stays scalar (identity values, computed predicates).
+
+.visible .entry shfl_pred_all(
+    .param .u64 shfl_pred_all_param_0,
+    .param .u64 shfl_pred_all_param_1,
+    .param .u64 shfl_pred_all_param_2,
+    .param .u64 shfl_pred_all_param_3,
+    .param .u64 shfl_pred_all_param_4,
+    .param .u64 shfl_pred_all_param_5,
+    .param .u64 shfl_pred_all_param_6,
+    .param .u64 shfl_pred_all_param_7,
+    .param .u64 shfl_pred_all_param_8,
+    .param .u32 shfl_pred_all_param_9
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<12>;
+    .reg .pred %p<6>;
+
+    ld.param.u64 %rd1, [shfl_pred_all_param_0];
+    ld.param.u64 %rd2, [shfl_pred_all_param_1];
+    ld.param.u64 %rd5, [shfl_pred_all_param_2];
+    ld.param.u64 %rd6, [shfl_pred_all_param_3];
+    ld.param.u64 %rd7, [shfl_pred_all_param_4];
+    ld.param.u64 %rd8, [shfl_pred_all_param_5];
+    ld.param.u64 %rd9, [shfl_pred_all_param_6];
+    ld.param.u64 %rd10, [shfl_pred_all_param_7];
+    ld.param.u64 %rd11, [shfl_pred_all_param_8];
+    ld.param.u32 %r1, [shfl_pred_all_param_9];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mul.wide.u32 %rd3, %r2, %r3;
+    mov.u32 %r4, %tid.x;
+    cvt.u64.u32 %rd4, %r4;
+    add.s64 %rd3, %rd3, %rd4;
+    cvt.u32.u64 %r5, %rd3;
+
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_RET;
+
+    mul.wide.u32 %rd4, %r5, 4;
+    add.s64 %rd1, %rd1, %rd4;
+    ld.global.b32 %r7, [%rd1];
+
+    // .sync.up by 8, clamp 8, full mask: valid iff lane>=8 and lane-8>=8,
+    // i.e. lanes 16..31 read in[lane-8] with p=1, lanes 0..15 keep their
+    // own value with p=0 (clamp is a range bound, verified on sm_75)
+    shfl.sync.up.b32 %r8|%p1, %r7, 8, 8, -1;
+    // .sync.bfly mask 4 (always in range)
+    shfl.sync.bfly.b32 %r9|%p2, %r7, 4, 31, -1;
+    // .sync.idx lane 7 (always in range)
+    shfl.sync.idx.b32 %r10|%p3, %r7, 7, 31, -1;
+    // legacy (mask-less) predicated .down by 8
+    shfl.down.b32 %r11|%p4, %r7, 8, 31;
+
+    // store value of each variant at out[i]
+    add.s64 %rd2, %rd2, %rd4;
+    st.global.b32 [%rd2], %r8;
+    selp.b32 %r12, 1, 0, %p1;
+    add.s64 %rd5, %rd5, %rd4;
+    st.global.b32 [%rd5], %r12;
+
+    add.s64 %rd6, %rd6, %rd4;
+    st.global.b32 [%rd6], %r9;
+    selp.b32 %r13, 1, 0, %p2;
+    add.s64 %rd7, %rd7, %rd4;
+    st.global.b32 [%rd7], %r13;
+
+    add.s64 %rd8, %rd8, %rd4;
+    st.global.b32 [%rd8], %r10;
+    selp.b32 %r14, 1, 0, %p3;
+    add.s64 %rd9, %rd9, %rd4;
+    st.global.b32 [%rd9], %r14;
+
+    add.s64 %rd10, %rd10, %rd4;
+    st.global.b32 [%rd10], %r11;
+    selp.b32 %r15, 1, 0, %p4;
+    add.s64 %rd11, %rd11, %rd4;
+    st.global.b32 [%rd11], %r15;
+
+L_RET:
+    ret;
+}

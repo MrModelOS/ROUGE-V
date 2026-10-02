@@ -1814,14 +1814,18 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       const bool is_up = op.find(".up.") != std::string::npos;
       const bool is_down = op.find(".down.") != std::string::npos;
       const uint32_t sel = static_cast<uint32_t>(operand_u64(st, A[2]));
-      // Operand c (clamp / segmask) is parsed to validate the form but does
-      // not redirect out-of-range lanes on real hardware (verified on sm_75):
-      // they keep their own value with p=False.
-      if (A.size() >= 4) (void)operand_u64(st, A[3]);
       const uint32_t linear = st.tid[0] + st.tid[1] * st.ntid[0] + st.tid[2] * st.ntid[0] * st.ntid[1];
       const uint32_t lane = linear % 32;
       const uint32_t warpBase = linear - lane;
       uint32_t targetLane = 0;
+      // Bound model, hardware-verified on sm_75 with nvcc probes: the clamp
+      // operand (c) is a RANGE BOUND, not a fallback lane. .down: valid iff
+      // lane+off <= clamp; .up: valid iff lane>=off and lane-off >= clamp.
+      // .bfly/.idx are always in range. Out-of-range lanes keep their own
+      // value with p=False.
+      const uint32_t clamp =
+          A.size() >= 4 ? static_cast<uint32_t>(operand_u64(st, A[3])) & 0x1f
+                        : 31;
       bool inRange = true;
       if (is_idx) {
         targetLane = sel & 0x1f;
@@ -1831,9 +1835,7 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
         inRange = true;
       } else if (is_up) {
         const uint32_t off = sel & 0x1f;
-        if (lane < off) {
-          // Out of range: the thread keeps its own value (confirmed against
-          // nvcc on real sm_75 hardware); the clamp lane is not read.
+        if (lane < off || lane - off < clamp) {
           targetLane = lane;
           inRange = false;
         } else {
@@ -1843,8 +1845,7 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       } else if (is_down) {
         const uint32_t off = sel & 0x1f;
         targetLane = lane + off;
-        if (targetLane >= 32) {
-          // Same as above: own value, p=False.
+        if (targetLane > clamp) {
           targetLane = lane;
           inRange = false;
         } else {

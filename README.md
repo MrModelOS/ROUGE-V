@@ -113,16 +113,16 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | compiles to a native object — never executed |
 | `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | compiles **and executes on a real GPU** — see below |
 
-All nine canonical kernels in `software/rouge-compiler/tests/kernels/` — `vadd`,
+All ten canonical kernels in `software/rouge-compiler/tests/kernels/` — `vadd`,
 `block_reduce`, `atomic_reduce`, `fp16_reduce`, `gemm_tile`, `shfl_reduce`,
-`atom_cas`, `shfl_pred`, `vote_pred` — build for all four triples.
+`atom_cas`, `shfl_pred`, `vote_pred`, `shfl_pred_all` — build for all four triples.
 
 ### Executed on real hardware
 
 The NVIDIA kernels do not just compile: `ctest compiler_nvptx_gpu_exec*`
 loads the generated PTX through the CUDA Driver API (driver-side JIT) on a
 real GeForce MX450 (sm_75) and checks every output bit-exactly against a host
-reference — all nine canonical kernels, two datasets for `fp16_reduce`/`gemm_tile`,
+reference — all ten canonical kernels, two datasets for `fp16_reduce`/`gemm_tile`,
 plus a two-block grid proving the multi-block path. `compiler_nvcc_gpu_exec`
 additionally runs genuine vendor output (`nvcc real_nvcc.cu`) end to end. On
 machines without an sm_75+ NVIDIA GPU the tests report SKIP, never failure.
@@ -147,12 +147,12 @@ driver needed to launch a translated kernel.
 ```
 $ ctest --test-dir build
 ...
- 7/23 aot_native_block_reduce ..............   Passed
- 8/23 aot_native_atomic_reduce .............   Passed
-15/23 compiler_nvcc_ptx ....................   Passed
-21/23 compiler_nvptx_gpu_exec ..............   Passed
-23/23 compiler_nvcc_gpu_exec ...............   Passed
-100% tests passed out of 23
+ 7/24 aot_native_block_reduce ..............   Passed
+ 8/24 aot_native_atomic_reduce .............   Passed
+16/24 compiler_nvcc_ptx ....................   Passed
+22/24 compiler_nvptx_gpu_exec ..............   Passed
+24/24 compiler_nvcc_gpu_exec ...............   Passed
+100% tests passed out of 24
 ```
 
 > [!NOTE]
