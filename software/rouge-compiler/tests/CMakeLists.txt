@@ -32,7 +32,7 @@ target_link_libraries(test_ptx_to_llvm_warp PRIVATE rouge-compiler-lib rouge-ptx
 add_test(NAME compiler_ptx_to_llvm_warp COMMAND test_ptx_to_llvm_warp)
 
 # Stage 1 always runs: PTX -> LLVM IR via our translator CLI.
-foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred)
+foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred)
   add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
     COMMAND ptx2ir ${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kern}.ptx
@@ -45,7 +45,7 @@ endforeach()
 find_program(CLANG_EXECUTABLE clang)
 if(CLANG_EXECUTABLE)
   # Compile one IR module per canonical kernel: ptx2ir -> clang -O2 -> .o
-  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred)
+  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred)
     add_custom_command(
       OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.o
       COMMAND ${CLANG_EXECUTABLE} -O2 -c ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
@@ -98,6 +98,12 @@ if(CLANG_EXECUTABLE)
                  ${CMAKE_CURRENT_BINARY_DIR}/shfl_pred.o)
   target_link_libraries(test_aot_shfl_pred PRIVATE rouge-runtime)
   add_test(NAME aot_native_shfl_pred COMMAND test_aot_shfl_pred)
+
+  # Test 2i: vote.sync.any/all/uni + activemask (scalar identity + all-ones).
+  add_executable(test_aot_vote_pred test_aot_vote_pred.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/vote_pred.o)
+  target_link_libraries(test_aot_vote_pred PRIVATE rouge-runtime)
+  add_test(NAME aot_native_vote_pred COMMAND test_aot_vote_pred)
 
   # ---- Test 4: real NVIDIA PTX (vendor input, not our own .ptx files) ----
   # Compiles real CUDA C with nvcc and pushes the vendor PTX through the whole
@@ -215,7 +221,7 @@ if(CLANG_EXECUTABLE AND CUDA_DRIVER_INCLUDE_DIR AND CUDA_DRIVER_LIBRARY)
       -DRUNNER=$<TARGET_FILE:gpu_exec_rungpu>
       -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
       -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/gpu-exec
-      "-DCELLS=vadd.vadd,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2,shfl_reduce.shfl_reduce,atom_cas.atom_cas,shfl_pred.shfl_pred"
+      "-DCELLS=vadd.vadd,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2,shfl_reduce.shfl_reduce,atom_cas.atom_cas,shfl_pred.shfl_pred,vote_pred.vote_pred"
       -DSM=sm_75
       -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_exec.cmake)
   set_tests_properties(compiler_nvptx_gpu_exec PROPERTIES

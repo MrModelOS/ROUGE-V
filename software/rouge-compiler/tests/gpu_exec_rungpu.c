@@ -844,9 +844,85 @@ static int test_shfl_pred(CUmodule mod) {
 }
 
 // ---------------------------------------------------------------------------
+// kernel: vote_pred -- vote.sync.{any,all,uni} + activemask.b32.
+//   params: (const u32* in, u32* outAny/All/Uni/Mask, u32 n), 1 block x 32.
+//   Each lane votes (in[l] != 0); outputs are 0/1 per lane (uniform across
+//   the warp) and the active mask. Non-uniform data proves a real ballot:
+//   an identity fallback would leave outAny[l] == (in[l] != 0) per lane.
+// ---------------------------------------------------------------------------
+static int test_vote_pred(CUmodule mod) {
+  const int threads = 32, blocks = 1, N = 32;
+  printf("  config: N=%d blockDim=(%d,1,1) gridDim=(%d,1,1), vote.sync.any/all/uni + activemask\n",
+         N, threads, blocks);
+
+  CUfunction fn;
+  CK(cuModuleGetFunction(&fn, mod, "vote_pred"));
+
+  uint32_t hd[32], hoA[32], hoB[32], hoC[32], hoM[32];
+  for (int i = 0; i < 32; ++i) hd[i] = (i % 2 == 0) ? 0u : (100u + (uint32_t)i);
+  for (int i = 0; i < 32; ++i) {
+    hoA[i] = 0xdeadbeefu;
+    hoB[i] = 0xdeadbeefu;
+    hoC[i] = 0xdeadbeefu;
+    hoM[i] = 0xdeadbeefu;
+  }
+  // Reference over the full warp: any=1 (odd lanes vote), all=0, uni=0
+  // (mixed votes), activemask = all 32 lanes.
+  const uint32_t eA = 1u, eB = 0u, eC = 0u, eM = 0xffffffffu;
+
+  CUdeviceptr dd, da, db, dc, dm;
+  CK(cuMemAlloc(&dd, N * 4));
+  CK(cuMemAlloc(&da, N * 4));
+  CK(cuMemAlloc(&db, N * 4));
+  CK(cuMemAlloc(&dc, N * 4));
+  CK(cuMemAlloc(&dm, N * 4));
+  CK(cuMemcpyHtoD(dd, hd, N * 4));
+  CK(cuMemcpyHtoD(da, hoA, N * 4));
+  CK(cuMemcpyHtoD(db, hoB, N * 4));
+  CK(cuMemcpyHtoD(dc, hoC, N * 4));
+  CK(cuMemcpyHtoD(dm, hoM, N * 4));
+
+  unsigned int n = N;
+  void* args[] = {&dd, &da, &db, &dc, &dm, &n};
+  CK(cuLaunchKernel(fn, blocks, 1, 1, threads, 1, 1, 0, 0, args, 0));
+  CUresult r = cuCtxSynchronize();
+  if (r != CUDA_SUCCESS) {
+    printf("  MISMATCH: launch/sync failed: %s (%s) -- the kernel faulted on the device\n",
+           cuerr(r), cuerrstr(r));
+    return 3;
+  }
+  CK(cuMemcpyDtoH(hoA, da, N * 4));
+  CK(cuMemcpyDtoH(hoB, db, N * 4));
+  CK(cuMemcpyDtoH(hoC, dc, N * 4));
+  CK(cuMemcpyDtoH(hoM, dm, N * 4));
+
+  int bad = 0;
+  for (int i = 0; i < 32; ++i) {
+    if (hoA[i] != eA) {
+      printf("  outAny[%d]: got %u want %u\n", i, hoA[i], eA);
+      bad = 1;
+    }
+    if (hoB[i] != eB) {
+      printf("  outAll[%d]: got %u want %u\n", i, hoB[i], eB);
+      bad = 1;
+    }
+    if (hoC[i] != eC) {
+      printf("  outUni[%d]: got %u want %u\n", i, hoC[i], eC);
+      bad = 1;
+    }
+    if (hoM[i] != eM) {
+      printf("  outMask[%d]: got 0x%08x want 0x%08x\n", i, hoM[i], eM);
+      bad = 1;
+    }
+  }
+  printf(bad ? "  MISMATCH\n" : "  OK: 32 lanes, vote.any/all/uni + activemask verified bit-exactly\n");
+  return bad;
+}
+
+// ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
   if (argc < 3) {
-    printf("usage: %s <file.ptx> <vadd|block_reduce|fp16_reduce|gemm_tile|shfl_reduce|atom_cas|shfl_pred|all>\n", argv[0]);
+    printf("usage: %s <file.ptx> <vadd|block_reduce|fp16_reduce|gemm_tile|shfl_reduce|atom_cas|shfl_pred|vote_pred|all>\n", argv[0]);
     return 2;
   }
   const char* ptx = argv[1];
@@ -976,6 +1052,12 @@ int main(int argc, char** argv) {
     printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
     if (rc && g_exit_code == 0) g_exit_code = rc;
   }
+  if (all || strcmp(kname, "vote_pred") == 0) {
+    printf("== vote_pred ==\n");
+    rc = test_vote_pred(mod);
+    printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
+    if (rc && g_exit_code == 0) g_exit_code = rc;
+  }
   if (!all && strcmp(kname, "fp16_reduceB") == 0) {
     printf("== fp16_reduce (dataset B only) ==\n");
     rc = test_fp16_reduce(mod, 1);
@@ -1000,7 +1082,7 @@ int main(int argc, char** argv) {
   if (!all && strcmp(kname, "vadd") && strcmp(kname, "block_reduce") &&
       strcmp(kname, "fp16_reduce") && strcmp(kname, "gemm_tile") &&
       strcmp(kname, "shfl_reduce") && strcmp(kname, "atom_cas") &&
-      strcmp(kname, "shfl_pred") &&
+      strcmp(kname, "shfl_pred") && strcmp(kname, "vote_pred") &&
       strcmp(kname, "fp16_reduceB") && strcmp(kname, "gemm_tileB") &&
       strcmp(kname, "gemm_tile2")) {
     printf("unknown kernel '%s'\n", kname);

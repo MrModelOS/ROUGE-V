@@ -51,11 +51,11 @@ ctest --test-dir build --output-on-failure
 | `compiler_rvv_backend_*` | тот же IR собирается бэкендом RISC-V `rv64gcv` (информационные) |
 | `compiler_amdgpu_backend` | IR собирается бэкендом AMD `gfx1100` (5 ядер, информационный; SKIP без ROCm) |
 | `compiler_nvptx_backend` | IR собирается бэкендом NVIDIA `sm_75` (7 ядер, информационный) |
-| `compiler_nvptx_gpu_exec` | ядра исполняются на настоящей NVIDIA GPU и сверяются побитово (10 конфигураций: 8 ядер, fp16/gemm по двум наборам данных + сетка 2×1; SKIP без sm_75+) |
+| `compiler_nvptx_gpu_exec` | ядра исполняются на настоящей NVIDIA GPU и сверяются побитово (11 конфигураций: 9 ядер, fp16/gemm по двум наборам данных + сетка 2×1; SKIP без sm_75+) |
 | `compiler_nvptx_gpu_exec_atomic` | атомики `red`/`atom` исполняются на настоящей NVIDIA GPU (SKIP без sm_75+) |
 | `compiler_nvcc_gpu_exec` | вендорный PTX (`nvcc real_nvcc.cu`) сквозь ptx2ir исполняется на настоящей NVIDIA GPU (SKIP без nvcc или sm_75+) |
 | AMD-бэкенд — кросс-сборка | тот же IR с `addrspace(1)` (global) и `addrspace(5)` (shared) собирается в нативный объект `amdgcn-amd-amdhsa -mcpu=gfx1100` (5 ядер). Объект получен, но **ни разу не исполнялся** — AMD-видеокарты в проекте нет |
-| NVIDIA-бэкенд — кросс-сборка и исполнение | тот же IR с `addrspace(1)` (global) и `addrspace(3)` (shared) собирается в нативный объект `nvptx64-nvidia-cuda -march=sm_75` (8 ядер) и **исполняется на GeForce MX450** — см. `compiler_nvptx_gpu_exec*` выше |
+| NVIDIA-бэкенд — кросс-сборка и исполнение | тот же IR с `addrspace(1)` (global) и `addrspace(3)` (shared) собирается в нативный объект `nvptx64-nvidia-cuda -march=sm_75` (9 ядер) и **исполняется на GeForce MX450** — см. `compiler_nvptx_gpu_exec*` выше |
 | `mlir_simt_access_report` | MLIR-контур: `rouge-opt --rouge-simt-access-report` (только с `-DROUGE_ENABLE_MLIR=ON` + MLIR) |
 
 Цель выбирается флагом `--target` (см. ниже). Строки `*_backend` — это проверка
@@ -117,10 +117,10 @@ global — `addrspace(1)` у обоих GPU-бэкендов, shared — `addrsp
 | Память shared | `.shared` + динамический `.shared` (unsized `.extern`), `ld/st.shared.*`, `[sym±const]`, scratchpad на launch-дескрипторе + экспорт `@__rouge_*_query` |
 | Память local | `.local`-депо спиллов (`cvta.local`, `mov` адреса, generic доступы через `%SP`) |
 | Синхронизация | `bar.sync` / `barrier.sync` / `bar.warp.sync` → `__rouge_syncthreads` (хост) / `llvm.nvvm.barrier0` (NVPTX) |
-| Варп-шаффлы | `shfl.sync.*` + легаси `shfl.*`, включая предикатную форму `d\|p` (NVPTX: NVVM-интринсик + предикат из `%laneid`; хост: скаляр) |
+| Варп-шаффлы и голосования | `shfl.sync.*` + легаси `shfl.*`, включая предикатную форму `d\|p` (NVPTX: NVVM-интринсик + предикат из `%laneid`; хост: скаляр); `vote.sync.{any,all,uni}` (NVPTX: `llvm.nvvm.vote.*.sync`); `activemask.b32` (NVPTX: `llvm.nvvm.activemask`) |
 | Атомики | `atom.add.{u32,s32,u64,s64,f32}` (→ `atomicrmw`, возвращает старое), `red.add.*` (без возврата), `monotonic` |
 
-Неподдерживаемое (`mma.*`, `vote`/`activemask` на NVPTX, split-фазные
+Неподдерживаемое (`mma.*`, split-фазные
 `arrive`/`red`/`mbarrier.*`, `%clock64` на хосте)
 транслятор **отклоняет с ошибкой** — честный отказ, а не тихий мискомпил.
 

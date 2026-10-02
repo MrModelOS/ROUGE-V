@@ -652,6 +652,22 @@ class LlvmGen {
           (kind == "down" || kind == "up"))
         nvvm_sreg("laneid");
     }
+    // Real warp votes need their declares up front too. Backend-verified
+    // signature: i1 @llvm.nvvm.vote.<kind>.sync(i32 mask, i1 pred).
+    for (const auto& ins : body_) {
+      if (ins.op.rfind("vote", 0) != 0) continue;
+      std::string kind;
+      bool sync = false;
+      if (!nvptx_vote(ins, &kind, &sync)) continue;
+      intrinsics_.insert("declare i1 @llvm.nvvm.vote." + kind +
+                         ".sync(i32, i1)");
+    }
+    // activemask.b32 reads the executing mask straight from the hardware.
+    for (const auto& ins : body_) {
+      if (ins.op.rfind("activemask", 0) != 0) continue;
+      if (ins.args.size() != 1) continue;
+      intrinsics_.insert("declare i32 @llvm.nvvm.activemask()");
+    }
   }
 
   // Emit (once) a read of the named special register and return the intrinsic.
@@ -677,6 +693,33 @@ class LlvmGen {
     return "";
   }
 
+  // NVVM vote kind named by the opcode, or "" when this vote must stay on
+  // the scalar path. `sync` reports whether the opcode already carries the
+  // .sync form (with an explicit member mask as its last operand).
+  std::string vote_nvvm_kind(const std::string& op, bool* sync) {
+    if (sync) *sync = op.find(".sync.") != std::string::npos;
+    if (op.find(".any.") != std::string::npos) return "any";
+    if (op.find(".all.") != std::string::npos) return "all";
+    if (op.find(".uni.") != std::string::npos) return "uni";
+    return "";
+  }
+
+  // True when this vote can go through a real NVVM ballot: NVPTX target,
+  // known kind, .pred (i1) destination, and the operand count of its form
+  // (2 legacy, 3 .sync). Backend-verified signature:
+  //   i1 @llvm.nvvm.vote.<kind>.sync(i32 mask, i1 pred)
+  // Legacy (mask-less) PTX passes member mask -1, i.e. the full warp.
+  bool nvptx_vote(const rouge::PtxInstruction& ins, std::string* kind,
+                  bool* sync) {
+    if (!is_nvptx()) return false;
+    const std::string k = vote_nvvm_kind(ins.op, sync);
+    if (k.empty()) return false;
+    const size_t want = *sync ? 3 : 2;
+    if (ins.args.size() != want) return false;
+    if (reg_type(ins.args[0]) != "i1") return false;
+    *kind = k;
+    return true;
+  }
   // NVVM warp-shuffle kind named by the opcode, or "" when this shfl must stay
   // on the scalar path. `sync` reports whether the opcode already carries the
   // .sync form (with an explicit member mask as its last operand).
@@ -1100,6 +1143,39 @@ class LlvmGen {
     // ---- vote.{any,all,uni}.pred and vote.sync.* ----
     if (op.rfind("vote", 0) == 0) {
       if (A.size() < 2) return fail("bad " + op + " operands @ " + std::to_string(idx));
+      std::string vkind;
+      bool vsync = false;
+      if (nvptx_vote(ins, &vkind, &vsync)) {
+        // A = [dst.pred, src.pred, (mask)]. The source may be negated
+        // ("!%p1"); the intrinsic takes an i1 either way.
+        std::string srcPred = A[1];
+        bool neg = false;
+        if (!srcPred.empty() && srcPred[0] == '!') {
+          neg = true;
+          srcPred = srcPred.substr(1);
+        }
+        std::string pv = load_reg(srcPred);
+        if (neg) {
+          const std::string nv = fresh("%n");
+          line("  " + nv + " = xor i1 " + pv + ", true");
+          pv = nv;
+        }
+        // Immediates arrive in PTX spelling ("0xffffffff"), which LLVM IR
+        // does not accept as an i32 literal: spell them decimal.
+        const auto decimm = [](const std::string& t) -> std::string {
+          if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X'))
+            return std::to_string(
+                static_cast<long long>(std::strtoll(t.c_str(), nullptr, 16)));
+          return t;
+        };
+        const std::string mask =
+            vsync ? (is_register(A[2]) ? operand(A[2]) : decimm(A[2])) : "-1";
+        const std::string v = fresh("%vt");
+        line("  " + v + " = call i1 @llvm.nvvm.vote." + vkind + ".sync(i32 " +
+             mask + ", i1 " + pv + ")");
+        store_reg(A[0], v);
+        return true;
+      }
       // A warp collective has no meaning one lane at a time: the scalar
       // fallback is host-only. On a GPU it would silently answer wrong, so
       // refuse instead of emitting it.
@@ -1126,9 +1202,16 @@ class LlvmGen {
     // ---- activemask.b32 ----
     if (op.rfind("activemask", 0) == 0) {
       if (A.empty()) return fail("bad " + op + " operands @ " + std::to_string(idx));
-      if (is_nvptx())
-        return fail("unsupported " + op + " on NVPTX @ " + std::to_string(idx) +
-                    " (warp-collective lowering not implemented yet)");
+      // Backend-verified: i32 @llvm.nvvm.activemask() lowers to activemask.b32.
+      if (is_nvptx()) {
+        if (A.size() != 1)
+          return fail("unsupported " + op + " form on NVPTX @ " +
+                      std::to_string(idx) + " (want activemask.b32 %d)");
+        const std::string v = fresh("%am");
+        line("  " + v + " = call i32 @llvm.nvvm.activemask()");
+        store_reg(A[0], fit_reg(A[0], v, "i32"));
+        return true;
+      }
       line("  ; scalar fallback: activemask -> all lanes active (0xffffffff)");
       // b32 destination is i32; -1 == 0xffffffff
       store_reg(A[0], "-1");

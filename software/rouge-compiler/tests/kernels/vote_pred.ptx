@@ -1,0 +1,72 @@
+.version 8.0
+.target sm_80
+.address_size 64
+
+// ROUGE-V test kernel: vote.sync.{any,all,uni} + activemask.b32.
+// Each thread loads data[globalIdx], votes its (val != 0) predicate across
+// the warp with a full mask, and writes the three results plus the active
+// mask as 0/1 (mask as u32) to per-thread slots.
+// Exercises warp ballots in both paths: the host AOT scalar fallback
+// (predicate identity) and the NVPTX path (real llvm.nvvm.vote.*.sync +
+// llvm.nvvm.activemask) — verified bit-exactly against a host reference
+// on a real GPU (compiler_nvptx_gpu_exec).
+
+.visible .entry vote_pred(
+    .param .u64 vote_pred_param_0,
+    .param .u64 vote_pred_param_1,
+    .param .u64 vote_pred_param_2,
+    .param .u64 vote_pred_param_3,
+    .param .u64 vote_pred_param_4,
+    .param .u32 vote_pred_param_5
+)
+{
+    .reg .b32 %r<14>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<6>;
+
+    ld.param.u64 %rd1, [vote_pred_param_0];
+    ld.param.u64 %rd2, [vote_pred_param_1];
+    ld.param.u64 %rd5, [vote_pred_param_2];
+    ld.param.u64 %rd6, [vote_pred_param_3];
+    ld.param.u64 %rd7, [vote_pred_param_4];
+    ld.param.u32 %r1, [vote_pred_param_5];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mul.wide.u32 %rd3, %r2, %r3;
+    mov.u32 %r4, %tid.x;
+    cvt.u64.u32 %rd4, %r4;
+    add.s64 %rd3, %rd3, %rd4;
+    cvt.u32.u64 %r5, %rd3;
+
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_RET;
+
+    mul.wide.u32 %rd4, %r5, 4;
+    add.s64 %rd1, %rd1, %rd4;
+    ld.global.u32 %r7, [%rd1];
+
+    setp.ne.u32 %p2, %r7, 0;
+    vote.sync.any.pred %p3, %p2, -1;
+    vote.sync.all.pred %p4, %p2, -1;
+    vote.sync.uni.pred %p5, %p2, -1;
+    activemask.b32 %r8;
+
+    selp.b32 %r9, 1, 0, %p3;
+    add.s64 %rd2, %rd2, %rd4;
+    st.global.b32 [%rd2], %r9;
+
+    selp.b32 %r10, 1, 0, %p4;
+    add.s64 %rd5, %rd5, %rd4;
+    st.global.b32 [%rd5], %r10;
+
+    selp.b32 %r11, 1, 0, %p5;
+    add.s64 %rd6, %rd6, %rd4;
+    st.global.b32 [%rd6], %r11;
+
+    add.s64 %rd7, %rd7, %rd4;
+    st.global.b32 [%rd7], %r8;
+
+L_RET:
+    ret;
+}
