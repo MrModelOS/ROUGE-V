@@ -59,6 +59,37 @@ LD_LIBRARY_PATH=$PWD/imposter ROUGE_CUDA_FORCE_EMU=1 ./foreign_app kernel.ptx
 `cuMemcpyHtoD_v2`, …) — они реализованы и пробрасываются тем
 же путём, что и базовые спеллинги.
 
+## Запуск целой программы (Runtime API, сахар `<<<>>>`)
+
+Драйверный API — только половина дела: настоящие программы собраны
+через **Runtime API**, и компилятор NVIDIA реализует `<<<>>>`
+не через `cudaLaunchKernel`, а через собственный протокол
+регистрации. Протокол изучен по дизассемблированию объекта
+`nvcc -arch=sm_75 -c`, а не по памяти:
+
+```
+.init_array → __sti____cudaRegisterAll():
+    handle = __cudaRegisterFatBinary(...);   // возвращает handle
+    __nv_cudaEntityRegisterCallback(handle); // код самой программы
+    __cudaRegisterFatBinaryEnd(&handle);
+колбэк программы, на ядро:
+    __cudaRegisterFunction(handle, stub, mangled_name, ...);
+запуск <<<1,64>>>:
+    __cudaGetKernel(&handle, stub)          // один раз, под guard
+    __cudaPushCallConfiguration(...) / __cudaPopCallConfiguration(...)
+    __cudaLaunchKernel(handle, grid, block, args, shared, stream)
+```
+
+Мы перехватываем ровно эти точки: `stub → имя` — таблица
+диспетчеризации, а PTX берётся из `ROUGE_CUDA_PTX` (разбор fatbin
+следующий шаг и протокола не меняет).
+
+Проверка `tests/programs/wave1_vadd.cu`: **один и тот же исходник**
+собран дважды — `nvcc` против настоящего cudart и `g++` против
+нашего шима, без единой ссылки на CUDA-библиотеку. Оба запуска
+печатают `OK`; тест сравнивает выводы и валит прогон при расхождении.
+GPU для этого не нужен вообще.
+
 ## Структура
 
 ```

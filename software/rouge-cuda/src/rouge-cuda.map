@@ -2,6 +2,8 @@
   global:
     cu*;
     cuda*;
+    __cuda*;
+    __nv_*;
     rouge_cuda_emulation_sentinel;
   local:
     *;

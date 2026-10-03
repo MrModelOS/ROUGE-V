@@ -42,3 +42,35 @@ add_executable(test_interposer test_interposer.cpp)
 target_compile_definitions(test_interposer PRIVATE ROUGE_SHARED_LIB="$<TARGET_FILE:rouge-cuda>")
 target_link_libraries(test_interposer PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
 add_test(NAME interposer COMMAND test_interposer)
+
+# ---- Волна 1: целая чужая программа, собранная настоящим nvcc --------------
+# The program source lives in programs/ and is compiled by nvcc at test time.
+# Without nvcc the test reports SKIP; it never needs a GPU.
+# nvcc is not always on PATH (CUDA installs it outside it), so the standard
+# toolkit locations are probed explicitly before giving up.
+# nvcc usually lives outside PATH (each toolkit installs it in its own bin),
+# so search PATH first and then probe the standard locations explicitly.
+find_program(ROUGE_NVCC_PROG nvcc)
+if(NOT RROUGE_NVCC_PROG)
+  foreach(_cuda_bin /opt/cuda/bin /usr/local/cuda/bin /usr/lib/nvidia-cuda-toolkit/bin)
+    if(EXISTS "${_cuda_bin}/nvcc")
+      set(ROUGE_NVCC_PROG "${_cuda_bin}/nvcc")
+      break()
+    endif()
+  endforeach()
+endif()
+if(ROUGE_NVCC_PROG)
+  add_executable(test_foreign_program test_foreign_program.cpp)
+  target_link_libraries(test_foreign_program PRIVATE ${CMAKE_DL_LIBS})
+  set(_fp_src ${CMAKE_CURRENT_SOURCE_DIR}/programs/wave1_vadd.cu)
+  set(_fp_work ${CMAKE_CURRENT_BINARY_DIR}/foreign-program)
+  add_test(NAME foreign_program
+    COMMAND ${CMAKE_COMMAND}
+      -DNVCC=${ROUGE_NVCC_PROG}
+      -DSRC=${_fp_src}
+      -DWORK_DIR=${_fp_work}
+      -DSHIM=$<TARGET_FILE:rouge-cuda>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/foreign_program.cmake)
+else()
+  message(STATUS "foreign_program: SKIP (nvcc not found)")
+endif()

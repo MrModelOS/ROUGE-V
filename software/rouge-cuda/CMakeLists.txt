@@ -17,6 +17,7 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../rouge-ptx ${CMAKE_CURRENT_BINARY
 add_library(rouge-cuda SHARED
   src/driver_api.cpp
   src/runtime_api.cpp
+  src/runtime_register.cpp
   src/forward.cpp
 )
 target_include_directories(rouge-cuda PUBLIC
@@ -35,6 +36,7 @@ set_target_properties(rouge-cuda PROPERTIES
 add_library(rouge-cuda-static STATIC
   src/driver_api.cpp
   src/runtime_api.cpp
+  src/runtime_register.cpp
   src/forward.cpp
 )
 target_include_directories(rouge-cuda-static PUBLIC
