@@ -87,10 +87,14 @@ struct PtxProgram {
 std::unique_ptr<PtxProgram> parse_ptx(const std::string& text, std::string* error);
 
 // Execute a kernel over the full grid for the CPU-emulated device.
+// globalBases (optional): module-scope .global/.const backing storage,
+// name -> host address. Provided by the API layer (cuModuleGetGlobal
+// allocates it); null means module globals resolve to zero, as before.
 bool execute_kernel(const PtxProgram& prog, int fnIndex,
                     const std::vector<uint8_t>& paramsBlob,
                     unsigned gx, unsigned gy, unsigned gz,
                     unsigned bx, unsigned by, unsigned bz,
-                    std::string* error);
+                    std::string* error,
+                    const std::unordered_map<std::string, uint64_t>* globalBases = nullptr);
 
 }  // namespace rouge

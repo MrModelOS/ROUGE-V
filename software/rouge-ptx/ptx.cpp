@@ -34,18 +34,50 @@ std::string norm_operand(const std::string& a) {
   return a;
 }
 
-bool is_label_line(const std::string& s, std::string* label) {
-  if (s.empty()) return false;
-  const size_t colon = s.find(':');
-  if (colon == std::string::npos) return false;
-  for (size_t i = colon + 1; i < s.size(); ++i)
-    if (!std::isspace((unsigned char)s[i])) return false;
-  const std::string name = s.substr(0, colon);
-  if (name.empty() || !std::isalpha((unsigned char)name[0])) return false;
-  for (char c : name)
-    if (!std::isalnum((unsigned char)c) && c != '_') return false;
-  *label = name;
-  return true;
+// PTX-идентификатор: буква, '_' или '$' первым символом, далее
+// буквы/цифры/'_'/'$'. '$' — валидный первый символ: так nvcc 13
+// (NVVM) пишет метки базовых блоков, например "$L__BB0_2:".
+bool ident_start(char c) {
+  return std::isalpha((unsigned char)c) || c == '_' || c == '$';
+}
+
+bool ident_cont(char c) {
+  return std::isalnum((unsigned char)c) || c == '_' || c == '$';
+}
+
+// Поиск метки "IDENT:" в строке — в любом её месте. Возвращает индекс
+// начала имени или npos; *colon — позиция ':', *label — имя метки.
+// Двоеточие в PTX больше нигде не встречается (ни в опкодах, ни в
+// типах, ни в операндах), поэтому первое вхождение однозначно метка.
+size_t find_label(const std::string& s, size_t* colon, std::string* label) {
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (!ident_start(s[i])) continue;
+    size_t j = i + 1;
+    while (j < s.size() && ident_cont(s[j])) ++j;
+    if (j < s.size() && s[j] == ':') {
+      *colon = j;
+      *label = s.substr(i, j - i);
+      return i;
+    }
+    i = j - 1;  // ++i в for перейдёт на j
+  }
+  return std::string::npos;
+}
+
+// Хвост строки после ':' метки: только пробелы и/или trailing-комментарий.
+// ("//" уже срезан вызывающим кодом; блочный "/* ... */" — ещё нет.)
+bool is_blank_or_comment(const std::string& s) {
+  size_t i = 0;
+  while (i < s.size() && std::isspace((unsigned char)s[i])) ++i;
+  if (i == s.size()) return true;
+  if (s.compare(i, 2, "/*") == 0) {
+    const size_t end = s.find("*/", i + 2);
+    if (end == std::string::npos) return false;
+    i = end + 2;
+    while (i < s.size() && std::isspace((unsigned char)s[i])) ++i;
+    return i == s.size();
+  }
+  return false;
 }
 
 bool parse_instruction(const std::string& raw, PtxInstruction* out) {
@@ -521,8 +553,27 @@ std::unique_ptr<PtxProgram> parse_ptx(const std::string& text, std::string* erro
     }
     if (!s.empty() && s[0] == '.') continue;  // .align/... directives
 
+    // Метка: "NAME:" — в любом месте строки, с необязательным
+    // trailing-комментарием; текст до метки (если есть) —
+    // инструкция, после двоеточия — пусто или комментарий.
+    // nvcc 13 пишет метки вида "$L__BB0_2:" ('$' — валидный
+    // символ идентификатора, см. find_label).
+    size_t colon = std::string::npos;
     std::string label;
-    if (is_label_line(s, &label)) {
+    const size_t lstart = find_label(s, &colon, &label);
+    if (lstart != std::string::npos &&
+        is_blank_or_comment(s.substr(colon + 1))) {
+      const std::string head = trim(s.substr(0, lstart));
+      if (!head.empty()) {
+        // Инструкция и метка в одной строке: инструкция выдаётся
+        // первой, чтобы метка указывала на следующую за ней.
+        PtxInstruction instr;
+        if (!parse_instruction(head, &instr)) {
+          if (error) *error = "cannot parse instruction (line " + std::to_string(lineNo) + "): " + head;
+          return nullptr;
+        }
+        cur->body.push_back(std::move(instr));
+      }
       cur->labels[label] = static_cast<int>(cur->body.size());
       continue;
     }
@@ -663,6 +714,26 @@ bool local_symbol_addr(const PtxFunction& fn, const ExecState& st,
   return true;
 }
 
+// Module-global backing storage for the current launch (name -> host
+// address), installed by execute_kernel from its globalBases argument.
+// Same single-threaded pattern as g_block_states below: the emulator
+// steps one CTA at a time, so a static is safe here.
+static const std::unordered_map<std::string, uint64_t>* g_global_bases = nullptr;
+
+// A module-scope .global/.const symbol ("sym", "[sym]") resolves to its
+// backing-store address; other operands fall through (returns false).
+bool module_global_addr(const std::string& tok, uint64_t* out) {
+  if (g_global_bases == nullptr || g_global_bases->empty()) return false;
+  std::string name = strip_brackets(tok);
+  // A symbol with an offset ("[sym+8]") is not a bare symbol.
+  if (name.find('+') != std::string::npos || name.find('-') != std::string::npos)
+    return false;
+  const auto it = g_global_bases->find(name);
+  if (it == g_global_bases->end()) return false;
+  *out = it->second;
+  return true;
+}
+
 // Resolve a memory operand: shared symbol first, then a shared symbol with a
 // constant offset, then a GPR holding an address (global, or a shared address
 // produced by cvta.to.shared), then a GPR plus a constant offset.
@@ -672,6 +743,11 @@ uintptr_t mem_addr(const PtxFunction& fn, const ExecState& st,
   if (shared_symbol_addr(fn, st, tok, &shared)) return shared;
   uintptr_t local = 0;
   if (local_symbol_addr(fn, st, tok, &local)) return local;
+  // Direct "[sym]" / "[sym+off]" over a module-scope .global/.const.
+  // (The common nvcc pattern goes through cvta/mov into a register
+  // first, which is covered above; this is the direct form.)
+  uint64_t gbase = 0;
+  if (module_global_addr(tok, &gbase)) return static_cast<uintptr_t>(gbase);
   const std::string inner = strip_brackets(tok);
   std::string base;
   int64_t off = 0;
@@ -867,9 +943,16 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
           if (local_symbol_addr(fn, st, A[1], &local))
             st.setreg(A[0], static_cast<uint64_t>(local));
           else {
-            uint64_t v = 0;
-            if (!st.spec_reg(A[1], &v)) v = st.reg(A[1]);
-            st.setreg(A[0], v);
+            // Module-scope .global/.const: backing store allocated by the
+            // API layer (cuModuleGetGlobal); without it the old zero stands.
+            uint64_t gbase = 0;
+            if (module_global_addr(A[1], &gbase))
+              st.setreg(A[0], gbase);
+            else {
+              uint64_t v = 0;
+              if (!st.spec_reg(A[1], &v)) v = st.reg(A[1]);
+              st.setreg(A[0], v);
+            }
           }
         }
       }
@@ -888,9 +971,14 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
         return 0;
       }
       // "mov.b64 %SPL, __local_depot0": materialise the thread depot address.
+      // A module-scope .global/.const source resolves to its backing store
+      // (same rule as cvta above); anything else is a register/immediate.
       uintptr_t local = 0;
+      uint64_t gbase = 0;
       if (local_symbol_addr(fn, st, A[1], &local))
         st.setreg(A[0], static_cast<uint64_t>(local));
+      else if (module_global_addr(A[1], &gbase))
+        st.setreg(A[0], gbase);
       else
         st.setreg(A[0], operand_u64(st, A[1]));
       st.pc = next_pc;
@@ -925,14 +1013,22 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       st.pc = next_pc;
       return 1;
     }
-    if (op == "add.f32" || op == "sub.f32" || op == "mul.f32" || op == "div.f32") {
-      if (A.size() < 3) { if (error) *error = "bad fp op in " + fn.name; return 0; }
+    if (op == "add.f32" || op == "sub.f32" || op == "mul.f32" || op == "div.f32" ||
+        op == "fma.rn.f32") {
+      // fma.rn.f32 — fused multiply-add с одним округлением: nvcc 13
+      // эмитит его в обычных циклах накопления (mmul поймал отсутствие).
+      // std::fma даёт то же одно округление, что железный FMA и llvm.fma.
+      const size_t need = op[0] == 'f' ? 4 : 3;
+      if (A.size() < need) { if (error) *error = "bad fp op in " + fn.name; return 0; }
       const float x = bit_cast_v<float>(static_cast<uint32_t>(operand_u64(st, A[1])));
       const float y = bit_cast_v<float>(static_cast<uint32_t>(operand_u64(st, A[2])));
       float r = 0.0f;
       if (op == "add.f32") r = x + y;
       else if (op == "sub.f32") r = x - y;
       else if (op == "mul.f32") r = x * y;
+      else if (op == "fma.rn.f32")
+        r = std::fma(x, y,
+                     bit_cast_v<float>(static_cast<uint32_t>(operand_u64(st, A[3]))));
       else r = x / y;
       st.setreg(A[0], static_cast<uint64_t>(bit_cast_v<uint32_t>(r)));
       st.pc = next_pc;
@@ -1984,6 +2080,18 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       return 2;
     }
 
+    // Метка ("NAME:", в т.ч. "$L__BB0_2:" от nvcc 13), проскочившая
+    // мимо фронтенда — no-op, а не неподдерживаемая инструкция.
+    // Опкод в PTX никогда не содержит ':', поэтому op с хвостом ':'
+    // однозначно метка; имя проверяется по правилам идентификатора.
+    if (!op.empty() && op.back() == ':') {
+      const std::string name = op.substr(0, op.size() - 1);
+      bool ok = !name.empty() && ident_start(name[0]);
+      for (char c : name)
+        if (!ident_cont(c)) { ok = false; break; }
+      if (ok) { st.pc = next_pc; return 1; }
+    }
+
     if (error) *error = "unsupported instruction '" + op + "' in " + fn.name;
     return 0;
 }
@@ -1996,7 +2104,8 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
                     const std::vector<uint8_t>& paramsBlob,
                     unsigned gx, unsigned gy, unsigned gz,
                     unsigned bx, unsigned by, unsigned bz,
-                    std::string* error) {
+                    std::string* error,
+                    const std::unordered_map<std::string, uint64_t>* globalBases) {
   if (fnIndex < 0 || fnIndex >= static_cast<int>(prog.functions.size())) {
     if (error) *error = "kernel function index out of range";
     return false;
@@ -2016,6 +2125,10 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
 
   // CTA-sized thread states for one block, stepped in lockstep (SIMT).
   const size_t threadsPerBlock = static_cast<size_t>(bz) * by * bx;
+
+  // Module-global backing storage (if the API layer provided any) is
+  // visible to every address-resolution path for the whole launch.
+  g_global_bases = globalBases;
 
   for (uint64_t bz_i = 0; bz_i < gz; ++bz_i)
     for (uint64_t by_i = 0; by_i < gy; ++by_i)
@@ -2064,11 +2177,13 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
             if (++steps > kMaxSteps) {
               if (error) *error = "emulation step limit exceeded (runaway loop?) in " + fn.name;
               g_block_states = nullptr;
+              g_global_bases = nullptr;
               return false;
             }
             const int rc = run_thread_step(fn, paramsBlob, states[i], error);
             if (rc == 0) {
               g_block_states = nullptr;
+              g_global_bases = nullptr;
               return false;
             }
             if (rc == 2) blocked[i] = true;
@@ -2087,6 +2202,7 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
         }
         g_block_states = nullptr;
       }
+  g_global_bases = nullptr;
   return true;
 }
 
