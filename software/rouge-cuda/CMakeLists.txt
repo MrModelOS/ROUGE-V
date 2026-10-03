@@ -18,6 +18,7 @@ add_library(rouge-cuda SHARED
   src/driver_api.cpp
   src/runtime_api.cpp
   src/runtime_register.cpp
+  src/fatbin.cpp
   src/forward.cpp
 )
 target_include_directories(rouge-cuda PUBLIC
@@ -37,6 +38,7 @@ add_library(rouge-cuda-static STATIC
   src/driver_api.cpp
   src/runtime_api.cpp
   src/runtime_register.cpp
+  src/fatbin.cpp
   src/forward.cpp
 )
 target_include_directories(rouge-cuda-static PUBLIC

@@ -46,8 +46,6 @@ add_test(NAME interposer COMMAND test_interposer)
 # ---- Волна 1: целая чужая программа, собранная настоящим nvcc --------------
 # The program source lives in programs/ and is compiled by nvcc at test time.
 # Without nvcc the test reports SKIP; it never needs a GPU.
-# nvcc is not always on PATH (CUDA installs it outside it), so the standard
-# toolkit locations are probed explicitly before giving up.
 # nvcc usually lives outside PATH (each toolkit installs it in its own bin),
 # so search PATH first and then probe the standard locations explicitly.
 find_program(ROUGE_NVCC_PROG nvcc)

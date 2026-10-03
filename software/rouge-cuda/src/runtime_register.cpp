@@ -20,6 +20,7 @@
 #include <rouge/cuda.h>
 #include <rouge/cuda_runtime_api.h>
 
+#include "fatbin.h"
 #include "ptx.h"
 #include "rouge_internal.h"
 
@@ -202,6 +203,31 @@ cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void
 void* __cudaRegisterFatBinary(const void* fatCubinHandle) {
   // The handle travels back into the program and is handed to its registration
   // callback, which stores it — it must be non-null and stable.
+  //
+  // The same handle points at the fatbin descriptor, so this is our moment to
+  // take the PTX straight out of the binary: after this the program needs no
+  // ROUGE_CUDA_PTX and is self-sufficient, exactly like with a real driver.
+  if (fatCubinHandle != nullptr) {
+    std::string err;
+    const std::vector<std::string> texts = rouge_fatbin_extract_ptx(fatCubinHandle, &err);
+    for (const std::string& text : texts) {
+      std::string perr;
+      auto prog = rouge::parse_ptx(text, &perr);
+      if (!prog) {
+        std::fprintf(stderr, "[ROUGE-CUDA] fatbin PTX parse failed: %s\n", perr.c_str());
+        continue;
+      }
+      ptx_modules().push_back(std::shared_ptr<rouge::PtxProgram>(std::move(prog)));
+    }
+    if (!texts.empty()) {
+      std::fprintf(stderr, "[ROUGE-CUDA] %zu PTX module(s) taken from the fatbin\n",
+                   texts.size());
+    } else {
+      // Loud, specific reason: a silent empty result would make a broken
+      // fatbin look like a missing ROUGE_CUDA_PTX much later on.
+      std::fprintf(stderr, "[ROUGE-CUDA] fatbin PTX unavailable: %s\n", err.c_str());
+    }
+  }
   return const_cast<void*>(fatCubinHandle);
 }
 

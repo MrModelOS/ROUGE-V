@@ -35,12 +35,6 @@ if(NOT rc EQUAL 0)
   message(FATAL_ERROR "foreign program: FAILED - nvcc -c exited ${rc}: ${err}")
 endif()
 
-execute_process(
-  COMMAND "${NVCC}" -arch=sm_75 -ptx "${SRC}" -o "${WORK_DIR}/prog.ptx"
-  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
-if(NOT rc EQUAL 0)
-  message(FATAL_ERROR "foreign program: FAILED - nvcc -ptx exited ${rc}: ${err}")
-endif()
 
 # The link names NO CUDA library on purpose: every CUDA symbol must resolve from
 # our own shim. With --no-as-needed the linker records the DT_NEEDED entry even
@@ -70,7 +64,7 @@ execute_process(
   COMMAND ${CMAKE_COMMAND} -E env
           "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}"
           "${CMAKE_CURRENT_BINARY_DIR}/test_foreign_program"
-          "${WORK_DIR}/prog_ref" "${WORK_DIR}/prog" "${WORK_DIR}/prog.ptx" "${SHIM}"
+          "${WORK_DIR}/prog_ref" "${WORK_DIR}/prog" "${SHIM}"
   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 string(REPLACE "\n" "\n    " pretty "${out}${err}")
 message(STATUS "foreign program: ${pretty}")

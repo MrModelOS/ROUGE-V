@@ -21,6 +21,24 @@ static int fail(const char* what) {
   return 1;
 }
 
+// Strips the compat layer's own diagnostics ("[ROUGE-CUDA] ...") so the
+// comparison is about the PROGRAM's output only, not about our logging.
+static std::string program_output_only(const std::string& text) {
+  std::string out;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t end = text.find('\n', pos);
+    if (end == std::string::npos) end = text.size();
+    const std::string line = text.substr(pos, end - pos);
+    if (line.rfind("[ROUGE-CUDA]", 0) != 0) {
+      out += line;
+      out += '\n';
+    }
+    pos = end + 1;
+  }
+  return out;
+}
+
 static bool read_file(const std::string& path, std::string* out) {
   FILE* f = std::fopen(path.c_str(), "rb");
   if (f == nullptr) return false;
@@ -34,23 +52,25 @@ static bool read_file(const std::string& path, std::string* out) {
 }
 
 int main(int argc, char** argv) {
-  if (argc < 5) {
-    std::fprintf(stderr, "usage: %s <prog_ref> <prog_shimmed> <kernel.ptx> <shim.so>\n",
+  if (argc < 4) {
+    std::fprintf(stderr, "usage: %s <prog_ref> <prog_shimmed> <shim.so>\n",
                  argv[0]);
     return 2;
   }
   // prog_ref  : the same program linked against the real CUDA runtime
   // prog      : the same object linked against OUR shim, no CUDA library at all
+  // The shimmed binary must find its kernels INSIDE ITSELF: no PTX file and no
+  // environment variable are handed to it.
   const std::string progRef = argv[1];
   const std::string prog = argv[2];
-  const std::string ptx = argv[3];
-  const std::string shim = argv[4];
+  const std::string shim = argv[3];
 
   // Run the SAME binary twice: once against the real libcudart (if the host has
   // it, i.e. a genuine NVIDIA stack) and once against our libcuda imposter with
   // emulation forced. Comparing the two is the whole point; when there is no
   // real driver the second run stands alone and must simply pass.
-  const std::string cwd = ptx.substr(0, ptx.find_last_of('/'));
+  // Work next to the binaries themselves: both are produced in WORK_DIR.
+  const std::string cwd = prog.substr(0, prog.find_last_of('/'));
 
   // Reference run: no LD_LIBRARY_PATH interference.
   const std::string refCmd =
@@ -64,9 +84,10 @@ int main(int argc, char** argv) {
   const std::string copyCmd = "cp -f " + shim + " " + shimDir + "/libcuda.so.1";
   if (std::system(copyCmd.c_str()) != 0) return fail("cannot install the shim as libcuda.so.1");
 
-  const std::string emuCmd =
-      "cd " + cwd + " && LD_LIBRARY_PATH=" + shimDir + " ROUGE_CUDA_FORCE_EMU=1 ROUGE_CUDA_PTX=" +
-      ptx + " ./" + prog.substr(prog.find_last_of('/') + 1) + " > emu.out 2>&1; echo rc=$?";
+  const std::string emuCmd = "cd " + cwd + " && LD_LIBRARY_PATH=" + shimDir +
+                             " ROUGE_CUDA_FORCE_EMU=1 ./" +
+                             prog.substr(prog.find_last_of('/') + 1) +
+                             " > emu.out 2>&1; echo rc=$?";
   const int emuRc = std::system(emuCmd.c_str());
 
   std::string refOut, emuOut;
@@ -90,7 +111,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "FAIL: reference run on the real stack exited %d\n", refRc);
     return 1;
   }
-  if (refOut != emuOut) {
+  if (program_output_only(refOut) != program_output_only(emuOut)) {
     std::fprintf(stderr, "FAIL: emulation output differs from the real stack\n");
     return 1;
   }
