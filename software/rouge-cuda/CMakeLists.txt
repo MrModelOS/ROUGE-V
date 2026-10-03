@@ -25,6 +25,11 @@ target_include_directories(rouge-cuda PUBLIC
 )
 target_link_libraries(rouge-cuda PRIVATE rouge-ptx ${CMAKE_DL_LIBS})
 set_target_properties(rouge-cuda PROPERTIES OUTPUT_NAME rouge-cuda)
+# Export ONLY the CUDA surface (cu*/cuda*/sentinel): the interposer must not
+# leak C++ internals (rouge::ctx, rouge::load_real_symbol, ...) into the
+# dynamic symbol table of a libcuda.so.1 imposter.
+set_target_properties(rouge-cuda PROPERTIES
+  LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/rouge-cuda.map")
 
 # ---- Static library: for embedding in our own software stack and tests ----
 add_library(rouge-cuda-static STATIC

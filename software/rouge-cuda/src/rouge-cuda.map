@@ -1,0 +1,8 @@
+{
+  global:
+    cu*;
+    cuda*;
+    rouge_cuda_emulation_sentinel;
+  local:
+    *;
+};

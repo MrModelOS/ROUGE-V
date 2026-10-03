@@ -41,7 +41,8 @@ void* load_real_symbol(const char* name) {
   // Probe once for a real CUDA library already loaded in the process.
   // If present, we are in "interposition" mode and forward to it.
   static void* handle = []() -> void* {
-    for (const char* lib : {"libcuda.so.1", "libcuda.so", "libcudart.so.12", "libcudart.so"}) {
+    for (const char* lib : {"libcuda.so.1", "libcuda.so", "libcudart.so.13",
+                          "libcudart.so.12", "libcudart.so"}) {
       void* h = dlopen(lib, RTLD_LAZY | RTLD_NOLOAD);
       if (!h) continue;
       // The imposter is ourselves: never forward into our own symbols.
