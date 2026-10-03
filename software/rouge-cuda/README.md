@@ -30,6 +30,35 @@ PASS: runtime-API memory copy pipeline
 PASS: cuInit is exported for LD_PRELOAD interposition
 ```
 
+## Imposter-режим: чужая программа без NVIDIA
+
+Слой работает не только как LD_PRELOAD-перехватчик, но и как
+подмена самой библиотеки. Бинарник, слинкованный против
+настоящего `-lcuda` (чужая программа, исходников которой у
+нас нет), запускается так:
+
+```bash
+mkdir imposter
+cp build/librouge-cuda.so imposter/libcuda.so.1
+LD_LIBRARY_PATH=$PWD/imposter ROUGE_CUDA_FORCE_EMU=1 ./foreign_app kernel.ptx
+```
+
+Как это устроено:
+- лоадер ищет `libcuda.so.1` по LD_LIBRARY_PATH и находит наш
+  файл; все вызовы CUDA Driver API попадают в нас;
+- сентинел `rouge_cuda_emulation_sentinel` не даёт нам
+  перепутать самих себя с «настоящей» libcuda при зондировании;
+- `ROUGE_CUDA_FORCE_EMU=1` запрещает проброс в настоящий
+  драйвер даже если он в системе есть — режим с нулём вызовов
+  NVIDIA, пригодный для аудита;
+- без этой переменной, наоборот, при наличии реальной libcuda
+  вызовы пробрасываются в неё (режим interposition).
+
+Бинарники, собранные против свежих заголовков CUDA 13, зовут
+версионированные имена (`cuCtxCreate_v4`, `cuMemAlloc_v2`,
+`cuMemcpyHtoD_v2`, …) — они реализованы и пробрасываются тем
+же путём, что и базовые спеллинги.
+
 ## Структура
 
 ```
@@ -55,11 +84,12 @@ tests/
 
 ## Что умеет PTX-интерпретатор (подмножество v0)
 
-Парсинг: `.version/.target/.address_size`, заголовки `.visible .entry`, сигнатуры `.param`, метки, комментарии `//`, `.reg .b16` (16-битные регистры).
+Парсинг: `.version/.target/.address_size`, заголовки `.visible .entry`, сигнатуры `.param`, метки (в т.ч. `$L__BB0_2` от nvcc 13 — `$` валиден, метка в любом месте строки, trailing-комментарий допустим), комментарии `//`, `.reg .b16` (16-битные регистры).
 
 Инструкции: `ld.param.{u64,u32}`, `mov.{u32,u64,f32,u16,f16,bf16}`, `cvta.*` (global: identity,
 адреса = host-адреса; shared: база scratchpad блока + смещение), `mul.wide.u32`,
-`add/sub.{s64,u64,u32,s32}` (в т.ч. с литералами), `add/sub/mul/div.f32`,
+`add/sub.{s64,u64,u32,s32}` (в т.ч. с литералами), `add/sub/mul/div/fma.rn.f32` (fused,
+одно округление через `std::fma` — как железный FMA и `llvm.fma`),
 `add/sub/mul/div.f16`, `add/sub/mul.rn.bf16`, `fma.rn.{f16,bf16}`, `neg.{f16,bf16}`,
 `cvt.*` (включая `cvt.rn.{f16,bf16}.f32`, `cvt.f32.{f16,bf16}`, `cvt.{f16,bf16}↔int`),
 `setp.{ge,gt,lt,le,eq,ne}.u32`, `bra`/`bra.uni` (+ предикаты `@p` / `@!p`),
@@ -77,6 +107,11 @@ tests/
 `rouge-compiler` (один PTX-файл, два пути исполнения).
 
 Спецрегистры: `%tid.x/y/z`, `%ctaid.x/y/z`, `%ntid.x/y/z`, `%nctaid.x/y/z`.
+
+Модульные `.global`/`.const`: backing store выделяет `cuModuleGetGlobal` (нулями,
+как device memory); интерпретатор видит те же адреса через `mov`/`cvta`/прямые
+`[sym]`, поэтому host-запись через возвращённый указатель видна последующим
+запускам кернелов. Хранилище живёт до `cuModuleUnload`.
 
 Расширение набора — вопрос добавления веток в `execute_kernel`; дорожная карта опкодов ведётся по мере появления реальных моделей.
 

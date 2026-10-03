@@ -102,9 +102,9 @@ cudaError_t cudaStreamCreate(cudaStream_t* pStream) {
   return cudaSuccess;
 }
 
-cudaError_t cudaStreamSynchronize(cudaStream_t /*stream*/) {
+cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
   if (auto* real = real_symbol<decltype(&cudaStreamSynchronize)>("cudaStreamSynchronize"))
-    return real(nullptr);
+    return real(stream);
   tls_last_error = cudaSuccess;
   return cudaSuccess;
 }

@@ -34,6 +34,10 @@ add_executable(test_runtime_api test_runtime_api.cpp)
 target_link_libraries(test_runtime_api PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
 add_test(NAME runtime_api COMMAND test_runtime_api)
 
+add_executable(test_driver_device_global test_driver_device_global.cpp)
+target_link_libraries(test_driver_device_global PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
+add_test(NAME driver_device_global COMMAND test_driver_device_global)
+
 add_executable(test_interposer test_interposer.cpp)
 target_compile_definitions(test_interposer PRIVATE ROUGE_SHARED_LIB="$<TARGET_FILE:rouge-cuda>")
 target_link_libraries(test_interposer PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
