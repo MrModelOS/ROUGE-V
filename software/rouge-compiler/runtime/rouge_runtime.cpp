@@ -11,9 +11,14 @@
 #include "rouge_runtime.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <pthread.h>
+
+#if defined(__linux__) && defined(__x86_64__)
+#include <sys/mman.h>
+#endif
 
 // The IR emitted by ptx2ir fills these structures by hard-coded byte offsets;
 // refuse to build on a host where the natural layout disagrees.
@@ -48,10 +53,41 @@ extern "C" int rouge_kernel_info_query(rouge_kernel_query_fn q,
 
 extern "C" void* rouge_smem_alloc(const RougeKernelInfo* info) {
   if (!info || info->smem_size == 0) return nullptr;
+#if defined(__linux__) && defined(__x86_64__)
+  // PTX address math on symbol addresses is 32-bit (mov.u32/add.s32), and
+  // the lowering keeps only the low 32 bits in those registers — exactly
+  // like hardware, where the shared window fits in 32 bits. A heap scratchpad
+  // would lose its high bits in that roundtrip (matrixMul segfaulted here),
+  // so the scratchpad lives in low memory: base + any in-bounds offset never
+  // crosses 4GB and the trunc/zext roundtrip is bit-exact. The 16 bytes
+  // before the aligned user pointer hold {mapping, length} for free().
+  const size_t need = static_cast<size_t>(info->smem_size) + 64;
+  void* map = mmap(nullptr, need, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+  if (map == MAP_FAILED) return nullptr;  // callers already fail cleanly
+  const uintptr_t user =
+      (reinterpret_cast<uintptr_t>(map) + 16 + 15) & ~uintptr_t(15);
+  static_cast<void**>(reinterpret_cast<void*>(user))[-2] = map;
+  *reinterpret_cast<size_t*>(user - 8) = need;
+  void* p = reinterpret_cast<void*>(user);
+  std::memset(p, 0, info->smem_size);
+  return p;
+#else
   return std::calloc(1, info->smem_size);
+#endif
 }
 
-extern "C" void rouge_smem_free(void* p) { std::free(p); }
+extern "C" void rouge_smem_free(void* p) {
+  if (!p) return;
+#if defined(__linux__) && defined(__x86_64__)
+  void* map = static_cast<void**>(p)[-2];
+  const size_t len = *reinterpret_cast<size_t*>(static_cast<char*>(p) - 8);
+  if (!map || len < 64) return;  // not ours: leak instead of unmapping garbage
+  munmap(map, len);
+#else
+  std::free(p);
+#endif
+}
 
 extern "C" uint32_t rouge_smem_offset(const RougeKernelInfo* info,
                                       const char* name) {

@@ -790,6 +790,15 @@ class LlvmGen {
         intrinsics_.insert("declare float @llvm.sqrt.f32(float)");
         continue;
       }
+      // fma.rn.f32 and the widened f16/bf16 fma both reach llvm.fma.f32.
+      if (op.rfind("fma.", 0) == 0 &&
+          (op.find(".f32") != std::string::npos ||
+           op.find(".f16") != std::string::npos ||
+           op.find(".bf16") != std::string::npos)) {
+        intrinsics_.insert(
+            "declare float @llvm.fma.f32(float, float, float)");
+        continue;
+      }
       if (bits == 0) continue;
       const std::string ty = int_ty(bits);
       if (op.rfind("abs.", 0) == 0 && is_signed_int_type(op))
@@ -1857,6 +1866,23 @@ class LlvmGen {
 
     const bool f32 = op.rfind(".f32") != std::string::npos;
     if (f32) {
+      // fma.rn.f32 is a 4-operand single-rounding op: routing it into the
+      // fdiv below (which reads only two operands) silently miscompiled
+      // every fma into a division (matrixMul caught this on hardware).
+      if (op.rfind("fma.", 0) == 0) {
+        if (A.size() != 4)
+          return fail("bad " + op + " operands @ " + std::to_string(idx));
+        const std::string x = load_f32(A[1]);
+        const std::string y = load_f32(A[2]);
+        const std::string z = load_f32(A[3]);
+        const std::string r = fresh("%r");
+        line("  " + r + " = call float @llvm.fma.f32(float " + x + ", float " +
+             y + ", float " + z + ")");
+        store_f32(A[0], r);
+        return true;
+      }
+      if (A.size() != 3)
+        return fail("bad " + op + " operands @ " + std::to_string(idx));
       const std::string x = load_f32(A[1]);
       const std::string y = load_f32(A[2]);
       const std::string r = fresh("%r");
@@ -2557,6 +2583,10 @@ class LlvmGen {
         line("  " + w + " = zext " + ty + " " + a + " to i64");
         line("  " + sum + " = add i64 " + w + ", " + std::to_string(off));
       }
+      // A qualified opcode names its space authoritatively, so .shared
+      // accesses resolve to the shared window even when the address sits in
+      // an unmarked register; unqualified (generic) opcodes keep the
+      // provenance fallback below.
       const std::string ptrTy =
           (space == "shared" || (space.empty() && is_shared_addr_reg(base)))
               ? shared_ptr_ty()

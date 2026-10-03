@@ -1,6 +1,7 @@
 // ptx2ir — ROUGE-V AOT compiler, stage 1 CLI.
-// Usage: ptx2ir [--target <llvm-triple>] <kernel.ptx> [output.ll]
-// Parses PTX assembly and emits textual LLVM IR for the first (.entry) kernel.
+// Usage: ptx2ir [--target <llvm-triple>] [--entry <name>] <kernel.ptx> [output.ll]
+// Parses PTX assembly and emits textual LLVM IR for one (.entry) kernel
+// (the first one, unless --entry selects another by name or 0-based index).
 // With no output path the IR goes to stdout.
 
 #include <fstream>
@@ -11,9 +12,9 @@
 #include "rougecomp/ptx_to_llvm.h"
 
 int main(int argc, char** argv) {
-  if (argc < 2 || argc > 5) {
+  if (argc < 2 || argc > 7) {
     std::cerr << "usage: " << argv[0]
-              << " [--target <llvm-triple>] <kernel.ptx> [output.ll]\n"
+              << " [--target <llvm-triple>] [--entry <name>] <kernel.ptx> [output.ll]\n"
                  "\n"
                  "targets:\n"
                  "  (default)                x86_64-pc-linux-gnu     host\n"
@@ -23,18 +24,35 @@ int main(int argc, char** argv) {
     return 2;
   }
   std::string target = "x86_64-pc-linux-gnu";
+  std::string entry;
   int i = 1;
-  // Accept both "--target X" and "--target=X".
-  if (std::string(argv[i]) == "--target") {
-    if (++i >= argc) { std::cerr << "ptx2ir: --target needs a value\n"; return 2; }
-    target = argv[i++];
-  } else if (std::string(argv[i]).rfind("--target=", 0) == 0) {
-    target = std::string(argv[i]).substr(9);
-    ++i;
+  // Accept both "--target X" and "--target=X" (same for --entry).
+  for (; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--target" || a == "--entry") {
+      if (++i >= argc) {
+        std::cerr << "ptx2ir: " << a << " needs a value\n";
+        return 2;
+      }
+      if (a == "--target")
+        target = argv[i];
+      else
+        entry = argv[i];
+    } else if (a.rfind("--target=", 0) == 0) {
+      target = a.substr(9);
+    } else if (a.rfind("--entry=", 0) == 0) {
+      entry = a.substr(8);
+    } else {
+      break;
+    }
   }
   if (i >= argc) { std::cerr << "ptx2ir: no input file\n"; return 2; }
   const std::string inPath = argv[i];
   const std::string outPath = (i + 1 < argc) ? argv[i + 1] : "";
+  if (i + 2 < argc) {
+    std::cerr << "ptx2ir: too many arguments\n";
+    return 2;
+  }
 
   std::ifstream in(inPath, std::ios::binary);
   if (!in) {
@@ -54,9 +72,34 @@ int main(int argc, char** argv) {
     std::cerr << "ptx2ir: no .entry kernels found in " << inPath << "\n";
     return 1;
   }
+  int fnIndex = 0;
+  if (!entry.empty()) {
+    // Numeric --entry selects by 0-based index, otherwise by kernel name.
+    bool numeric = !entry.empty();
+    for (char c : entry)
+      if (!std::isdigit(static_cast<unsigned char>(c))) numeric = false;
+    if (numeric) {
+      fnIndex = std::atoi(entry.c_str());
+    } else {
+      const auto it = prog->functionIndex.find(entry);
+      if (it == prog->functionIndex.end()) {
+        std::cerr << "ptx2ir: no .entry '" << entry << "' in " << inPath
+                  << "; available:";
+        for (const auto& fn : prog->functions) std::cerr << " " << fn.name;
+        std::cerr << "\n";
+        return 1;
+      }
+      fnIndex = it->second;
+    }
+    if (fnIndex < 0 || fnIndex >= static_cast<int>(prog->functions.size())) {
+      std::cerr << "ptx2ir: entry index " << fnIndex << " out of range in "
+                << inPath << " (" << prog->functions.size() << " entries)\n";
+      return 1;
+    }
+  }
 
   err.clear();
-  std::string ir = rougecomp::ptx_to_llvm_ir(*prog, 0, &err, target);
+  std::string ir = rougecomp::ptx_to_llvm_ir(*prog, fnIndex, &err, target);
   if (ir.empty()) {
     std::cerr << "ptx2ir: translation error: " << err << "\n";
     return 1;

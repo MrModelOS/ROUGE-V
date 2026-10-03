@@ -989,9 +989,140 @@ static int test_shfl_pred_all(CUmodule mod) {
 }
 
 // ---------------------------------------------------------------------------
+// Foreign kernels (genuine vendor PTX, not hand-written): executed from an
+// arbitrary .ptx FILE passed on the command line (multi-entry files need
+// ptx2ir --entry first; each cell names its entry explicitly).
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// cell: foreign_vadd -- cuda-samples vectorAdd VecAdd_kernel
+//   params: (const float* A, const float* B, float* C, int n)
+// ---------------------------------------------------------------------------
+static int test_foreign_vadd(CUmodule mod) {
+  const int N = 50000, threads = 256, blocks = (N + threads - 1) / threads;
+  printf("  config: N=%d blockDim=(%d,1,1) gridDim=(%d,1,1), vendor VecAdd_kernel\n",
+         N, threads, blocks);
+
+  CUfunction fn;
+  CK(cuModuleGetFunction(&fn, mod, "VecAdd_kernel"));
+
+  float* ha = malloc(N * 4);
+  float* hb = malloc(N * 4);
+  float* hc = malloc(N * 4);
+  float* he = malloc(N * 4);
+  for (int i = 0; i < N; ++i) {
+    ha[i] = (float)i * 0.25f;
+    hb[i] = (float)(i * 2) - 0.5f;
+    he[i] = ha[i] + hb[i];
+  }
+  memset(hc, 0x5a, N * 4);
+
+  CUdeviceptr da, db, dc;
+  CK(cuMemAlloc(&da, N * 4));
+  CK(cuMemAlloc(&db, N * 4));
+  CK(cuMemAlloc(&dc, N * 4));
+  CK(cuMemcpyHtoD(da, ha, N * 4));
+  CK(cuMemcpyHtoD(db, hb, N * 4));
+  CK(cuMemcpyHtoD(dc, hc, N * 4));
+
+  int n = N;
+  void* args[] = {&da, &db, &dc, &n};
+  CK(cuLaunchKernel(fn, blocks, 1, 1, threads, 1, 1, 0, 0, args, 0));
+  CUresult r = cuCtxSynchronize();
+  if (r != CUDA_SUCCESS) {
+    printf("  MISMATCH: launch/sync failed: %s (%s)\n", cuerr(r), cuerrstr(r));
+    return 3;
+  }
+  CK(cuMemcpyDtoH(hc, dc, N * 4));
+
+  int bad = 0, first = -1;
+  for (int i = 0; i < N; ++i)
+    if (memcmp(&hc[i], &he[i], 4) != 0) {
+      if (first < 0) first = i;
+      bad++;
+    }
+  if (!bad) {
+    printf("  OK: %d elements of vendor vectorAdd verified bit-exactly\n", N);
+    return 0;
+  }
+  printf("  MISMATCH: %d of %d elements wrong, first at i=%d\n", bad, N, first);
+  dump_words("got", hc + first, 4, 0);
+  dump_words("expected", he + first, 4, 0);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// cell: matrixmul16 -- cuda-samples matrixMul, BLOCK_SIZE 16 template
+//   params: (float* C, const float* A, const float* B, int wA, int wB)
+//   32x32 square (2x2 blocks of 16x16). Reference is the same sequential
+//   fmaf chain the kernel's unrolled fma.rn.f32 tree computes, so the
+//   comparison is bit-exact, no tolerance.
+// ---------------------------------------------------------------------------
+static int test_matrixmul16(CUmodule mod) {
+  const int SZ = 32, BS = 16, blocks = SZ / BS;
+  printf("  config: %dx%d C=A*B, blockDim=(%d,%d) gridDim=(%d,%d), vendor MatrixMulCUDA<16>\n",
+         SZ, SZ, BS, BS, blocks, blocks);
+
+  CUfunction fn;
+  CK(cuModuleGetFunction(&fn, mod, "_Z13MatrixMulCUDAILi16EEvPfS0_S0_ii"));
+
+  float* hA = malloc(SZ * SZ * 4);
+  float* hB = malloc(SZ * SZ * 4);
+  float* hC = malloc(SZ * SZ * 4);
+  float* hE = malloc(SZ * SZ * 4);
+  rng_seed(0x4d41544cull);
+  for (int i = 0; i < SZ * SZ; ++i) {
+    hA[i] = rnd_f32_in(-2.f, 2.f);
+    hB[i] = rnd_f32_in(-2.f, 2.f);
+    hE[i] = 0.f;
+  }
+  memset(hC, 0x5a, SZ * SZ * 4);
+  for (int row = 0; row < SZ; ++row)
+    for (int col = 0; col < SZ; ++col) {
+      float acc = 0.f;
+      for (int k = 0; k < SZ; ++k) acc = fmaf(hA[row * SZ + k], hB[k * SZ + col], acc);
+      hE[row * SZ + col] = acc;
+    }
+
+  CUdeviceptr dA, dB, dC;
+  CK(cuMemAlloc(&dA, SZ * SZ * 4));
+  CK(cuMemAlloc(&dB, SZ * SZ * 4));
+  CK(cuMemAlloc(&dC, SZ * SZ * 4));
+  CK(cuMemcpyHtoD(dA, hA, SZ * SZ * 4));
+  CK(cuMemcpyHtoD(dB, hB, SZ * SZ * 4));
+  CK(cuMemcpyHtoD(dC, hC, SZ * SZ * 4));
+
+  int wA = SZ, wB = SZ;
+  void* args[] = {&dC, &dA, &dB, &wA, &wB};
+  CK(cuLaunchKernel(fn, blocks, blocks, 1, BS, BS, 1, 0, 0, args, 0));
+  CUresult r = cuCtxSynchronize();
+  if (r != CUDA_SUCCESS) {
+    printf("  MISMATCH: launch/sync failed: %s (%s) -- the kernel faulted on the device\n",
+           cuerr(r), cuerrstr(r));
+    return 3;
+  }
+  CK(cuMemcpyDtoH(hC, dC, SZ * SZ * 4));
+
+  int bad = 0, first = -1;
+  for (int i = 0; i < SZ * SZ; ++i)
+    if (memcmp(&hC[i], &hE[i], 4) != 0) {
+      if (first < 0) first = i;
+      bad++;
+    }
+  if (!bad) {
+    printf("  OK: %dx%d vendor matrixMul verified bit-exactly\n", SZ, SZ);
+    return 0;
+  }
+  printf("  MISMATCH: %d of %d outputs wrong, first at %d\n", bad, SZ * SZ, first);
+  dump_words("C got", hC + first, 4, 0);
+  dump_words("C expected", hE + first, 4, 0);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
   if (argc < 3) {
-    printf("usage: %s <file.ptx> <vadd|block_reduce|fp16_reduce|gemm_tile|shfl_reduce|atom_cas|shfl_pred|vote_pred|shfl_pred_all|all>\n", argv[0]);
+    printf("usage: %s <file.ptx> <vadd|block_reduce|fp16_reduce|gemm_tile|shfl_reduce|atom_cas|shfl_pred|vote_pred|shfl_pred_all|foreign_vadd|matrixmul16|all>\n", argv[0]);
     return 2;
   }
   const char* ptx = argv[1];
@@ -1133,6 +1264,18 @@ int main(int argc, char** argv) {
     printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
     if (rc && g_exit_code == 0) g_exit_code = rc;
   }
+  if (all || strcmp(kname, "foreign_vadd") == 0) {
+    printf("== foreign_vadd ==\n");
+    rc = test_foreign_vadd(mod);
+    printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
+    if (rc && g_exit_code == 0) g_exit_code = rc;
+  }
+  if (all || strcmp(kname, "matrixmul16") == 0) {
+    printf("== matrixmul16 ==\n");
+    rc = test_matrixmul16(mod);
+    printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
+    if (rc && g_exit_code == 0) g_exit_code = rc;
+  }
   if (!all && strcmp(kname, "fp16_reduceB") == 0) {
     printf("== fp16_reduce (dataset B only) ==\n");
     rc = test_fp16_reduce(mod, 1);
@@ -1158,7 +1301,8 @@ int main(int argc, char** argv) {
       strcmp(kname, "fp16_reduce") && strcmp(kname, "gemm_tile") &&
       strcmp(kname, "shfl_reduce") && strcmp(kname, "atom_cas") &&
       strcmp(kname, "shfl_pred") && strcmp(kname, "vote_pred") &&
-      strcmp(kname, "shfl_pred_all") &&
+      strcmp(kname, "shfl_pred_all") && strcmp(kname, "foreign_vadd") &&
+      strcmp(kname, "matrixmul16") &&
       strcmp(kname, "fp16_reduceB") && strcmp(kname, "gemm_tileB") &&
       strcmp(kname, "gemm_tile2")) {
     printf("unknown kernel '%s'\n", kname);

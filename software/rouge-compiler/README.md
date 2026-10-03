@@ -109,7 +109,7 @@ global — `addrspace(1)` у обоих GPU-бэкендов, shared — `addrsp
 |---|---|
 | Параметры | `ld.param.{u32,u64}` (+s/b) |
 | Пересылки | `mov.{u32,u64,f32,u16,f16,bf16}`, `cvta.to.global.*`, `cvta.to.shared.*`, `cvta.local.*` (депо `.local`) |
-| Арифметика | `add/sub/mul.{u32,s64,…}`, `add/sub/mul/div.f32`, `mul.wide.{u,s}32`, `add/sub/mul/div.f16`, `add/sub/mul.rn.bf16`, `fma.rn.{f16,bf16}` |
+| Арифметика | `add/sub/mul.{u32,s64,…}`, `add/sub/mul/div.f32`, `fma.rn.f32` (одиночное округление), `mul.wide.{u,s}32`, `add/sub/mul/div.f16`, `add/sub/mul.rn.bf16`, `fma.rn.{f16,bf16}` |
 | Преобразования | `cvt.{u64.u32,u32.u64,s64.s32,s32.s64}`, `cvt.{f32↔u32/s32}`, `cvt.{f32↔f16, f32↔bf16, f16↔bf16, f16/bf16↔int}` (`rn`-квалификатор) |
 | Сравнения | `setp.{ge,gt,lt,le,eq,ne}.u32` |
 | Предикаты/ветвления | `@p bra`, `bra`, `ret`, `exit` |
