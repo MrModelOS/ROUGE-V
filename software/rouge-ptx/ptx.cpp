@@ -1,7 +1,11 @@
 #include "ptx.h"
 
+#include <atomic>
 #include <cctype>
 #include <cmath>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -454,6 +458,10 @@ std::unique_ptr<PtxProgram> parse_ptx(const std::string& text, std::string* erro
   // Module-scope ".extern .shared" lines (dynamic shared, nvcc puts them
   // before the entries): stashed here, attached to every function below.
   std::vector<std::string> externShared;
+  // Module-scope static .shared/.local (nvcc 13 emits kernel __shared__ arrays
+  // outside .entry); attached to every function after the body loop.
+  std::vector<std::string> moduleShared;
+  std::vector<std::string> moduleLocal;
 
   while (std::getline(ss, line)) {
     ++lineNo;
@@ -500,6 +508,15 @@ std::unique_ptr<PtxProgram> parse_ptx(const std::string& text, std::string* erro
       // the module; stashed and attached to each function after the loop.
       if (s.rfind(".extern", 0) == 0 && s.find(".shared") != std::string::npos)
         externShared.push_back(s);
+      // nvcc 13 declares kernel-scope static __shared__ arrays at MODULE
+      // scope, outside any .entry ("_ZZ...E2As[1024]" for matrixMul). Such a
+      // declaration still belongs to every kernel of the module, so stash the
+      // line and hand it to each function once the body is closed. Dropping
+      // it silently left the symbol unresolved: addresses resolved to zero,
+      // every store hit one cell and loops such as matrixMul's tile fill
+      // never terminated.
+      if (s.rfind(".shared", 0) == 0) moduleShared.push_back(s);
+      if (s.rfind(".local", 0) == 0) moduleLocal.push_back(s);
       // ".extern .global/.const ..." (nvcc emits these for unused C++ markers):
       // record like a normal global so a use resolves to a real external
       // symbol (link/JIT fails loudly if nobody defines it) instead of
@@ -590,6 +607,14 @@ std::unique_ptr<PtxProgram> parse_ptx(const std::string& text, std::string* erro
   // dynamic region base lands after each kernel's static scratchpad.
   for (const std::string& decl : externShared)
     for (auto& fn : prog->functions) parse_shared_decl(decl, &fn);
+  // Module-scope static .shared/.local from nvcc 13 (see the comment at the
+  // collection site): these belong to every kernel in the module, and their
+  // laid-out offsets must be assigned AFTER the function's own declarations
+  // so the per-kernel scratchpad layout stays contiguous.
+  for (const std::string& decl : moduleShared)
+    for (auto& fn : prog->functions) parse_shared_decl(decl, &fn);
+  for (const std::string& decl : moduleLocal)
+    for (auto& fn : prog->functions) parse_local_decl(decl, &fn);
 
   return prog;
 }
@@ -648,12 +673,41 @@ uint64_t read_mem(const uint8_t* p, int width) {
   return v;
 }
 
+// Parse a PTX float literal into its IEEE bit pattern. PTX writes floats as
+// "0f3F800000" (raw hex of the 32-bit pattern) or "0d3FF0000000000000"
+// (f64), and sometimes as a decimal value ("1f3f800000" is never seen; plain
+// decimal floats do not appear in nvcc output but "1.0" does appear in some
+// hand-written PTX). Returns false when tok is not a float literal.
+bool parse_float_literal(const std::string& tok, uint64_t* bits, int* width) {
+  if (tok.size() < 3) return false;
+  const char kind = tok[1];
+  if (kind != 'f' && kind != 'F' && kind != 'd' && kind != 'D') return false;
+  const std::string digits = tok.substr(2);
+  for (char c : digits)
+    if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
+  if (digits.empty()) return false;
+  if (kind == 'f' || kind == 'F') {
+    *bits = std::strtoull(digits.c_str(), nullptr, 16);
+    *width = 32;
+    return true;
+  }
+  *bits = std::strtoull(digits.c_str(), nullptr, 16);
+  *width = 64;
+  return true;
+}
+
 // Read an operand that may be a special register, an immediate literal, or a GPR.
 uint64_t operand_u64(const ExecState& st, const std::string& tok) {
   uint64_t v = 0;
   if (st.spec_reg(tok, &v)) return v;
-  if (!tok.empty() && (std::isdigit(static_cast<unsigned char>(tok[0])) || tok[0] == '-'))
+  if (!tok.empty() && (std::isdigit(static_cast<unsigned char>(tok[0])) || tok[0] == '-')) {
+    // "0f3F800000" is a float literal, not the integer 0: strtoull would
+    // stop at the 'f' and silently yield 0 (vendor PTX is full of these).
+    uint64_t fbits = 0;
+    int fw = 0;
+    if (parse_float_literal(tok, &fbits, &fw) && fw == 32) return fbits;
     return static_cast<uint64_t>(std::strtoull(tok.c_str(), nullptr, 10));
+  }
   return st.reg(tok);
 }
 
@@ -973,12 +1027,32 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       // "mov.b64 %SPL, __local_depot0": materialise the thread depot address.
       // A module-scope .global/.const source resolves to its backing store
       // (same rule as cvta above); anything else is a register/immediate.
+      //
+      // "mov.u32 %r11, smem_symbol" (nvcc 13 demoted-shared form) also
+      // materialises the scratchpad ADDRESS into a 32-bit register: the
+      // symbol must win over the register lookup, otherwise the register
+      // silently reads 0 and every thread of the block stores to address
+      // zero (reduction's tree loop then never converges).
+      uintptr_t shared = 0;
       uintptr_t local = 0;
       uint64_t gbase = 0;
-      if (local_symbol_addr(fn, st, A[1], &local))
-        st.setreg(A[0], static_cast<uint64_t>(local));
+      const auto dst_is32 = op == "mov.u32" || op == "mov.s32" || op == "mov.b32";
+      // A 32-bit destination keeps the low 32 bits of the address, exactly as
+      // the hardware and the AOT path do (fit_reg / width_mask). This is only
+      // sound because the interpreter's scratchpad lives in low memory
+      // (see scratchpad_base below), so base + in-bounds offset never crosses
+      // 4GB — the same invariant the AOT runtime establishes with MAP_32BIT.
+      const auto put_addr = [&](uint64_t a) {
+        st.setreg(A[0], dst_is32 ? static_cast<uint64_t>(static_cast<uint32_t>(a)) : a);
+      };
+      if (shared_symbol_addr(fn, st, A[1], &shared))
+        put_addr(static_cast<uint64_t>(shared));
+      else if (local_symbol_addr(fn, st, A[1], &local))
+        put_addr(static_cast<uint64_t>(local));
       else if (module_global_addr(A[1], &gbase))
-        st.setreg(A[0], gbase);
+        put_addr(gbase);
+      else if (dst_is32)
+        st.setreg(A[0], static_cast<uint64_t>(static_cast<uint32_t>(operand_u64(st, A[1]))));
       else
         st.setreg(A[0], operand_u64(st, A[1]));
       st.pc = next_pc;
@@ -1003,13 +1077,18 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
 
     if (op == "add.s64" || op == "add.u64" || op == "add.u32" || op == "add.s32") {
       if (A.size() < 3) { if (error) *error = "bad add in " + fn.name; return 0; }
-      st.setreg(A[0], operand_u64(st, A[1]) + operand_u64(st, A[2]));
+      const uint64_t r = operand_u64(st, A[1]) + operand_u64(st, A[2]);
+      // A 32-bit form wraps at 32 bits (width_mask in the AOT path does the
+      // same); leaving the high bits would let a sign/zero-extended 32-bit
+      // value leak into an address computation.
+      st.setreg(A[0], op.back() == '2' ? width_mask(r, 32) : r);
       st.pc = next_pc;
       return 1;
     }
     if (op == "sub.s64" || op == "sub.u64" || op == "sub.u32" || op == "sub.s32") {
       if (A.size() < 3) { if (error) *error = "bad sub in " + fn.name; return 0; }
-      st.setreg(A[0], operand_u64(st, A[1]) - operand_u64(st, A[2]));
+      const uint64_t r = operand_u64(st, A[1]) - operand_u64(st, A[2]);
+      st.setreg(A[0], op.back() == '2' ? width_mask(r, 32) : r);
       st.pc = next_pc;
       return 1;
     }
@@ -1412,11 +1491,13 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       if (A.size() < 2) { if (error) *error = "bad cvt in " + fn.name; return 0; }
       const std::string full = op.substr(4);  // "<mod>.<dst>.<src>"
 
-      // Saturating and explicitly-rounded conversions (cvt.sat.*, cvt.rz/rn/
-      // ru/rp/rm/rzi.*) are deliberately not emulated: they need PTX's
-      // saturation and rounding rules, so fail loudly instead of silently
-      // handing back the source bits. ".rn" stays legal for the f16/bf16
-      // narrowing handled below.
+      // Saturating and explicitly-rounded conversions (cvt.sat.*, cvt.rz/ru/rp/
+      // rm/rzi.*) are deliberately not emulated: they need PTX's saturation
+      // and rounding rules, so fail loudly instead of silently handing back
+      // the source bits. ".rn" is legal in two cases and falls through to the
+      // ordinary conversion below: the f16/bf16 narrowing handled there, and
+      // integer-to-float ("cvt.rn.f32.s32" from nvcc's threadFence code),
+      // where round-to-nearest-even IS the default conversion.
       {
         std::stringstream mods(full);
         std::string mt;
@@ -1424,8 +1505,12 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
           const bool is_round = mt == "rn" || mt == "rz" || mt == "rm" ||
                                 mt == "rp" || mt == "ru" || mt == "rzi";
           if (mt != "sat" && !is_round) continue;
-          if (mt == "rn" && (op.find(".f16") != std::string::npos ||
-                             op.find(".bf16") != std::string::npos))
+          if (mt == "rn" &&
+              (op.find(".f16") != std::string::npos ||
+               op.find(".bf16") != std::string::npos ||
+               // int -> float, any width: RNE is the only defined behaviour
+               op.find(".f32") != std::string::npos ||
+               op.find(".f64") != std::string::npos))
             continue;
           if (error)
             *error = "unsupported rounding/saturating conversion '" + op +
@@ -1435,7 +1520,15 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       }
 
       std::string spec = full;
-      if (spec.rfind("rn.", 0) == 0) spec = spec.substr(3);  // cvt.rn.f16.f32 etc.
+      // Drop a leading rounding/saturation modifier so "rn.f32.s32" parses as
+      // dst="f32", src="s32" (the modifier itself was validated above).
+      {
+        const size_t firstDot = spec.find('.');
+        const std::string head = firstDot == std::string::npos ? spec : spec.substr(0, firstDot);
+        if (head == "rn" || head == "rz" || head == "rm" || head == "rp" ||
+            head == "ru" || head == "rzi" || head == "sat")
+          spec = firstDot == std::string::npos ? std::string() : spec.substr(firstDot + 1);
+      }
       const size_t dot = spec.find('.');
       const std::string dst = dot == std::string::npos ? spec : spec.substr(0, dot);
       const std::string src = dot == std::string::npos ? "" : spec.substr(dot + 1);
@@ -1608,24 +1701,64 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
 
     if (op.rfind("setp.", 0) == 0) {
       if (A.size() < 3) { if (error) *error = "bad setp in " + fn.name; return 0; }
-      const uint32_t x = static_cast<uint32_t>(operand_u64(st, A[1]));
-      const uint32_t y = static_cast<uint32_t>(operand_u64(st, A[2]));
+      const uint64_t xu = operand_u64(st, A[1]);
+      const uint64_t yu = operand_u64(st, A[2]);
       const size_t d1 = op.find('.');
       std::string cond = (d1 == std::string::npos) ? "ge" : op.substr(d1 + 1);
       const size_t d2 = cond.find('.');
+      const std::string ty = (d2 == std::string::npos) ? std::string() : cond.substr(d2 + 1);
       if (d2 != std::string::npos) cond = cond.substr(0, d2);
+      // Signedness comes from the PTX type suffix, not the condition:
+      // setp.gt.s32 %p, %r, -1 is a signed compare (vendor PTX from nvcc
+      // 13 always emits .s32), so ignoring ".s" silently misjudges every
+      // negative operand. Width follows the suffix; eq/ne are width-free.
+      const bool is64 = (ty == "s64" || ty == "u64" || ty == "b64");
+      const bool signed_cmp = (ty == "s32" || ty == "s64");
+      int64_t xs = 0, ys = 0;
+      if (is64) {
+        xs = static_cast<int64_t>(xu);
+        ys = static_cast<int64_t>(yu);
+      } else {
+        xs = static_cast<int32_t>(static_cast<uint32_t>(xu));
+        ys = static_cast<int32_t>(static_cast<uint32_t>(yu));
+      }
       bool r = false;
-      if (cond == "ge") r = x >= y;
-      else if (cond == "gt") r = x > y;
-      else if (cond == "lt") r = x < y;
-      else if (cond == "le") r = x <= y;
-      else if (cond == "eq") r = x == y;
-      else if (cond == "ne") r = x != y;
-      else {
-        if (error) *error = "unsupported setp condition '" + cond + "' in " + fn.name;
-        return false;
+      if (cond == "eq") r = (is64 ? xu == yu : static_cast<uint32_t>(xu) == static_cast<uint32_t>(yu));
+      else if (cond == "ne") r = (is64 ? xu != yu : static_cast<uint32_t>(xu) != static_cast<uint32_t>(yu));
+      else if (signed_cmp) {
+        if (cond == "ge") r = xs >= ys;
+        else if (cond == "gt") r = xs > ys;
+        else if (cond == "lt") r = xs < ys;
+        else if (cond == "le") r = xs <= ys;
+        else {
+          if (error) *error = "unsupported setp condition '" + cond + "' in " + fn.name;
+          return 0;
+        }
+      } else {
+        const uint64_t x = is64 ? xu : static_cast<uint32_t>(xu);
+        const uint64_t y = is64 ? yu : static_cast<uint32_t>(yu);
+        if (cond == "ge") r = x >= y;
+        else if (cond == "gt") r = x > y;
+        else if (cond == "lt") r = x < y;
+        else if (cond == "le") r = x <= y;
+        else {
+          if (error) *error = "unsupported setp condition '" + cond + "' in " + fn.name;
+          return 0;
+        }
       }
       st.preds[A[0]] = r;
+      st.pc = next_pc;
+      return 1;
+    }
+
+    // Memory fences and system-level barriers (membar.gl from __threadfence(),
+    // membar.sys, fence.*). On a CPU backend every thread runs on its own
+    // core over host memory, where the compiler and the CPU already provide
+    // the release/acquire ordering these instructions request; the fence is
+    // therefore a no-op that must never be emulated as a hardware counter.
+    // Atomic RMWs that follow it are real host atomics (see the atomic block).
+    if (op.rfind("membar.", 0) == 0 || op.rfind("fence.", 0) == 0) {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
       st.pc = next_pc;
       return 1;
     }
@@ -2126,6 +2259,33 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
   // CTA-sized thread states for one block, stepped in lockstep (SIMT).
   const size_t threadsPerBlock = static_cast<size_t>(bz) * by * bx;
 
+  // Per-block .shared scratchpad, one mapping reused by every block (blocks
+  // are stepped sequentially, so a single region suffices).
+  //
+  // The region is mapped LOW (MAP_32BIT) on purpose: nvcc addresses shared
+  // arrays with 32-bit arithmetic ("mov.u32 %r, sym; add.s32 %r, %r, %off"),
+  // and a scratchpad above 4GB would lose its high bits in that roundtrip and
+  // fault on st.shared — the exact reason the AOT runtime maps its scratchpad
+  // the same way (rouge_runtime.cpp: rouge_smem_alloc).
+  size_t smemBytes = fn.sharedSize > 0 ? static_cast<size_t>(fn.sharedSize) : 1;
+  void* smemMap = nullptr;
+  std::vector<uint8_t> smemHeap;
+#if defined(__linux__) && defined(__x86_64__)
+  const size_t need = smemBytes + 64;
+  void* map = mmap(nullptr, need, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+  if (map != MAP_FAILED) smemMap = map;
+#endif
+  if (smemMap == nullptr) {
+    smemHeap.assign(smemBytes, 0);  // fallback: heap (offsets then must fit 32 bits)
+    smemMap = smemHeap.data();
+  }
+  auto smem_release = [&]() {
+#if defined(__linux__) && defined(__x86_64__)
+    if (!smemHeap.empty()) munmap(smemMap, smemBytes + 64);
+#endif
+  };
+
   // Module-global backing storage (if the API layer provided any) is
   // visible to every address-resolution path for the whole launch.
   g_global_bases = globalBases;
@@ -2133,9 +2293,11 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
   for (uint64_t bz_i = 0; bz_i < gz; ++bz_i)
     for (uint64_t by_i = 0; by_i < gy; ++by_i)
       for (uint64_t bx_i = 0; bx_i < gx; ++bx_i) {
-        // Per-block scratchpad for .shared variables (one per CTA).
-        std::vector<uint8_t> shared(fn.sharedSize > 0 ? fn.sharedSize : 1, 0);
-        const uintptr_t sharedBase = reinterpret_cast<uintptr_t>(shared.data());
+        // Per-block scratchpad for .shared variables (one per CTA): the low
+        // mapping is zeroed fresh for every block, since each CTA sees its own
+        // copy of shared memory.
+        std::memset(smemMap, 0, smemBytes);
+        const uintptr_t sharedBase = reinterpret_cast<uintptr_t>(smemMap);
 
         std::vector<ExecState> states(threadsPerBlock);
         std::vector<bool> alive(threadsPerBlock, true);
@@ -2175,15 +2337,18 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
             if (!alive[i] || blocked[i]) continue;
             anyAlive = true;
             if (++steps > kMaxSteps) {
-              if (error) *error = "emulation step limit exceeded (runaway loop?) in " + fn.name;
+              if (error)
+                *error = "emulation step limit exceeded (runaway loop?) in " + fn.name;
               g_block_states = nullptr;
               g_global_bases = nullptr;
+              smem_release();
               return false;
             }
             const int rc = run_thread_step(fn, paramsBlob, states[i], error);
             if (rc == 0) {
               g_block_states = nullptr;
               g_global_bases = nullptr;
+              smem_release();
               return false;
             }
             if (rc == 2) blocked[i] = true;
@@ -2203,6 +2368,7 @@ bool execute_kernel(const PtxProgram& prog, int fnIndex,
         g_block_states = nullptr;
       }
   g_global_bases = nullptr;
+  smem_release();
   return true;
 }
 

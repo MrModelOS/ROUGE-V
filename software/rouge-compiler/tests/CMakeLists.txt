@@ -231,6 +231,25 @@ if(CLANG_EXECUTABLE AND CUDA_DRIVER_INCLUDE_DIR AND CUDA_DRIVER_LIBRARY)
   add_executable(gpu_exec_runreal gpu_exec_runreal.c)
   target_include_directories(gpu_exec_runreal PRIVATE ${CUDA_DRIVER_INCLUDE_DIR})
   target_link_libraries(gpu_exec_runreal PRIVATE ${CUDA_DRIVER_LIBRARY})
+  add_executable(gpu_exec_vendor gpu_exec_vendor.c)
+  target_include_directories(gpu_exec_vendor PRIVATE ${CUDA_DRIVER_INCLUDE_DIR})
+  target_link_libraries(gpu_exec_vendor PRIVATE ${CUDA_DRIVER_LIBRARY} m)
+
+  # Tier-1 vendor kernels: genuine nvcc output in kernels/vendor/*.ptx, run
+  # through OUR NVPTX lowering and checked on the card. Multi-entry modules,
+  # so each cell names its entry explicitly.
+  add_test(NAME compiler_nvptx_vendor_gpu_exec
+    COMMAND ${CMAKE_COMMAND}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DPTX2IR=$<TARGET_FILE:ptx2ir>
+      -DRUNNER=$<TARGET_FILE:gpu_exec_vendor>
+      -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
+      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/vendor-gpu-exec
+      "-DCELLS=vecAdd.VecAdd_kernel,matrixMul._Z13MatrixMulCUDAILi16EEvPfS0_S0_ii,transpose.transposeCoalesced,reduction.blockSum,threadFence.fenceProducer"
+      -DSM=sm_75
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/vendor_gpu.cmake)
+  set_tests_properties(compiler_nvptx_vendor_gpu_exec PROPERTIES
+    SKIP_REGULAR_EXPRESSION "NO-DEVICE|SKIP-OLD-ARCH")
 
   # kernel.selector cells: dataset A for fp16/gemm, dataset B, a two-block grid
   # proving the nctaid path, warp shuffles, and cas/exch/min/max atomics.

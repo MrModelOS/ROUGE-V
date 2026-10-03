@@ -1310,6 +1310,18 @@ class LlvmGen {
       return true;
     }
 
+    // Memory fences and system barriers: __threadfence() -> membar.gl,
+    // also membar.sys / membar.cta / fence.*. The semantics requested are
+    // release/acquire on the memory space, which on both targets is already
+    // provided by the underlying memory model: on the host the following
+    // atomic RMWs are host atomics, and on the GPU the hardware enforces
+    // them. A fence must never be dropped silently by accident, so it is an
+    // explicit seq_cst fence (stronger than asked, never weaker).
+    if (op.rfind("membar.", 0) == 0 || op.rfind("fence.", 0) == 0) {
+      line("  fence seq_cst");
+      return true;
+    }
+
     if (op == "bra" || op == "bra.uni" || op == "ret" || op == "exit") return true;
 
     return fail("unsupported PTX op '" + op + "' @ " + std::to_string(idx) +
