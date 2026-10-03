@@ -181,6 +181,7 @@ class LlvmGen {
   const rouge::PtxProgram* prog_ = nullptr;  // for module-scope .global decls
   std::string target_ = "x86_64-pc-linux-gnu";
   std::set<std::string> shared_addr_regs_;  // written by cvta.to.shared
+  std::set<std::string> local_addr_regs_;  // .local depot addresses (generic ptrs)
   std::string smem_sym_;    // GPU block scratchpad global
   std::string smem_decl_;  // its module-level declaration, emitted with the header
   // Pointer type per SSA value, so memory operations can print "ptr addrspace(N)"
@@ -256,6 +257,16 @@ class LlvmGen {
   }
 
   // ---- register typing ---------------------------------------------------
+
+  // A token names a register when it is declared in .reg (covers %SP/%SPL,
+  // which end in no digit) or matches the %r0/%rd1/%p2 pattern (covers
+  // undeclared uses, which default to 32 bits). Symbols (.shared/.global/
+  // .local names, special registers) live in their own tables and never
+  // match, so this cannot misclassify them.
+  bool is_reg(const std::string& tok) const {
+    if (fn_->regBits.find(tok) != fn_->regBits.end()) return true;
+    return is_register(tok);
+  }
 
   int reg_bits(const std::string& reg) const {
     const auto it = fn_->regBits.find(reg);
@@ -337,7 +348,7 @@ class LlvmGen {
   // LLVM type an operand must be read as: a literal takes the width the
   // mnemonic declares (a literal has no type of its own), a register its own.
   std::string operand_type(const std::string& tok, int bits) const {
-    return is_register(tok) ? reg_type(tok) : int_ty(bits);
+    return is_reg(tok) ? reg_type(tok) : int_ty(bits);
   }
   // A conversion produces a value of the width its *mnemonic* names, while the
   // destination register may be wider or narrower. Line the two up (zext when
@@ -747,7 +758,7 @@ class LlvmGen {
     const size_t bar = dst.find('|');
     if (bar != std::string::npos) dst = dst.substr(0, bar);
     if (reg_type(dst) != "i32") return false;
-    if (is_register(ins.args[1]) && reg_type(ins.args[1]) != "i32") return false;
+    if (is_reg(ins.args[1]) && reg_type(ins.args[1]) != "i32") return false;
     *kind = k;
     return true;
   }
@@ -815,18 +826,18 @@ class LlvmGen {
     const auto is_label = [this](const std::string& tok) {
       return labels_.find(tok) != labels_.end();
     };
-    const auto add_reg = [&used, &is_label](const std::string& tok) {
+    const auto add_reg = [&](const std::string& tok) {
       // Hardware special registers (%clock64, %warpid, ...) are read from
       // intrinsics, never from an alloca: allocating one would silently feed
       // garbage into the kernel (clock.ptx caught this).
       if (!sreg_llvm_ty(tok).empty()) return;
-      if (is_register(tok) && !is_label(tok)) used.insert(tok);
+      if (is_reg(tok) && !is_label(tok)) used.insert(tok);
       // Predicated destinations arrive as "r10|p1" — allocate the guard too.
       const size_t bar = tok.find('|');
       if (bar != std::string::npos && bar + 1 < tok.size()) {
         std::string g = tok.substr(bar + 1);
         if (!g.empty() && g[0] == '%') g = g.substr(1);
-        if (is_register(g) && !is_label(g)) used.insert(g);
+        if (is_reg(g) && !is_label(g)) used.insert(g);
       }
     };
     for (const auto& ins : body_) {
@@ -934,6 +945,7 @@ class LlvmGen {
       // (the form nvcc emits for spilled stack frames).
       if (find_local(A[1])) {
         store_reg(A[0], fit_reg(A[0], local_addr(A[1]), "i64"));
+        local_addr_regs_.insert(A[0]);  // stays a generic pointer
         return true;
       }
       // Width mismatch (e.g. mov.b16 %h, %r32): fit the bit pattern,
@@ -941,7 +953,7 @@ class LlvmGen {
       // width_mask (an unconditional trunc miscompiles i32 -> i64 moves).
       const std::string dstTy = reg_type(A[0]);
       std::string val = operand(A[1]);  // register or numeric immediate
-      if (is_register(A[1]) && reg_type(A[1]) != dstTy)
+      if (is_reg(A[1]) && reg_type(A[1]) != dstTy)
         val = fit_reg(A[0], val, reg_type(A[1]));
       store_reg(A[0], val);
       return true;
@@ -982,6 +994,36 @@ class LlvmGen {
       // conversion is an identity copy, width-fitted like the interpreter.
       if (A.size() != 2) return fail("bad " + op + " operands @ " + std::to_string(idx));
       store_reg(A[0], fit_reg(A[0], operand(A[1]), reg_type(A[1])));
+      local_addr_regs_.insert(A[0]);  // stays a generic pointer
+      return true;
+    }
+    if (op.rfind("cvta.", 0) == 0) {
+      // Plain cvta.space without .to (the form clang's CUDA frontend emits,
+      // e.g. cvta.shared.u64 %rd, %r): a register-to-register address-space
+      // annotation. Addresses are plain i64 everywhere here, so this is an
+      // identity copy, width-fitted like the interpreter — but the window
+      // provenance (shared/local marks) must flow through, or generic
+      // accesses via the result resolve to the wrong address space.
+      if (A.size() != 2) return fail("bad " + op + " operands @ " + std::to_string(idx));
+      // A symbol source (cvta.shared.u64 %rd, sym) takes the shared window
+      // path with its laid-out offset, like cvta.to.shared.
+      int symOff = 0, symConst = 0;
+      if (shared_symbol(A[1], &symOff, &symConst)) {
+        const std::string base = shared_base_for(A[1]);
+        const std::string addr = fresh("%sa");
+        line("  " + addr + " = add i64 " + base + ", " +
+             std::to_string(symOff + symConst));
+        shared_addr_regs_.insert(A[0]);
+        store_reg(A[0], fit_reg(A[0], addr, "i64"));
+        return true;
+      }
+      const std::string srcTy =
+          is_reg(A[1]) ? reg_type(A[1]) : std::string("i64");
+      store_reg(A[0], fit_reg(A[0], operand(A[1]), srcTy));
+      if (is_reg(A[1]) && is_shared_addr_reg(A[1]))
+        shared_addr_regs_.insert(A[0]);
+      if (is_reg(A[1]) && is_local_addr_reg(A[1]))
+        local_addr_regs_.insert(A[0]);
       return true;
     }
 
@@ -1052,7 +1094,7 @@ class LlvmGen {
           setPred = dst.substr(bar + 1);
           dst = dst.substr(0, bar);
           if (!setPred.empty() && setPred[0] == '%') setPred = setPred.substr(1);
-          if (setPred.empty() || !is_register(setPred))
+          if (setPred.empty() || !is_reg(setPred))
             return fail("bad shfl set predicate '" + A[0] + "' @ " +
                         std::to_string(idx));
         }
@@ -1067,11 +1109,11 @@ class LlvmGen {
                 static_cast<long long>(std::strtoll(t.c_str(), nullptr, 16)));
           return t;
         };
-        const std::string src = is_register(A[1]) ? operand(A[1]) : imm(A[1]);
-        const std::string b = is_register(A[2]) ? operand(A[2]) : imm(A[2]);
-        const std::string c = is_register(A[3]) ? operand(A[3]) : imm(A[3]);
+        const std::string src = is_reg(A[1]) ? operand(A[1]) : imm(A[1]);
+        const std::string b = is_reg(A[2]) ? operand(A[2]) : imm(A[2]);
+        const std::string c = is_reg(A[3]) ? operand(A[3]) : imm(A[3]);
         const std::string mask =
-            sync ? (is_register(A[4]) ? operand(A[4]) : imm(A[4])) : "-1";
+            sync ? (is_reg(A[4]) ? operand(A[4]) : imm(A[4])) : "-1";
         const std::string v = fresh("%sh");
         line("  " + v + " = call i32 @llvm.nvvm.shfl.sync." + kind +
              ".i32(i32 " + mask + ", i32 " + src + ", i32 " + b + ", i32 " + c +
@@ -1120,7 +1162,7 @@ class LlvmGen {
       // with zext and shrinking with trunc, like the interpreter's width_mask.
       const std::string dstTy = reg_type(dst);
       std::string srcVal = operand(A[1]);
-      if (is_register(A[1]) && reg_type(A[1]) != dstTy)
+      if (is_reg(A[1]) && reg_type(A[1]) != dstTy)
         srcVal = fit_reg(dst, srcVal, reg_type(A[1]));
       // Always write the value; SET the predicate per PTX ISA 9.7.10.6.
       store_reg(dst, srcVal);
@@ -1144,13 +1186,13 @@ class LlvmGen {
           const std::string laneMod = fresh("%shlm");
           line("  " + laneMod + " = urem i32 " + tid + ", 32");
           std::string offRaw =
-              is_register(A[2]) ? operand(A[2]) : normalize_literal(A[2]);
+              is_reg(A[2]) ? operand(A[2]) : normalize_literal(A[2]);
           offRaw = dec(offRaw);
           const std::string off5 = fresh("%shoff");
           line("  " + off5 + " = and i32 " + offRaw + ", 31");
           std::string clRaw("31");
           if (A.size() >= 4)
-            clRaw = is_register(A[3]) ? operand(A[3])
+            clRaw = is_reg(A[3]) ? operand(A[3])
                                       : dec(normalize_literal(A[3]));
           const std::string cl5 = fresh("%shcl");
           line("  " + cl5 + " = and i32 " + clRaw + ", 31");
@@ -1205,7 +1247,7 @@ class LlvmGen {
           return t;
         };
         const std::string mask =
-            vsync ? (is_register(A[2]) ? operand(A[2]) : decimm(A[2])) : "-1";
+            vsync ? (is_reg(A[2]) ? operand(A[2]) : decimm(A[2])) : "-1";
         const std::string v = fresh("%vt");
         line("  " + v + " = call i1 @llvm.nvvm.vote." + vkind + ".sync(i32 " +
              mask + ", i1 " + pv + ")");
@@ -1305,7 +1347,7 @@ class LlvmGen {
       return std::to_string(static_cast<long long>(
           raw & static_cast<unsigned long long>(mask)));
     }
-    if (!is_register(tok) || reg_type(tok) != ty) return val;
+    if (!is_reg(tok) || reg_type(tok) != ty) return val;
     const std::string m = fresh("%sh");
     line("  " + m + " = and " + ty + " " + val + ", " + std::to_string(mask));
     return m;
@@ -1824,7 +1866,7 @@ class LlvmGen {
     if (f16 || bf16) {
       const char* irTy = f16 ? "half" : "bfloat";
       for (const auto& a : A)
-        if (is_register(a) && reg_bits(a) != 16)
+        if (is_reg(a) && reg_bits(a) != 16)
           return fail(op + " needs 16-bit registers (@ " + std::to_string(idx) + ")");
       const auto widen = [&](const std::string& r) {
         const std::string h = load16(r, irTy);
@@ -1901,6 +1943,25 @@ class LlvmGen {
     const std::string r = fresh("%r");
     line("  " + r + " = " + ll + " " + ty + " " + x + ", " + y);
     store_reg(A[0], r);
+    // Address provenance flows through add/sub (never mul: a product of an
+    // address is not an address): "add.s64 %rd22, %rd21, %rd19" keeps the
+    // shared/local window of its sources, so generic accesses through the
+    // derived register resolve to the right address space (clang-emitted
+    // generic ld.b32 [%rd] over shared memory caught this on NVPTX).
+    if (op[0] == 'a' || op[0] == 's') {
+      const auto marked = [&](const std::string& t) {
+        return is_reg(t) &&
+               (is_shared_addr_reg(t) || is_local_addr_reg(t));
+      };
+      const std::string* src =
+          (A.size() > 1 && marked(A[1]))
+              ? &A[1]
+              : (A.size() > 2 && marked(A[2]) ? &A[2] : nullptr);
+      if (src != nullptr) {
+        if (is_shared_addr_reg(*src)) shared_addr_regs_.insert(A[0]);
+        if (is_local_addr_reg(*src)) local_addr_regs_.insert(A[0]);
+      }
+    }
     (void)idx;
     return true;
   }
@@ -2111,7 +2172,7 @@ class LlvmGen {
     if (spec.find("x2") != std::string::npos) {
       std::string val = operand(A[1]);
       const std::string dstTy = reg_type(A[0]);
-      if (is_register(A[1]) && reg_type(A[1]) != dstTy) {
+      if (is_reg(A[1]) && reg_type(A[1]) != dstTy) {
         const std::string t = fresh("%t");
         if (reg_bits(A[1]) < reg_bits(A[0]))
           line("  " + t + " = zext " + reg_type(A[1]) + " " + val + " to " + dstTy);
@@ -2127,15 +2188,15 @@ class LlvmGen {
     // round exactly like the interpreter's software conversions.
     const bool src16 = src == "f16" || src == "bf16";
     const bool dst16 = dst == "f16" || dst == "bf16";
-    if (dst16 && is_register(A[0]) && reg_bits(A[0]) != 16)
+    if (dst16 && is_reg(A[0]) && reg_bits(A[0]) != 16)
       return fail(ins.op + " needs a 16-bit destination (@ " +
                   std::to_string(idx) + ")");
-    if (src16 && is_register(A[1]) && reg_bits(A[1]) != 16)
+    if (src16 && is_reg(A[1]) && reg_bits(A[1]) != 16)
       return fail(ins.op + " needs a 16-bit source (@ " + std::to_string(idx) + ")");
     if (dst16) {
       const char* irTy = dst == "f16" ? "half" : "bfloat";
       if (src == "f32" || src == "f64") {
-        if (is_register(A[1]) && reg_bits(A[1]) != 32)
+        if (is_reg(A[1]) && reg_bits(A[1]) != 32)
           return fail(ins.op + " needs a 32-bit float source (@ " +
                       std::to_string(idx) + ")");
         const std::string f = load_f32(A[1]);
@@ -2397,6 +2458,13 @@ class LlvmGen {
     if (!gpu_addrspaces()) return "ptr";
     return is_amdgpu() ? "ptr addrspace(5)" : "ptr addrspace(3)";
   }
+  // Thread-local spill depots: NVPTX numbers its local window 5, so a
+  // depot address through the generic space makes the backend guess (and
+  // ptxas reject) a global access to a stack slot. Everywhere else the
+  // generic pointer is already right (host flat memory, AMDGPU allocas).
+  std::string local_ptr_ty() const {
+    return is_nvptx() ? "ptr addrspace(5)" : "ptr";
+  }
 
   // Turn an i64 host-visible address into a typed pointer.
   std::string inttoptr_as(const std::string& i64val, const std::string& ty) {
@@ -2410,6 +2478,13 @@ class LlvmGen {
   bool is_shared_addr_reg(const std::string& reg) const {
     return shared_addr_regs_.count(reg) != 0;
   }
+  // True when a register holds a .local depot address (mov from a .local
+  // symbol or cvta.local). Such addresses must stay generic pointers:
+  // defaulting them to the global space makes ptxas reject the backend's
+  // st.global to a stack address (clang-emitted spill code caught this).
+  bool is_local_addr_reg(const std::string& reg) const {
+    return local_addr_regs_.count(reg) != 0;
+  }
 
   std::string addr_of(const std::string& reg_tok, const std::string& space = "") {
     std::string a = load_reg(reg_tok);
@@ -2421,8 +2496,13 @@ class LlvmGen {
       line("  " + w + " = zext " + reg_type(reg_tok) + " " + a + " to i64");
       a = w;
     }
+    // A qualified opcode names its space authoritatively; a .local depot
+    // address (or any provenance-marked shared address under a generic
+    // opcode) keeps its own window instead of defaulting to global.
     if (space == "shared" || (space.empty() && is_shared_addr_reg(reg_tok)))
       return inttoptr_as(a, shared_ptr_ty());
+    if (space.empty() && is_local_addr_reg(reg_tok))
+      return inttoptr_as(a, local_ptr_ty());
     return inttoptr_as(a, global_ptr_ty());
   }
 
@@ -2586,11 +2666,15 @@ class LlvmGen {
       // A qualified opcode names its space authoritatively, so .shared
       // accesses resolve to the shared window even when the address sits in
       // an unmarked register; unqualified (generic) opcodes keep the
-      // provenance fallback below.
-      const std::string ptrTy =
-          (space == "shared" || (space.empty() && is_shared_addr_reg(base)))
-              ? shared_ptr_ty()
-              : global_ptr_ty();
+      // provenance fallback below (shared marks, then local marks, else the
+      // global window).
+      std::string ptrTy;
+      if (space == "shared" || (space.empty() && is_shared_addr_reg(base)))
+        ptrTy = shared_ptr_ty();
+      else if (space.empty() && is_local_addr_reg(base))
+        ptrTy = local_ptr_ty();
+      else
+        ptrTy = global_ptr_ty();
       return inttoptr_as(sum, ptrTy);
     }
     return addr_of(inner, space);
@@ -2703,9 +2787,13 @@ class LlvmGen {
       store_reg(A[0], v);
       return true;
     }
+    // Plain 32-bit load (u32/s32/b32, qualified or generic). A 64-bit
+    // destination (the form clang's CUDA frontend emits, e.g. ld.s32 %rd4)
+    // takes the word zero-extended — the interpreter's rule, so both paths
+    // agree bit-for-bit.
     const std::string v = fresh("%v");
     line("  " + v + " = load i32, " + pt(addr) + " " + addr + ", align 4");
-    store_reg(A[0], v);
+    store_reg(A[0], fit_reg(A[0], v, "i32"));
     return true;
   }
 

@@ -131,7 +131,9 @@ void parse_reg_decl(const std::string& line, std::unordered_map<std::string, int
                                : 32;
   while (ss >> tok) {
     std::string t = trim(tok);
-    if (!t.empty() && t.back() == ',') t.pop_back();
+    // Trailing ',' (comma lists) and ';' (end of declaration, e.g. a lone
+    // ".reg .b64 %SP;") are not part of the name.
+    while (!t.empty() && (t.back() == ',' || t.back() == ';')) t.pop_back();
     if (t.empty() || t[0] != '%') continue;
     const size_t lt = t.find('<');
     if (lt != std::string::npos) {  // range form "%r<9>" -> %r0..%r8
