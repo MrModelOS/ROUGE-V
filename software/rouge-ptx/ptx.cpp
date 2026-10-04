@@ -2549,8 +2549,16 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       // Split brace groups: {d..}, {a..}, {b..}, {c..}.
       std::vector<std::vector<std::string>> groups;
       {
+        // Brace groups split operands: a token starting with '{' opens a new
+        // group (so a lone "{%r9}" is its own group instead of gluing to the
+        // address token before it); a token ending with '}' closes it.
         std::vector<std::string> cur;
         for (const auto& a : A) {
+          const std::string t = trim(a);
+          if (!t.empty() && t.front() == '{' && !cur.empty()) {
+            groups.push_back(cur);
+            cur.clear();
+          }
           cur.push_back(vector_reg_name(a));
           if (!a.empty() && a.back() == '}') {
             groups.push_back(cur);
@@ -2741,6 +2749,188 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
         } else {
           for (int s = 0; s < 4; ++s)
             st.setreg(groups[0][s], static_cast<uint64_t>(bit_cast_v<uint32_t>(acc[s])));
+        }
+      }
+      st.pc = next_pc;
+      return 1;
+    }
+
+    // ---- ldmatrix / stmatrix (warp-collective shared-memory matrix move) ----
+    // One or more 8x8 .b16 matrices collectively moved between shared memory
+    // and registers, PTX ISA 9.7.16.5.15/16 (only .m8n8/.b16: the sm_75 form
+    // real kernels use; .m16n16/.m8n16/.b8/.s4 are sm_90+/sm_100a+ and refuse
+    // loudly below).
+    //
+    // Addressing (transcribed from the spec): eight threads provide row-start
+    // addresses (threads 0-7 matrix 0, 8-15 matrix 1, ...); a group of four
+    // consecutive threads moves a whole row, thread t taking elements
+    // ((t%4)*2, (t%4)*2+1) of row (t%8) of matrix ((t/8)%num). For .x1 every
+    // thread takes matrix 0 (lower addresses are copied up, per the sm_75
+    // note). .trans swaps the receive assignment to columns (addresses still
+    // name rows, so coverage is complete).
+    if (op.rfind("ldmatrix.sync.", 0) == 0 || op.rfind("stmatrix.sync.", 0) == 0) {
+      const bool isLoad = op[0] == 'l';
+      if (!g_block_states) {
+        if (error) *error = std::string(isLoad ? "ldmatrix" : "stmatrix") +
+                            " outside a warp context in " + fn.name;
+        return 0;
+      }
+      std::vector<std::string> q;
+      {
+        std::stringstream ss(op);
+        std::string t;
+        while (std::getline(ss, t, '.')) q.push_back(t);
+      }
+      // q = [ldmatrix,sync,aligned,m8n8,x4,trans?,shared(::cta)?,b16]
+      std::string shape, num, type;
+      bool trans = false, sharedQ = false;
+      for (const auto& t : q) {
+        if (t == "ldmatrix" || t == "stmatrix" || t == "sync" || t == "aligned")
+          continue;
+        else if (t == "m8n8") shape = t;
+        else if (t == "x1" || t == "x2" || t == "x4") num = t;
+        else if (t == "trans") trans = true;
+        else if (t == "shared" || t == "shared::cta") sharedQ = true;
+        else if (t == "b16" || t == "b8") type = t;
+        else {
+          if (error)
+            *error = "unsupported " + std::string(isLoad ? "ldmatrix" : "stmatrix") +
+                     " qualifier '" + t + "' in " + fn.name;
+          return 0;
+        }
+      }
+      (void)sharedQ;  // generic addresses into shared resolve the same way
+      if (shape != "m8n8" || type != "b16" ||
+          (num != "x1" && num != "x2" && num != "x4")) {
+        if (error)
+          *error = "unsupported " + std::string(isLoad ? "ldmatrix" : "stmatrix") +
+                   " form '" + op + "' in " + fn.name +
+                   " (supported: .m8n8.x{1,2,4}[.trans].b16)";
+        return 0;
+      }
+      const int nMat = (num == "x4") ? 4 : (num == "x2") ? 2 : 1;
+      // Operands: ldmatrix {d..}, [addr] | stmatrix [addr], {r..}.
+      std::vector<std::vector<std::string>> groups;
+      {
+        // Same brace-group rule as ldmatrix above (a lone "{b0}" is its own
+        // group, e.g. the single-.b32 B fragment of integer/fp8 mma).
+        std::vector<std::string> cur;
+        for (const auto& a : A) {
+          const std::string t = trim(a);
+          if (!t.empty() && t.front() == '{' && !cur.empty()) {
+            groups.push_back(cur);
+            cur.clear();
+          }
+          cur.push_back(vector_reg_name(a));
+          if (!a.empty() && a.back() == '}') {
+            groups.push_back(cur);
+            cur.clear();
+          }
+        }
+        if (!cur.empty()) groups.push_back(cur);
+      }
+      // After grouping: ldmatrix -> [{d..}, {addr}]; stmatrix -> [{addr}, {r..}].
+      // The address token keeps its brackets ([addr] / [reg+off]).
+      if (groups.size() != 2 || (int)groups[isLoad ? 0 : 1].size() != nMat) {
+        if (error)
+          *error = "bad " + std::string(isLoad ? "ldmatrix" : "stmatrix") +
+                   " operands in '" + op + "' in " + fn.name;
+        return 0;
+      }
+      const std::vector<std::string>& fragRegs = groups[isLoad ? 0 : 1];
+      const std::string addrTok = groups[isLoad ? 1 : 0][0];
+      // Address operand: [reg] or [reg+off] (spec: Addresses as Operands).
+      const std::string inner = strip_brackets(addrTok);
+      std::string addrBase;
+      int64_t addrOff = 0;
+      {
+        std::string base;
+        int64_t off = 0;
+        if (split_reg_offset(inner, &base, &off)) {
+          addrBase = base;
+          addrOff = off;
+        } else {
+          addrBase = inner;
+        }
+      }
+      const uint32_t linear0 =
+          st.tid[0] + st.tid[1] * st.ntid[0] + st.tid[2] * st.ntid[0] * st.ntid[1];
+      const uint32_t warpBase0 = linear0 - (linear0 % 32);
+      // Row-start address per lane (threads that provide none still carry a
+      // usable address in well-formed code; sm_75 note).
+      uintptr_t rowAddr[32];
+      for (uint32_t l = 0; l < 32; ++l) {
+        const size_t si = static_cast<size_t>(warpBase0 + l);
+        if (si >= g_block_states->size()) {
+          rowAddr[l] = 0;
+          continue;
+        }
+        const ExecState& ls = (*g_block_states)[si];
+        uint64_t base = 0;
+        // The address operand names a register (possibly with +/- offset).
+        // A bare .shared symbol is also legal PTX ([smem]); resolve it.
+        {
+          uintptr_t sym = 0;
+          if (shared_symbol_addr(fn, ls, addrBase, &sym))
+            base = sym;
+          else if (local_symbol_addr(fn, ls, addrBase, &sym))
+            base = sym;
+          else
+            base = ls.reg(addrBase);
+        }
+        rowAddr[l] = static_cast<uintptr_t>(base + static_cast<uint64_t>(addrOff));
+      }
+      if (isLoad) {
+        // Each thread takes 2x u16 of its (matrix, row/column). The provider
+        // lane for element (r, c) of matrix m is m*8+r (it supplied that
+        // row's start address); the element sits at rowAddr + c*2. For x1/x2
+        // the matrices repeat ((l/8)%num), reusing the lower lanes' row
+        // addresses (sm_75 note). With .trans the thread takes column
+        // elements instead (addresses still name rows, so coverage holds).
+        for (uint32_t l = 0; l < 32; ++l) {
+          const size_t si = static_cast<size_t>(warpBase0 + l);
+          if (si >= g_block_states->size()) continue;
+          const int m = static_cast<int>((l / 8) % static_cast<uint32_t>(nMat));
+          const int e0 = static_cast<int>((l % 4) * 2);
+          const int fixed = static_cast<int>(l % 8);
+          uint16_t els[2] = {0, 0};
+          for (int e = 0; e < 2; ++e) {
+            const int r = trans ? (e0 + e) : fixed;
+            const int c = trans ? fixed : (e0 + e);
+            const uint32_t provider = static_cast<uint32_t>(m * 8 + r);
+            if (provider >= 32) continue;
+            const uintptr_t at =
+                rowAddr[provider] + static_cast<uintptr_t>(c * 2);
+            uint16_t v = 0;
+            std::memcpy(&v, reinterpret_cast<const void*>(at), 2);
+            els[e] = v;
+          }
+          ExecState& ls = (*g_block_states)[si];
+          ls.setreg(fragRegs[m],
+                    static_cast<uint64_t>(els[0]) |
+                        (static_cast<uint64_t>(els[1]) << 16));
+        }
+      } else {
+        // Store: thread t's fragment goes to its (matrix, row/column).
+        for (uint32_t l = 0; l < 32; ++l) {
+          const size_t si = static_cast<size_t>(warpBase0 + l);
+          if (si >= g_block_states->size()) continue;
+          const ExecState& ls = (*g_block_states)[si];
+          const int m = static_cast<int>((l / 8) % static_cast<uint32_t>(nMat));
+          const uint32_t v = static_cast<uint32_t>(ls.reg(fragRegs[m]));
+          const uint16_t els[2] = {static_cast<uint16_t>(v & 0xffffu),
+                                   static_cast<uint16_t>((v >> 16) & 0xffffu)};
+          const int e0 = static_cast<int>((l % 4) * 2);
+          const int fixed = static_cast<int>(l % 8);
+          for (int e = 0; e < 2; ++e) {
+            const int r = trans ? (e0 + e) : fixed;
+            const int c = trans ? fixed : (e0 + e);
+            const uint32_t provider = static_cast<uint32_t>(m * 8 + r);
+            if (provider >= 32) continue;
+            const uintptr_t at =
+                rowAddr[provider] + static_cast<uintptr_t>(c * 2);
+            std::memcpy(reinterpret_cast<void*>(at), &els[e], 2);
+          }
         }
       }
       st.pc = next_pc;

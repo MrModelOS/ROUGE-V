@@ -1,0 +1,264 @@
+// ROUGE-V canonical kernel: ldmatrix/stmatrix roundtrip (m8n8, b16).
+//
+// One warp (32 threads): each thread writes 2x f16 into an 8x8 input tile in
+// .shared (value = row*8+col), ldmatrix.x1 the tile into a register, then
+// stmatrix.x1 into an output tile, then copies its 2 elements to global.
+// Non-trans must roundtrip exactly; .trans must transpose exactly.
+// A second entry does the x4 variant (4 stacked 8x8 matrices).
+.version 9.4
+.target sm_75
+.address_size 64
+
+.visible .entry ldmatrix_tile(
+    .param .u64 ldmatrix_tile_param_0
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<4>;
+    .shared .align 2 .b8 tile_in[128];
+    .shared .align 2 .b8 tile_out[128];
+
+    ld.param.u64 %rd1, [ldmatrix_tile_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.shared.u64 %rd2, tile_in;
+    cvta.to.shared.u64 %rd3, tile_out;
+
+    mov.u32 %r2, %tid.x;
+    and.b32 %r3, %r2, 7;        // row = tid % 8
+    shr.u32 %r4, %r2, 3;        // tid / 8
+    and.b32 %r4, %r4, 3;
+    shl.b32 %r4, %r4, 1;        // col0 = ((tid/8)%4)*2: 4 потока строки кроют 8 столбцов
+
+    // fill input tile: in[row][col0..col0+1] = row*8+col (as f16)
+    shl.b32 %r5, %r3, 3;        // row*8
+    add.s32 %r5, %r5, %r4;      // row*8+col0
+    cvt.f32.s32 %f1, %r5;
+    cvt.f16.f32 %r6, %f1;
+    add.s32 %r5, %r5, 1;
+    cvt.f32.s32 %f1, %r5;
+    cvt.f16.f32 %r7, %f1;
+    shl.b32 %r7, %r7, 16;
+    or.b32 %r6, %r6, %r7;       // packed pair
+    shl.b32 %r7, %r3, 4;        // row*16 bytes
+    shl.b32 %r8, %r4, 1;        // col0*2 bytes
+    add.s64 %rd4, %rd2, %r7;
+    add.s64 %rd4, %rd4, %r8;
+    st.shared.b32 [%rd4], %r6;
+
+    bar.sync 0;
+
+    // address of our row start (all threads provide a valid address)
+    shl.b32 %r7, %r3, 4;
+    add.s64 %rd5, %rd2, %r7;
+    // x1 load of the whole tile (matrix 0 for every thread)
+    ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r9}, [%rd5];
+    // x1 store to the output tile (same row layout)
+    shl.b32 %r7, %r3, 4;
+    add.s64 %rd6, %rd3, %r7;
+    stmatrix.sync.aligned.m8n8.x1.shared.b16 [%rd6], {%r9};
+
+    bar.sync 0;
+
+    // copy our 2 elements back to global: out[tid*2 + e]. The copy reads
+    // the STORE positions (row tid%8, cols (tid%4)*2), not the fill positions.
+    and.b32 %r14, %r2, 3;
+    shl.b32 %r14, %r14, 1;      // out-col0 = (tid%4)*2
+    shl.b32 %r7, %r3, 4;
+    shl.b32 %r8, %r14, 1;
+    add.s64 %rd4, %rd3, %r7;
+    add.s64 %rd4, %rd4, %r8;
+    ld.shared.b32 %r10, [%rd4];
+    // mode 0: plain copy; mode 1: transpose check happens on host
+    // (the kernel always copies; transposition is a separate entry below)
+    shl.b32 %r11, %r2, 1;       // tid*2 elements
+    shl.b32 %r11, %r11, 2;      // tid*8 bytes (2x f32 out)
+    add.s64 %rd5, %rd1, %r11;
+    // unpack the pair to two f32 stores for easy host comparison
+    and.b32 %r12, %r10, 65535;
+    shr.u32 %r13, %r10, 16;
+    cvt.f32.f16 %f2, %r12;
+    cvt.f32.f16 %f3, %r13;
+    st.global.f32 [%rd5], %f2;
+    st.global.f32 [%rd5+4], %f3;
+    ret;
+}
+
+.visible .entry ldmatrix_trans(
+    .param .u64 ldmatrix_trans_param_0
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<4>;
+    .shared .align 2 .b8 tile_in[128];
+    .shared .align 2 .b8 tile_out[128];
+
+    ld.param.u64 %rd1, [ldmatrix_trans_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.shared.u64 %rd2, tile_in;
+    cvta.to.shared.u64 %rd3, tile_out;
+
+    mov.u32 %r2, %tid.x;
+    and.b32 %r3, %r2, 7;        // row = tid % 8
+    shr.u32 %r4, %r2, 3;        // tid / 8
+    and.b32 %r4, %r4, 3;
+    shl.b32 %r4, %r4, 1;        // col0 = ((tid/8)%4)*2: 4 потока строки кроют 8 столбцов
+
+    shl.b32 %r5, %r3, 3;
+    add.s32 %r5, %r5, %r4;
+    cvt.f32.s32 %f1, %r5;
+    cvt.f16.f32 %r6, %f1;
+    add.s32 %r5, %r5, 1;
+    cvt.f32.s32 %f1, %r5;
+    cvt.f16.f32 %r7, %f1;
+    shl.b32 %r7, %r7, 16;
+    or.b32 %r6, %r6, %r7;
+    shl.b32 %r7, %r3, 4;
+    shl.b32 %r8, %r4, 1;
+    add.s64 %rd4, %rd2, %r7;
+    add.s64 %rd4, %rd4, %r8;
+    st.shared.b32 [%rd4], %r6;
+
+    bar.sync 0;
+
+    shl.b32 %r7, %r3, 4;
+    add.s64 %rd5, %rd2, %r7;
+    // transposed load: thread takes column elements
+    ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {%r9}, [%rd5];
+    // store back to the same row layout (so the copy-out reads columns)
+    shl.b32 %r7, %r3, 4;
+    add.s64 %rd6, %rd3, %r7;
+    stmatrix.sync.aligned.m8n8.x1.shared.b16 [%rd6], {%r9};
+
+    bar.sync 0;
+
+    // copy-out reads the STORE positions: row tid%8, cols (tid%4)*2.
+    and.b32 %r14, %r2, 3;
+    shl.b32 %r14, %r14, 1;
+    shl.b32 %r7, %r3, 4;
+    shl.b32 %r8, %r14, 1;
+    add.s64 %rd4, %rd3, %r7;
+    add.s64 %rd4, %rd4, %r8;
+    ld.shared.b32 %r10, [%rd4];
+    shl.b32 %r11, %r2, 1;
+    shl.b32 %r11, %r11, 2;
+    add.s64 %rd5, %rd1, %r11;
+    and.b32 %r12, %r10, 65535;
+    shr.u32 %r13, %r10, 16;
+    cvt.f32.f16 %f2, %r12;
+    cvt.f32.f16 %f3, %r13;
+    st.global.f32 [%rd5], %f2;
+    st.global.f32 [%rd5+4], %f3;
+    ret;
+}
+
+.visible .entry ldmatrix_x4(
+    .param .u64 ldmatrix_x4_param_0
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<4>;
+    .shared .align 2 .b8 tiles_in[512];
+    .shared .align 2 .b8 tiles_out[512];
+
+    ld.param.u64 %rd1, [ldmatrix_x4_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.shared.u64 %rd2, tiles_in;
+    cvta.to.shared.u64 %rd3, tiles_out;
+
+    // Each thread fills its (matrix m=(tid/8)%4, row tid%8) fragment position
+    // with a matrix-tagged value: in = m*1000 + row*8 + col.
+    mov.u32 %r2, %tid.x;
+    and.b32 %r3, %r2, 7;        // row
+    shr.u32 %r4, %r2, 3;        // tid/8
+    and.b32 %r4, %r4, 3;        // m = (tid/8)%4
+    // One thread owns (m, row) alone, so it fills all 8 columns itself:
+    // col0 = 0,2,4,6 unrolled (value = m*128+100+row*8+col, f16-exact).
+    shl.b32 %r6, %r4, 7;        // m*128
+    shl.b32 %r7, %r3, 3;        // row*8
+    add.s32 %r6, %r6, %r7;
+    add.s32 %r6, %r6, 100;       // base = m*128+100+row*8 (max 547: f16-exact)
+    shl.b32 %r9, %r4, 7;        // m*128
+    shl.b32 %r10, %r3, 4;       // row*16
+    add.s64 %rd4, %rd2, %r9;
+    add.s64 %rd4, %rd4, %r10;   // tiles_in + m*128 + row*16
+    mov.u32 %r5, 0;             // col0 = 0
+    cvt.f32.s32 %f1, %r6;
+    cvt.f16.f32 %r7, %f1;
+    add.s32 %r6, %r6, 1;
+    cvt.f32.s32 %f1, %r6;
+    cvt.f16.f32 %r8, %f1;
+    shl.b32 %r8, %r8, 16;
+    or.b32 %r7, %r7, %r8;
+    st.shared.b32 [%rd4], %r7;
+    add.s32 %r6, %r6, 1;        // col0 = 2
+    cvt.f32.s32 %f1, %r6;
+    cvt.f16.f32 %r7, %f1;
+    add.s32 %r6, %r6, 1;
+    cvt.f32.s32 %f1, %r6;
+    cvt.f16.f32 %r8, %f1;
+    shl.b32 %r8, %r8, 16;
+    or.b32 %r7, %r7, %r8;
+    st.shared.b32 [%rd4+4], %r7;
+    add.s32 %r6, %r6, 1;        // col0 = 4
+    cvt.f32.s32 %f1, %r6;
+    cvt.f16.f32 %r7, %f1;
+    add.s32 %r6, %r6, 1;
+    cvt.f32.s32 %f1, %r6;
+    cvt.f16.f32 %r8, %f1;
+    shl.b32 %r8, %r8, 16;
+    or.b32 %r7, %r7, %r8;
+    st.shared.b32 [%rd4+8], %r7;
+    add.s32 %r6, %r6, 1;        // col0 = 6
+    cvt.f32.s32 %f1, %r6;
+    cvt.f16.f32 %r7, %f1;
+    add.s32 %r6, %r6, 1;
+    cvt.f32.s32 %f1, %r6;
+    cvt.f16.f32 %r8, %f1;
+    shl.b32 %r8, %r8, 16;
+    or.b32 %r7, %r7, %r8;
+    st.shared.b32 [%rd4+12], %r7;
+
+    bar.sync 0;
+
+    // Each thread provides its matrix row address (m*128 + row*16).
+    shl.b32 %r9, %r4, 7;
+    shl.b32 %r10, %r3, 4;
+    add.s64 %rd5, %rd2, %r9;
+    add.s64 %rd5, %rd5, %r10;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r9, %r10, %r11, %r12}, [%rd5];
+    // Store all four matrices back at the same layout. (Fresh regs: %r9-%r12
+    // hold the loaded fragments and must survive until the store.)
+    shl.b32 %r0, %r4, 7;
+    shl.b32 %r1, %r3, 4;
+    add.s64 %rd6, %rd3, %r0;
+    add.s64 %rd6, %rd6, %r1;
+    stmatrix.sync.aligned.m8n8.x4.shared.b16 [%rd6], {%r9, %r10, %r11, %r12};
+
+    bar.sync 0;
+
+    // Copy our matrix fragment back: out[tid*2+e] (store layout: row tid%8,
+    // cols (tid%4)*2 — same reasoning as the x1 kernel).
+    and.b32 %r14, %r2, 3;
+    shl.b32 %r14, %r14, 1;
+    shl.b32 %r0, %r4, 7;
+    shl.b32 %r1, %r3, 4;
+    shl.b32 %r5, %r14, 1;
+    add.s64 %rd4, %rd3, %r0;
+    add.s64 %rd4, %rd4, %r1;
+    add.s64 %rd4, %rd4, %r5;
+    ld.shared.b32 %r13, [%rd4];
+    shl.b32 %r11, %r2, 1;
+    shl.b32 %r11, %r11, 2;
+    add.s64 %rd5, %rd1, %r11;
+    and.b32 %r14, %r13, 65535;
+    shr.u32 %r15, %r13, 16;
+    cvt.f32.f16 %f2, %r14;
+    cvt.f32.f16 %f3, %r15;
+    st.global.f32 [%rd5], %f2;
+    st.global.f32 [%rd5+4], %f3;
+    ret;
+}

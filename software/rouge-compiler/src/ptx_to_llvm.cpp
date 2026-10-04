@@ -1324,12 +1324,15 @@ class LlvmGen {
 
     if (op == "bra" || op == "bra.uni" || op == "ret" || op == "exit") return true;
 
-    // mma.sync needs warp-cooperative fragment exchange across lanes. The
-    // interpreter executes it exactly (see rouge-ptx/ptx.cpp); the AOT path
-    // lowers it once a cross-lane exchange channel exists (Wave 3, step 2:
-    // per-launch exchange region through the launch descriptor). Refusing
-    // loudly beats silently computing one lane's fragment as the whole tile.
-    if (op.rfind("mma.", 0) == 0 || op.rfind("wmma.", 0) == 0)
+    // mma.sync / ldmatrix / stmatrix need warp-cooperative fragment exchange
+    // across lanes. The interpreter executes them exactly (see
+    // rouge-ptx/ptx.cpp); the AOT path lowers them once a cross-lane exchange
+    // channel exists (Wave 3, step 2: per-launch exchange region through the
+    // launch descriptor). Refusing loudly beats silently computing one lane's
+    // fragment as the whole tile.
+    if (op.rfind("mma.", 0) == 0 || op.rfind("wmma.", 0) == 0 ||
+        op.rfind("ldmatrix.", 0) == 0 || op.rfind("stmatrix.", 0) == 0 ||
+        op.rfind("movmatrix.", 0) == 0)
       return fail("warp-cooperative '" + op + "' @ " + std::to_string(idx) +
                   " is interpreter-only for now (Wave 3 step 2 tracks the AOT"
                   " exchange lowering)");
