@@ -36,12 +36,25 @@ static_assert(offsetof(RougeSharedVar, count) == 24, "ABI: count@24");
 //   0..44: 12 x i32 special registers (tid/ctaid/ntid/nctaid xyz)
 //   48   : i64 scratchpad base (block .shared memory)
 //   56   : i64 barrier handle
+//   64   : i64 exchange base (per-block warp-exchange region, see below)
 namespace {
 struct LaunchDesc {
   int32_t spec[12];
   uint64_t smem;      // 48
   uint64_t barrier;   // 56
+  uint64_t exchange;  // 64
 };
+// Warp-exchange slot: one 64-byte slot per thread in the block, indexed by
+// linear tid (tid.x + tid.y*ntid.x + tid.z*ntid.x*ntid.y).
+//   +0 : i64 row address published by this lane (ldmatrix/stmatrix)
+//   +8 : up to 14 x i32 fragment words published by this lane (mma A/B/C)
+// The region is per-block scratch memory owned by the driver (one allocation
+// per block, threads*64 bytes); a warp-collective op publishes, executes a
+// block barrier (stronger than warp scope, still correct), then reads the
+// peers' slots. Reused sequentially by every collective in the kernel.
+static constexpr size_t kExchangeSlot = 64;
+static constexpr size_t kExchangeAddrOff = 0;
+static constexpr size_t kExchangeFragOff = 8;
 }  // namespace
 
 extern "C" int rouge_kernel_info_query(rouge_kernel_query_fn q,
@@ -98,6 +111,13 @@ extern "C" uint32_t rouge_smem_offset(const RougeKernelInfo* info,
   }
   return UINT32_MAX;
 }
+
+extern "C" void* rouge_exchange_alloc(uint32_t threads) {
+  if (threads == 0) return nullptr;
+  return std::calloc(static_cast<size_t>(threads), kExchangeSlot);
+}
+
+extern "C" void rouge_exchange_free(void* p) { std::free(p); }
 
 // bar.sync 0 -> block-wide barrier. Blocks until all threads of the block have
 // arrived. A null barrier (kernels without bar.sync) is a no-op.

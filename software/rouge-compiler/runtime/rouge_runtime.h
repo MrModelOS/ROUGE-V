@@ -14,6 +14,8 @@
 //   0..44: 12 x i32 special registers (tid/ctaid/ntid/nctaid xyz)
 //   48   : i64 scratchpad base (block .shared memory)
 //   56   : i64 barrier handle
+//   64   : i64 exchange base (per-block warp-exchange region for
+//         mma/ldmatrix/stmatrix; null when the kernel uses none)
 
 #ifndef ROUGE_RUNTIME_H_
 #define ROUGE_RUNTIME_H_
@@ -57,6 +59,13 @@ void rouge_smem_free(void* p);
 // Byte offset of a .shared symbol, or UINT32_MAX when the kernel has no such
 // variable.
 uint32_t rouge_smem_offset(const RougeKernelInfo* info, const char* name);
+
+// Warp-exchange region for mma/ldmatrix/stmatrix (host AOT path): one 64-byte
+// slot per thread in the block. Allocate threads*64 zeroed bytes per block and
+// store the pointer at launch-descriptor offset 64; free after the block joins.
+// May return null on allocation failure (callers fail cleanly).
+void* rouge_exchange_alloc(uint32_t threads);
+void rouge_exchange_free(void* p);
 
 // bar.sync 0 -> block-wide barrier (pthread barrier on the host, fence on
 // RISC-V). A null launch descriptor or a null barrier handle is a no-op.

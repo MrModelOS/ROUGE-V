@@ -2761,13 +2761,12 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
     // real kernels use; .m16n16/.m8n16/.b8/.s4 are sm_90+/sm_100a+ and refuse
     // loudly below).
     //
-    // Addressing (transcribed from the spec): eight threads provide row-start
-    // addresses (threads 0-7 matrix 0, 8-15 matrix 1, ...); a group of four
-    // consecutive threads moves a whole row, thread t taking elements
-    // ((t%4)*2, (t%4)*2+1) of row (t%8) of matrix ((t/8)%num). For .x1 every
-    // thread takes matrix 0 (lower addresses are copied up, per the sm_75
-    // note). .trans swaps the receive assignment to columns (addresses still
-    // name rows, so coverage is complete).
+    // Addressing (transcribed from the spec): eight threads per matrix provide
+    // row-start addresses (threads 0-7 matrix 0, 8-15 matrix 1, 16-23 matrix 2,
+    // 24-31 matrix 3); a group of four consecutive threads moves a whole row
+    // and EVERY thread receives a fragment of EVERY matrix: thread t takes row
+    // t%8, elements (t%4)*2 and +1. .trans swaps the receive side to columns
+    // (the addresses still name rows, so coverage stays complete).
     if (op.rfind("ldmatrix.sync.", 0) == 0 || op.rfind("stmatrix.sync.", 0) == 0) {
       const bool isLoad = op[0] == 'l';
       if (!g_block_states) {
@@ -2880,56 +2879,47 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
         }
         rowAddr[l] = static_cast<uintptr_t>(base + static_cast<uint64_t>(addrOff));
       }
-      if (isLoad) {
-        // Each thread takes 2x u16 of its (matrix, row/column). The provider
-        // lane for element (r, c) of matrix m is m*8+r (it supplied that
-        // row's start address); the element sits at rowAddr + c*2. For x1/x2
-        // the matrices repeat ((l/8)%num), reusing the lower lanes' row
-        // addresses (sm_75 note). With .trans the thread takes column
-        // elements instead (addresses still name rows, so coverage holds).
-        for (uint32_t l = 0; l < 32; ++l) {
-          const size_t si = static_cast<size_t>(warpBase0 + l);
-          if (si >= g_block_states->size()) continue;
-          const int m = static_cast<int>((l / 8) % static_cast<uint32_t>(nMat));
-          const int e0 = static_cast<int>((l % 4) * 2);
-          const int fixed = static_cast<int>(l % 8);
+      // Every thread receives a fragment from EVERY matrix (PTX ISA
+      // 9.7.16.5.15: "each component of the vector expression holds a fragment
+      // from the corresponding matrix"; for .x2 the second matrix lands in the
+      // next register *in each thread*). Thread t takes row t%8 of each matrix,
+      // elements (t%4)*2 and +1; the row's start address comes from the lane
+      // that provided it: threads 0-7 for matrix 0, 8-15 for matrix 1, and so
+      // on (the .num table in the spec). With .trans the thread takes column
+      // elements instead; the addresses still name rows, so coverage holds.
+      for (uint32_t l = 0; l < 32; ++l) {
+        const size_t si = static_cast<size_t>(warpBase0 + l);
+        if (si >= g_block_states->size()) continue;
+        const int e0 = static_cast<int>((l % 4) * 2);
+        const int fixed = static_cast<int>(l % 8);
+        for (int m = 0; m < nMat; ++m) {
           uint16_t els[2] = {0, 0};
           for (int e = 0; e < 2; ++e) {
             const int r = trans ? (e0 + e) : fixed;
             const int c = trans ? fixed : (e0 + e);
+            // Lane that supplied matrix m's row r's address.
             const uint32_t provider = static_cast<uint32_t>(m * 8 + r);
             if (provider >= 32) continue;
             const uintptr_t at =
                 rowAddr[provider] + static_cast<uintptr_t>(c * 2);
-            uint16_t v = 0;
-            std::memcpy(&v, reinterpret_cast<const void*>(at), 2);
-            els[e] = v;
+            if (isLoad) {
+              uint16_t v = 0;
+              std::memcpy(&v, reinterpret_cast<const void*>(at), 2);
+              els[e] = v;
+            } else {
+              // stmatrix: this thread's fragment register for matrix m goes to
+              // the shared window at the same (row, column) position.
+              const uint32_t v = static_cast<uint32_t>(
+                  (*g_block_states)[si].reg(fragRegs[m]));
+              const uint16_t bits = static_cast<uint16_t>(
+                  (e == 0 ? (v & 0xffffu) : ((v >> 16) & 0xffffu)));
+              std::memcpy(reinterpret_cast<void*>(at), &bits, 2);
+            }
           }
-          ExecState& ls = (*g_block_states)[si];
-          ls.setreg(fragRegs[m],
-                    static_cast<uint64_t>(els[0]) |
-                        (static_cast<uint64_t>(els[1]) << 16));
-        }
-      } else {
-        // Store: thread t's fragment goes to its (matrix, row/column).
-        for (uint32_t l = 0; l < 32; ++l) {
-          const size_t si = static_cast<size_t>(warpBase0 + l);
-          if (si >= g_block_states->size()) continue;
-          const ExecState& ls = (*g_block_states)[si];
-          const int m = static_cast<int>((l / 8) % static_cast<uint32_t>(nMat));
-          const uint32_t v = static_cast<uint32_t>(ls.reg(fragRegs[m]));
-          const uint16_t els[2] = {static_cast<uint16_t>(v & 0xffffu),
-                                   static_cast<uint16_t>((v >> 16) & 0xffffu)};
-          const int e0 = static_cast<int>((l % 4) * 2);
-          const int fixed = static_cast<int>(l % 8);
-          for (int e = 0; e < 2; ++e) {
-            const int r = trans ? (e0 + e) : fixed;
-            const int c = trans ? fixed : (e0 + e);
-            const uint32_t provider = static_cast<uint32_t>(m * 8 + r);
-            if (provider >= 32) continue;
-            const uintptr_t at =
-                rowAddr[provider] + static_cast<uintptr_t>(c * 2);
-            std::memcpy(reinterpret_cast<void*>(at), &els[e], 2);
+          if (isLoad) {
+            (*g_block_states)[si].setreg(
+                fragRegs[m], static_cast<uint64_t>(els[0]) |
+                                (static_cast<uint64_t>(els[1]) << 16));
           }
         }
       }

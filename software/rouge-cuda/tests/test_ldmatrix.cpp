@@ -115,24 +115,28 @@ int main(int argc, char** argv) {
     EXPECT_TRUE(bad == 0);
   }
 
-  // x4: 4 stacked matrices, tagged m*1024+1000. Thread tid holds matrix
-  // m=(tid/8)%4, row tid%8, cols (tid%4)*2 (store layout); values must match.
+  // x4: four matrices; EVERY thread gets a fragment of every matrix
+  // (PTX ISA 9.7.16.5.15). Thread tid holds matrix k, row tid%8, columns
+  // (tid%4)*2 and +1, written out at out[k*64 + tid*2 + e].
   {
     const int fx = fn_index(prog, "ldmatrix_x4");
     EXPECT_TRUE(fx >= 0);
     if (fx >= 0) {
-      float out[64] = {0};
+      float out[256] = {0};
       EXPECT_TRUE(run_entry(*prog, fx, out));
       int bad = 0;
       for (int tid = 0; tid < 32; ++tid) {
-        const int m = (tid / 8) % 4, row = tid % 8, col0 = (tid % 4) * 2;
-        for (int e = 0; e < 2; ++e) {
-          const float want = (float)(m * 128 + 100 + row * 8 + col0 + e);
-          if (out[tid * 2 + e] != want) {
-            if (bad < 5)
-              std::printf("x4 tid=%d e=%d: got=%g want=%g\n", tid, e,
-                          (double)out[tid * 2 + e], (double)want);
-            ++bad;
+        const int row = tid % 8, col0 = (tid % 4) * 2;
+        for (int k = 0; k < 4; ++k) {
+          for (int e = 0; e < 2; ++e) {
+            const float want = (float)(k * 128 + 100 + row * 8 + col0 + e);
+            const float got = out[k * 64 + tid * 2 + e];
+            if (got != want) {
+              if (bad < 6)
+                std::printf("x4 tid=%d m=%d e=%d: got=%g want=%g\n", tid, k, e,
+                            (double)got, (double)want);
+              ++bad;
+            }
           }
         }
       }

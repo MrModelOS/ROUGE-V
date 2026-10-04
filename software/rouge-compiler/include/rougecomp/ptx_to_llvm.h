@@ -25,6 +25,8 @@ namespace rougecomp {
 //   offset  0..44: 12 x i32  (tid/ctaid/ntid/nctaid x y z)
 //   offset 48   : i64  scratchpad base (block .shared memory)
 //   offset 56   : i64  barrier handle (passed to __rouge_syncthreads)
+//   offset 64   : i64  exchange base (per-block warp-exchange region for
+//                mma/ldmatrix/stmatrix; null when the kernel uses none)
 // CUDA special registers (%ctaid.x and friends) are loaded from this structure
 // by the host runtime before each kernel launch.
 //
