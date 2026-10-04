@@ -117,15 +117,21 @@ typedef struct rouge_cuda_device_prop {
   int          reserved[56];
 } rouge_cuda_device_prop;
 
+/* Коды ошибок — численно равны настоящему cudaError (driver_types.h).
+ * Это ABI: чужая программа, собранная против настоящего заголовка, сравнивает
+ * именно числа (было поймано пробой: наши 10/29/30 вообще не существуют в
+ * настоящем enum — там 101/4/999). */
 typedef enum cudaError {
   cudaSuccess = 0,
   cudaErrorInvalidValue = 1,
   cudaErrorMemoryAllocation = 2,
-  cudaErrorInvalidDevice = 10,
+  cudaErrorCudartUnloading = 4,
+  cudaErrorInvalidDeviceFunction = 98,
+  cudaErrorNoDevice = 100,
+  cudaErrorInvalidDevice = 101,
   cudaErrorInvalidDevicePointer = 17,
-  cudaErrorCudartUnloading = 29,
-  cudaErrorUnknown = 30,
-  cudaErrorInvalidResourceHandle = 400
+  cudaErrorInvalidResourceHandle = 400,
+  cudaErrorUnknown = 999
 } cudaError_t;
 
 typedef enum cudaMemcpyKind {
@@ -194,6 +200,81 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count);
 cudaError_t cudaStreamCreateWithFlags(cudaStream_t *pStream, unsigned int flags);
 #define cudaStreamDefault 0x00
 #define cudaStreamNonBlocking 0x01
+
+/* rouge_cudaSharedMemoryMode: значения из настоящего driver_types.h
+ * (cudaSharedMemoryModeDefault = 0 .. PreferOversized = 4). */
+typedef enum rouge_cudaSharedMemoryMode {
+  rouge_cudaSharedMemoryModeDefault = 0,
+  rouge_cudaSharedMemoryModeRequirePortable = 1,
+  rouge_cudaSharedMemoryModeAllowNonPortable = 2,
+  rouge_cudaSharedMemoryModeAllowOversizedSharedMemory = 3,
+  rouge_cudaSharedMemoryModePreferOversizedSharedMemory = 4
+} rouge_cudaSharedMemoryMode;
+
+/* rouge_cuda_func_attributes: раскладка настоящего cudaFuncAttributes
+ * (driver_types.h), поле в поле. ABI-контракт: программа, собранная против
+ * настоящего заголовка, читает эту структуру напрямую.
+ * tests/test_func_attr_layout.cpp сверяет offsetof/sizeof каждого поля. */
+typedef struct rouge_cuda_func_attributes {
+  size_t sharedSizeBytes;
+  size_t constSizeBytes;
+  size_t localSizeBytes;
+  int maxThreadsPerBlock;
+  int numRegs;
+  int ptxVersion;
+  int binaryVersion;
+  int cacheModeCA;
+  int maxDynamicSharedSizeBytes;
+  int preferredShmemCarveout;
+  int clusterDimMustBeSet;
+  int requiredClusterWidth;
+  int requiredClusterHeight;
+  int requiredClusterDepth;
+  int clusterSchedulingPolicyPreference;
+  int nonPortableClusterSizeAllowed;
+  int deviceNodeUpdateStatus;
+  rouge_cudaSharedMemoryMode sharedMemoryMode;
+  int reserved[14];
+} rouge_cuda_func_attributes;
+
+cudaError_t cudaFuncGetAttributes(rouge_cuda_func_attributes *attr, const void *func);
+
+/* Occupancy: сколько блоков ядра одновременно живёт на одном SM.
+ * Считается по документированному алгоритму из открытого cuda_occupancy.h
+ * (минимум лимитов: варпы, регистры, блоки, shared-память), для референсного
+ * sm_75. cudaOcc-флаги: cudaOccupancyDefault = 0. */
+#define cudaOccupancyDefault 0x0
+#define cudaOccupancyDisableCachingOverride 0x1
+cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    int *numBlocks, const void *func, int blockSize, size_t dynamicSMemSize);
+cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+    int *numBlocks, const void *func, int blockSize, size_t dynamicSMemSize,
+    unsigned int flags);
+cudaError_t cudaOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize,
+                                               const void *func,
+                                               size_t (*blockSizeToDynamicSMemSize)(int),
+                                               size_t dynamicSMemSize);
+cudaError_t cudaOccupancyAvailableDynamicSMemPerBlock(size_t *dynamicSmemSize,
+                                                      const void *func, int numBlocks,
+                                                      int blockSize);
+
+/* cudaDeviceAttr: значения из настоящего driver_types.h (совпадают 1:1 с
+ * CUdevice_attribute). Только те атрибуты, на которые слой отвечает честно;
+ * остальные дают cudaErrorInvalidValue, как настоящий драйвер на неверный
+ * атрибут. */
+typedef enum cudaDeviceAttr {
+  cudaDevAttrMaxThreadsPerBlock = 1,
+  cudaDevAttrMaxSharedMemoryPerBlock = 8,
+  cudaDevAttrWarpSize = 10,
+  cudaDevAttrMaxRegistersPerBlock = 12,
+  cudaDevAttrMultiProcessorCount = 16,
+  cudaDevAttrConcurrentKernels = 31,
+  cudaDevAttrMaxThreadsPerMultiProcessor = 39,
+  cudaDevAttrComputeCapabilityMajor = 75,
+  cudaDevAttrComputeCapabilityMinor = 76
+} cudaDeviceAttr;
+
+cudaError_t cudaDeviceGetAttribute(int *pi, cudaDeviceAttr attr, int device);
 
 #ifdef __cplusplus
 }

@@ -55,17 +55,43 @@ if(ROUGE_REAL_CUDA_INCLUDE AND ROUGE_PYTHON3)
   add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/real_cuda_device_prop.h
     COMMAND ${ROUGE_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/gen_real_prop_header.py
-            ${ROUGE_REAL_CUDA_INCLUDE}/driver_types.h
+            ${ROUGE_REAL_CUDA_INCLUDE}/driver_types.h cudaDeviceProp
             ${CMAKE_CURRENT_BINARY_DIR}/real_cuda_device_prop.h
     DEPENDS ${ROUGE_REAL_CUDA_INCLUDE}/driver_types.h
             ${CMAKE_CURRENT_SOURCE_DIR}/gen_real_prop_header.py)
+  add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/real_cuda_func_attributes.h
+    COMMAND ${ROUGE_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/gen_real_prop_header.py
+            ${ROUGE_REAL_CUDA_INCLUDE}/driver_types.h cudaFuncAttributes
+            ${CMAKE_CURRENT_BINARY_DIR}/real_cuda_func_attributes.h cudaFuncAttributes
+    DEPENDS ${ROUGE_REAL_CUDA_INCLUDE}/driver_types.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/gen_real_prop_header.py)
   add_custom_target(real_prop_header
-    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/real_cuda_device_prop.h)
+    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/real_cuda_device_prop.h
+            ${CMAKE_CURRENT_BINARY_DIR}/real_cuda_func_attributes.h)
   add_executable(test_device_prop_layout test_device_prop_layout.cpp)
   target_include_directories(test_device_prop_layout PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include ${CMAKE_CURRENT_BINARY_DIR})
   add_dependencies(test_device_prop_layout real_prop_header)
   add_test(NAME device_prop_layout COMMAND test_device_prop_layout)
+  add_executable(test_func_attr_layout test_func_attr_layout.cpp)
+  target_include_directories(test_func_attr_layout PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include ${CMAKE_CURRENT_BINARY_DIR})
+  add_dependencies(test_func_attr_layout real_prop_header)
+  add_test(NAME func_attr_layout COMMAND test_func_attr_layout)
+
+  # Юнит-тест occupancy-калькулятора (числа сверены с настоящим драйвером).
+  # Внутренний заголовок occupancy.h виден только здесь, не устанавливается.
+  add_executable(test_occupancy test_occupancy.cpp)
+  target_include_directories(test_occupancy PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(test_occupancy PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
+  add_test(NAME occupancy COMMAND test_occupancy)
+
+  # Driver-путь occupancy (CUfunction -> калькулятор).
+  add_executable(test_driver_occupancy test_driver_occupancy.cpp)
+  target_link_libraries(test_driver_occupancy PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
+  add_test(NAME driver_occupancy COMMAND test_driver_occupancy)
 else()
   message(STATUS "device_prop_layout: SKIP (needs real CUDA headers and python3)")
 endif()
@@ -92,7 +118,7 @@ if(ROUGE_NVCC_PROG)
   add_test(NAME foreign_program
     COMMAND ${CMAKE_COMMAND}
       -DNVCC=${ROUGE_NVCC_PROG}
-      "-DPROGRAMS=${_fp_dir}/wave1_vadd.cu;${_fp_dir}/wave1_api.cu"
+      "-DPROGRAMS=${_fp_dir}/wave1_vadd.cu;${_fp_dir}/wave1_api.cu;${_fp_dir}/wave1_occupancy.cu"
       -DWORK_DIR=${_fp_work}
       -DSHIM=$<TARGET_FILE:rouge-cuda>
       -DTEST_BIN=$<TARGET_FILE:test_foreign_program>

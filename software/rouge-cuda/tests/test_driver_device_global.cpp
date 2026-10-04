@@ -149,9 +149,12 @@ int main() {
   EXPECT(sharedBytes == 0);
   CHECK(cuFuncGetAttribute(&maxThreads, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, fn));
   EXPECT(maxThreads == 1024);
-  // NUM_REGS needs a register allocator: loud refusal.
-  EXPECT(cuFuncGetAttribute(&maxThreads, CU_FUNC_ATTRIBUTE_NUM_REGS, fn) ==
-         CUDA_ERROR_NOT_SUPPORTED);
+  // NUM_REGS — статическая верхняя граница по .reg-декларациям PTX
+  // (настоящий аллокатор регистров недоступен вне ptxas): никогда не
+  // занижает, поэтому occupancy-арифметика остаётся с безопасной стороны.
+  int numRegs = -1;
+  CHECK(cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, fn));
+  EXPECT(numRegs > 0);
 
   CUdeviceptr dBias = 0;
   size_t biasBytes = 0;

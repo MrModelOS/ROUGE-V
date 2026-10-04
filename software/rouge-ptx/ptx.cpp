@@ -502,6 +502,13 @@ std::unique_ptr<PtxProgram> parse_ptx(const std::string& text, std::string* erro
     }
 
     if (!cur) {  // module-scope: .version/.target/.address_size and .global
+      // ".target sm_75" records the compute capability the module was built
+      // for (needed for cudaFuncAttributes' ptxVersion/binaryVersion).
+      if (s.rfind(".target", 0) == 0) {
+        const size_t sm = s.find("sm_");
+        if (sm != std::string::npos)
+          prog->targetSm = std::atoi(s.c_str() + sm + 3);
+      }
       if (s.rfind(".global", 0) == 0 || s.rfind(".const", 0) == 0)
         parse_global_decl(s, prog.get());
       // ".extern .shared ..." (dynamic shared) applies to every kernel in

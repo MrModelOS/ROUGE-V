@@ -1,5 +1,6 @@
 #include <rouge/cuda.h>
 
+#include "occupancy.h"
 #include "ptx.h"
 #include "rouge_internal.h"
 
@@ -494,26 +495,24 @@ CUresult cuFuncGetAttribute(int* pi, CUfunction_attribute attrib, CUfunction hfu
   if (fit == ctx().functions.end()) return CUDA_ERROR_INVALID_HANDLE;
   const auto mit = ctx().modules.find(fit->second.moduleKey);
   if (mit == ctx().modules.end()) return CUDA_ERROR_INVALID_HANDLE;
-  const auto& prog = mit->second;
-  const int fnIndex = fit->second.fnIndex;
-  if (fnIndex < 0 || fnIndex >= static_cast<int>(prog->functions.size()))
+  KernelStats st;
+  if (!kernel_stats(*mit->second, fit->second.fnIndex, &st))
     return CUDA_ERROR_INVALID_VALUE;
-  const PtxFunction& fn = prog->functions[fnIndex];
-  // Only attributes the backend can answer from the parsed PTX; the rest
-  // (notably NUM_REGS, which needs a register allocator) refuse loudly.
   switch (attrib) {
     case CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: *pi = 1024; return CUDA_SUCCESS;
-    case CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: *pi = fn.sharedSize; return CUDA_SUCCESS;
-    case CU_FUNC_ATTRIBUTE_PTX_VERSION: {
-      // PTX .version line, e.g. 94 for ".version 9.4"; unknown when the
-      // module text carried none (hand-written PTX without a header).
-      int v = 0;
-      // The version is module-wide; recover it from the raw text is not
-      // possible here, so report the newest version the loader accepts.
-      v = 94;
-      *pi = v;
+    case CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES:
+      *pi = static_cast<int>(st.staticSmem);
       return CUDA_SUCCESS;
-    }
+    case CU_FUNC_ATTRIBUTE_NUM_REGS:
+      // Static upper bound from .reg declarations (see occupancy.h): never
+      // undercounts, so occupancy math stays on the safe side.
+      *pi = st.numRegs;
+      return CUDA_SUCCESS;
+    case CU_FUNC_ATTRIBUTE_PTX_VERSION:
+      // Compute capability the module targets (.target sm_XX); 0 when the
+      // text carries no .target line (hand-written PTX without a header).
+      *pi = st.targetSm;
+      return CUDA_SUCCESS;
     default: return CUDA_ERROR_NOT_SUPPORTED;
   }
 }
@@ -567,6 +566,85 @@ CUresult cuGetErrorName(CUresult error, const char** pStr) {
     case CUDA_ERROR_NOT_SUPPORTED: *pStr = "CUDA_ERROR_NOT_SUPPORTED"; return CUDA_SUCCESS;
     default: *pStr = "CUDA_ERROR_UNKNOWN"; return CUDA_SUCCESS;
   }
+}
+
+// ---- occupancy ---------------------------------------------------------------
+// CUfunction -> (модуль, индекс) -> KernelStats -> тот же калькулятор, что у
+// Runtime API. Невозможная конфигурация — успех с нулём (как настоящий драйвер).
+
+namespace {
+
+bool stats_for_cufunc(CUfunction func, KernelStats* st) {
+  if (func == nullptr || st == nullptr) return false;
+  const auto fit = ctx().functions.find(reinterpret_cast<uint64_t>(func));
+  if (fit == ctx().functions.end()) return false;
+  const auto mit = ctx().modules.find(fit->second.moduleKey);
+  if (mit == ctx().modules.end()) return false;
+  return kernel_stats(*mit->second, fit->second.fnIndex, st);
+}
+
+}  // namespace
+
+CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int* numBlocks, CUfunction func,
+                                                     int blockSize, size_t dynamicSMemSize) {
+  if (auto* real =
+          real_symbol<decltype(&cuOccupancyMaxActiveBlocksPerMultiprocessor)>(
+              "cuOccupancyMaxActiveBlocksPerMultiprocessor"))
+    return real(numBlocks, func, blockSize, dynamicSMemSize);
+  if (!numBlocks || !func || blockSize <= 0) return CUDA_ERROR_INVALID_VALUE;
+  KernelStats st;
+  if (!stats_for_cufunc(func, &st)) return CUDA_ERROR_INVALID_HANDLE;
+  *numBlocks = occ_active_blocks(st, blockSize, dynamicSMemSize);
+  return CUDA_SUCCESS;
+}
+
+CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* numBlocks, CUfunction func,
+                                                               int blockSize,
+                                                               size_t dynamicSMemSize,
+                                                               unsigned int flags) {
+  if (auto* real =
+          real_symbol<decltype(&cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags)>(
+              "cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags"))
+    return real(numBlocks, func, blockSize, dynamicSMemSize, flags);
+  // Только документированные флаги; на sm_75 флаг кэширования на лимиты не
+  // влияет (partitioned GC там не поддерживается — см. occupancy.h).
+  if (flags != 0 && flags != 1) return CUDA_ERROR_INVALID_VALUE;
+  return cuOccupancyMaxActiveBlocksPerMultiprocessor(numBlocks, func, blockSize,
+                                                     dynamicSMemSize);
+}
+
+CUresult cuOccupancyMaxPotentialBlockSize(int* minGridSize, int* blockSize, CUfunction func,
+                                          CUoccupancyB2DSize blockSizeToDynamicSMemSize,
+                                          size_t dynamicSMemSize, int blockSizeLimit) {
+  if (auto* real = real_symbol<decltype(&cuOccupancyMaxPotentialBlockSize)>(
+          "cuOccupancyMaxPotentialBlockSize"))
+    return real(minGridSize, blockSize, func, blockSizeToDynamicSMemSize, dynamicSMemSize,
+                blockSizeLimit);
+  if (!minGridSize || !blockSize || !func) return CUDA_ERROR_INVALID_VALUE;
+  KernelStats st;
+  if (!stats_for_cufunc(func, &st)) return CUDA_ERROR_INVALID_HANDLE;
+  // blockSizeLimit <= 0 означает «без лимита» (как у настоящего драйвера).
+  if (blockSizeLimit > 0 && blockSizeLimit < 1024) {
+    // Тот же перебор configurator'а, но с обрезанным верхом.
+    int bestBlock = 0, bestNum = 0, bestThreads = 0;
+    for (int trySize = (blockSizeLimit / 32) * 32; trySize > 0; trySize -= 32) {
+      size_t dyn = dynamicSMemSize;
+      if (blockSizeToDynamicSMemSize != nullptr) dyn = blockSizeToDynamicSMemSize(trySize);
+      const int active = occ_active_blocks(st, trySize, dyn);
+      if (trySize * active > bestThreads) {
+        bestThreads = trySize * active;
+        bestBlock = trySize;
+        bestNum = active;
+      }
+      if (bestThreads == 1024) break;
+    }
+    *blockSize = bestBlock;
+    *minGridSize = bestNum;  // один SM у эмулированного устройства
+    return CUDA_SUCCESS;
+  }
+  occ_potential_block_size(minGridSize, blockSize, st, blockSizeToDynamicSMemSize,
+                           dynamicSMemSize, /*numSms=*/1);
+  return CUDA_SUCCESS;
 }
 
 CUresult cuGetErrorString(CUresult error, const char** pStr) {

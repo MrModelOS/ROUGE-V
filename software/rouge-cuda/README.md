@@ -111,6 +111,32 @@ GPU для этого не нужен вообще.
 - `cudaStreamCreateWithFlags` (флаги принимаются, бэкенд синхронный —
   это задокументировано, а не спрятано).
 
+## Occupancy и атрибуты функций
+
+Настоящие программы спрашивают у драйвера, сколько блоков влезет на SM,
+и подбирают конфигурацию запуска. Мы считаем по тому же документированному
+алгоритму из открытого `cuda_occupancy.h` (минимум лимитов: варпы, регистры,
+блоки, shared) для референсного sm_75:
+
+- `cudaFuncGetAttributes` / `cuFuncGetAttribute`: shared/local/const размеры
+  и `.target` модуля — из распарсенного PTX; `numRegs` — max-live оценка
+  (dataflow-анализ тела; настоящий аллокатор ptxas недоступен, его данные
+  лежат в недокументированном `.nv.info` — это вне legal frame);
+- `cudaOccupancyMaxActiveBlocksPerMultiprocessor[WithFlags]`,
+  `cudaOccupancyMaxPotentialBlockSize`, `cudaOccupancyAvailableDynamicSMemPerBlock`
+  и driver-варианты `cuOccupancy*`;
+- `cudaDeviceGetAttribute` (честный набор: варп 32, блоки, SM, CC 7.5).
+
+Архитектурные константы sm_75 сверены пробой с настоящим драйвером MX450,
+а не взяты по памяти (так пойманы `maxThreadsPerMultiProcessor = 1024`,
+а не 2048, и пять неверных значений в props). Невозможная конфигурация —
+успех с нулём блоков, как у настоящего драйвера; чужие флаги — отказ.
+
+Проверка — программа `tests/programs/wave1_occupancy.cu`: собирается `nvcc`
+против настоящего cudart и `g++` против шима, occupancy-числа сравниваются
+побайтово (нормализуются только имя устройства, minGridSize — топология
+14 SM против 1 — и regs — точная аллокация против max-live оценки).
+
 ## Структура
 
 ```

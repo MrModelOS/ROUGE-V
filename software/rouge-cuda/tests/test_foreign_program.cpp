@@ -9,6 +9,7 @@
 // Требует nvcc для СБОРКИ .cu и .ptx. Без nvcc тест честно пропускается;
 // исполнение GPU не требуется вовсе — это и есть смысл проверки.
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,10 +24,36 @@ static int fail(const char* what) {
 
 // Strips the compat layer's own diagnostics ("[ROUGE-CUDA] ...") so the
 // comparison is about the PROGRAM's output only, not about our logging.
-// The device name is also normalized: the real stack reports the physical
-// card ("NVIDIA GeForce MX450") while the shim honestly reports itself
-// ("ROUGE CPU-emulation device") — the name differing is correct behaviour,
-// everything else must agree.
+// Three fields are normalized, each for a documented reason — everything
+// else must agree byte for byte:
+//   name=      device identity: the real stack reports the physical card
+//              ("NVIDIA GeForce MX450") while the shim honestly reports
+//              itself ("ROUGE CPU-emulation device").
+//   minGrid=   machine topology: minGridSize = activeBlocks x SM count, and
+//              the card has 14 SMs while the emulated device has 1. The
+//              per-SM occupancy (the portable number) is compared exactly.
+//   regs=      register accounting: the real driver reports the ptxas
+//              allocation, we report a static upper bound from .reg
+//              declarations (see occupancy.h). The bound is pinned by the
+//              occupancy unit test; here only the occupancy math is compared.
+static std::string normalize_field(std::string line, const std::string& key) {
+  const std::string marker = key + "=";
+  size_t at = line.find(marker);
+  if (at == std::string::npos) return line;
+  size_t stop = at + marker.size();
+  while (stop < line.size() &&
+         (isdigit((unsigned char)line[stop]) || line[stop] == '<' || line[stop] == '>'))
+    ++stop;
+  // A device name runs until the next " key=" token or end of line.
+  if (stop == at + marker.size()) {
+    stop = line.find(" err=", at);
+    if (stop == std::string::npos) stop = line.size();
+  }
+  line.erase(at, stop - at);
+  line.insert(at, marker + "<" + key + ">");
+  return line;
+}
+
 static std::string program_output_only(const std::string& text) {
   std::string out;
   size_t pos = 0;
@@ -35,14 +62,9 @@ static std::string program_output_only(const std::string& text) {
     if (end == std::string::npos) end = text.size();
     std::string line = text.substr(pos, end - pos);
     if (line.rfind("[ROUGE-CUDA]", 0) != 0) {
-      const std::string marker = "name=";
-      size_t at = line.find(marker);
-      if (at != std::string::npos) {
-        size_t stop = line.find(" err=", at);
-        if (stop == std::string::npos) stop = line.size();
-        line.erase(at, stop - at);
-        line.insert(at, "name=<device>");
-      }
+      line = normalize_field(line, "name");
+      line = normalize_field(line, "minGrid");
+      line = normalize_field(line, "regs");
       out += line;
       out += '\n';
     }

@@ -111,6 +111,19 @@ CUresult cuStreamQuery(CUstream stream);
 
 CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc);
 
+/* Occupancy: тот же документированный алгоритм, что в открытом cuda_occupancy.h,
+ * для референсного sm_75. CUoccupancyB2DSize — как в настоящем cuda.h. */
+typedef size_t (*CUoccupancyB2DSize)(int blockSize);
+CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, CUfunction func,
+                                                     int blockSize, size_t dynamicSMemSize);
+CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlocks, CUfunction func,
+                                                               int blockSize,
+                                                               size_t dynamicSMemSize,
+                                                               unsigned int flags);
+CUresult cuOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize, CUfunction func,
+                                          CUoccupancyB2DSize blockSizeToDynamicSMemSize,
+                                          size_t dynamicSMemSize, int blockSizeLimit);
+
 CUresult cuLaunchKernel(CUfunction f,
                         unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                         unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,

@@ -81,6 +81,10 @@ struct PtxProgram {
   std::unordered_map<std::string, int> functionIndex;  // name -> index
   std::vector<PtxGlobalVar> globals;                    // .global/.const decls
   std::unordered_map<std::string, int> globalIndex;    // name -> index
+  // Module target architecture from ".target sm_XX" (75 for sm_75, 0 when the
+  // text carries no .target line). Needed for cudaFuncAttributes (ptxVersion
+  // and binaryVersion are the compute capability the module targets).
+  int targetSm = 0;
 };
 
 // Parse PTX assembly text into a program.

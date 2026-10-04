@@ -33,13 +33,6 @@
 
 namespace {
 
-
-// Registered kernel stubs: stub address -> mangled name.
-std::unordered_map<uintptr_t, std::string>& stub_names() {
-  static std::unordered_map<uintptr_t, std::string> table;
-  return table;
-}
-
 // The launch configuration pushed by the <<<>>> sugar, popped by the launch.
 struct CallConfig {
   dim3 grid{1, 1, 1};
@@ -53,11 +46,9 @@ std::vector<CallConfig>& config_stack() {
   return stack;
 }
 
-// Modules named by ROUGE_CUDA_PTX, parsed on first use.
-std::vector<std::shared_ptr<rouge::PtxProgram>>& ptx_modules() {
-  static std::vector<std::shared_ptr<rouge::PtxProgram>> mods;
-  return mods;
-}
+// Modules named by ROUGE_CUDA_PTX, parsed on first use. (Fatbin modules land
+// in the shared runtime_modules() registry straight from __cudaRegisterFatBinary;
+// stub_names() lives in rouge_internal.h so every TU shares one table.)
 
 bool load_ptx_modules() {
   const char* list = std::getenv("ROUGE_CUDA_PTX");
@@ -95,17 +86,17 @@ bool load_ptx_modules() {
                      err.c_str());
         return false;
       }
-      ptx_modules().push_back(std::shared_ptr<rouge::PtxProgram>(std::move(prog)));
+      rouge::runtime_modules().push_back(std::shared_ptr<rouge::PtxProgram>(std::move(prog)));
     }
     if (colon == std::string::npos) break;
     pos = colon + 1;
   }
-  return !ptx_modules().empty();
+  return !rouge::runtime_modules().empty();
 }
 
 // Find a kernel by mangled name across the loaded modules.
 bool find_kernel(const std::string& name, rouge::PtxProgram** out, int* fnIndex) {
-  for (auto& mod : ptx_modules()) {
+  for (auto& mod : rouge::runtime_modules()) {
     const auto it = mod->functionIndex.find(name);
     if (it != mod->functionIndex.end()) {
       *out = mod.get();
@@ -130,7 +121,7 @@ cudaError_t launch_registered(const void* stub, dim3 grid, dim3 block, void** ar
     std::fprintf(stderr, "[ROUGE-CUDA] kernel stub %p was never registered\n", stub);
     return cudaErrorInvalidValue;
   }
-  if (ptx_modules().empty() && !load_ptx_modules()) return cudaErrorInvalidValue;
+  if (rouge::runtime_modules().empty() && !load_ptx_modules()) return cudaErrorInvalidValue;
 
   rouge::PtxProgram* prog = nullptr;
   int fnIndex = -1;
@@ -217,7 +208,7 @@ void* __cudaRegisterFatBinary(const void* fatCubinHandle) {
         std::fprintf(stderr, "[ROUGE-CUDA] fatbin PTX parse failed: %s\n", perr.c_str());
         continue;
       }
-      ptx_modules().push_back(std::shared_ptr<rouge::PtxProgram>(std::move(prog)));
+      rouge::runtime_modules().push_back(std::shared_ptr<rouge::PtxProgram>(std::move(prog)));
     }
     if (!texts.empty()) {
       std::fprintf(stderr, "[ROUGE-CUDA] %zu PTX module(s) taken from the fatbin\n",
@@ -245,11 +236,11 @@ void __cudaRegisterFunction(const void* fatCubinHandle, void* stub, const char* 
   (void)funcAnnotations;
   (void)deviceAnnotations;
   if (stub == nullptr || name == nullptr) return;
-  stub_names()[reinterpret_cast<uintptr_t>(stub)] = name;
+  rouge::stub_names()[reinterpret_cast<uintptr_t>(stub)] = name;
 }
 
 void __cudaUnregisterFunction(const void* func) {
-  stub_names().erase(reinterpret_cast<uintptr_t>(func));
+  rouge::stub_names().erase(reinterpret_cast<uintptr_t>(func));
 }
 
 cudaError_t __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim, size_t sharedMemBytes,
@@ -283,12 +274,6 @@ cudaError_t __cudaGetKernel(void** handle, const void* func) {
   if (handle == nullptr || func == nullptr) return cudaErrorInvalidValue;
   *handle = const_cast<void*>(func);
   return cudaSuccess;
-}
-
-cudaError_t cudaFuncGetAttributes(void* attr, const void* func) {
-  (void)attr;
-  (void)func;
-  return cudaErrorInvalidValue;
 }
 
 }  // extern "C"
