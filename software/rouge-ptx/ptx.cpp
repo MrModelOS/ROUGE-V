@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #if defined(__linux__)
 #include <sys/mman.h>
 #endif
@@ -443,6 +444,184 @@ uint16_t f32_to_bf16_rne(float f) {
   const uint32_t lsb = (x >> 16) & 1u;
   return static_cast<uint16_t>((x + 0x7fffu + lsb) >> 16);
 }
+
+// ---- narrow float formats (e4m3 / e5m2 / e3m2 / e2m3 / e2m1) -----------------
+// Bit layouts and special values are the OCP specs, not memory:
+//   OFP8 (OCP 8-bit Floating Point Specification, Table 1-2):
+//     e4m3: bias 7,  emax 8,  emin -6,  max 448 (0x7E), NaN only 0x7F/0xFF, no Inf;
+//     e5m2: bias 15, emax 15, emin -14, max 57344 (0x7B), Inf 0x7C/0xFC.
+//   OCP MX v1.0 (Table 7 element formats):
+//     e3m2: bias 3, max 28, min normal 0.25; e2m3: bias 1, max 7.5, min normal 1;
+//     e2m1: bias 1, max 6; none of the three has Inf or NaN.
+//   PTX ISA 9.4, cvt section: conversions into these formats carry mandatory
+//     .satfinite (clamp to sign-preserved MAX_NORM on overflow); NaN input
+//     becomes NaN for e4m3/e5m2 destinations and positive MAX_NORM for
+//     e3m2/e2m3/e2m1 destinations.
+//
+// Containers (PTX 5.2.3): e4m3/e5m2 live in a full .b8; e3m2/e2m3 in the lower
+// 6 bits of a .b8 (upper 2 zero-padded); e2m1 in the central 4 bits [5:2] of a
+// .b8 (2 zero bits on each side).
+
+struct NarrowFpFormat {
+  int expBits;     // E
+  int mantBits;    // M
+  int bias;        // exponent bias
+  uint32_t maxBits;  // bit pattern of MAX_NORM (without sign), in the container
+  uint32_t nanBits;  // bit pattern of canonical NaN (without sign), 0 = none
+  int containerBits;  // 8 for all narrow formats here
+  int fieldShift;     // bit offset of the field inside the container (e2m1: 2)
+  int fieldWidth;     // width of the field (8, 6 or 4)
+};
+
+// Decode narrow bits (already extracted to the low fieldWidth bits) to float.
+float narrow_to_f32(uint32_t bits, const NarrowFpFormat& F) {
+  const uint32_t sign = (bits >> (F.fieldWidth - 1)) & 1u;
+  const uint32_t exp = (bits >> F.mantBits) & ((1u << F.expBits) - 1u);
+  const uint32_t man = bits & ((1u << F.mantBits) - 1u);
+  const uint32_t fsign = sign << 31;
+  const uint32_t maxExp = (1u << F.expBits) - 1u;
+  uint32_t fbits;
+  if (exp == 0) {
+    if (man == 0) {
+      fbits = fsign;  // +-0
+    } else {
+      // Subnormal: normalize, then rebias to binary32.
+      uint32_t m = man;
+      uint32_t shift = 0;
+      while ((m & (1u << F.mantBits)) == 0) {
+        m <<= 1;
+        ++shift;
+      }
+      m &= (1u << F.mantBits) - 1u;
+      const int fexp = 127 - F.bias + 1 - static_cast<int>(shift);
+      const int fmanShift = 23 - F.mantBits;
+      fbits = fsign | (static_cast<uint32_t>(fexp) << 23) |
+              (m << fmanShift);
+    }
+  } else if (exp == maxExp) {
+    // All-ones exponent. Whether this is Inf/NaN or the top normal binade
+    // depends on the format: e4m3 reserves ONLY mantissa-all-ones as NaN
+    // (exp==15, mant 0..6 are normals up to 448); e5m2 uses the whole binade
+    // for Inf (mant 0) and NaN (mant 1..3); formats without NaN (e3m2/e2m3/
+    // e2m1) are normal here by construction.
+    const uint32_t allMant = (1u << F.mantBits) - 1u;
+    const bool topNormal =
+        ((F.maxBits >> F.mantBits) & maxExp) == maxExp;
+    if (F.nanBits != 0 && (man == allMant || !topNormal)) {
+      if (!topNormal && man == 0)
+        fbits = fsign | 0x7f800000u;  // e5m2 Inf (the only Inf in this family)
+      else
+        fbits = fsign | 0x7fc00000u;  // NaN (payload not preserved: see encode)
+    } else {
+      fbits = fsign |
+              (static_cast<uint32_t>(static_cast<int>(exp) - F.bias + 127) << 23) |
+              (man << (23 - F.mantBits));
+    }
+  } else {
+    fbits = fsign |
+            (static_cast<uint32_t>(static_cast<int>(exp) - F.bias + 127) << 23) |
+            (man << (23 - F.mantBits));
+  }
+  return bit_cast_v<float>(fbits);
+}
+
+// Encode float to narrow bits (low fieldWidth bits) with round-to-nearest-even
+// and saturation to sign-preserved MAX_NORM on overflow (.satfinite).
+// nanToMax: true for e3m2/e2m3/e2m1 (NaN -> positive MAX_NORM per PTX cvt),
+// false for e4m3/e5m2 (NaN -> sign-preserved NaN).
+uint32_t f32_to_narrow(float f, const NarrowFpFormat& F, bool roundToZero,
+                       bool nanToMax) {
+  const uint32_t x = bit_cast_v<uint32_t>(f);
+  const uint32_t sign = (x >> 31) & 1u;
+  const uint32_t e = (x >> 23) & 0xffu;
+  const uint32_t man = x & 0x7fffffu;
+  const uint32_t maxExp = (1u << F.expBits) - 1u;
+  // NaN input.
+  if (e == 0xffu && man != 0) {
+    if (nanToMax) return F.maxBits;  // positive MAX_NORM (PTX cvt rule)
+    return (sign << (F.fieldWidth - 1)) | F.nanBits;
+  }
+  // Inf input saturates (satfinite is mandatory on these conversions).
+  if (e == 0xffu) return (sign << (F.fieldWidth - 1)) | F.maxBits;
+  // Signed zero is exactly representable: preserve the sign (the range logic
+  // below would drop it to +0).
+  if (e == 0 && man == 0) return sign << (F.fieldWidth - 1);
+  const int unbiased = static_cast<int>(e) - 127;
+  // Target biased exponent for a normal result.
+  const int tExp = unbiased + F.bias;
+  const int M = F.mantBits;
+  // Overflow: only tExp PAST the top binade saturates up front. tExp inside
+  // the top binade rounds normally below: e4m3's exp==15 holds normals up to
+  // 0x7E (only mantissa-all-ones is NaN), so pre-saturating it would corrupt
+  // exactly-representable values like 256.0.
+  if (tExp > static_cast<int>(maxExp))
+    return (sign << (F.fieldWidth - 1)) | F.maxBits;
+  if (tExp <= 0) {
+    // Subnormal or underflow. Full significand with implicit 1, shifted.
+    if (tExp < -M) return 0;  // underflows past min-subnormal/2 (sign dropped: +0)
+    // Hmm: tExp in [1-M, 0]: value = 2^(1-bias) * (mantissa >> shift).
+    const uint32_t full = (1u << 23) | man;  // 24-bit significand
+    const int shift = 1 - tExp + (23 - M);
+    uint32_t val = full >> shift;
+    const uint32_t rem = full & ((shift >= 32) ? 0xffffffffu : ((1u << shift) - 1u));
+    const uint32_t half = 1u << (shift - 1);
+    if (!roundToZero && (rem > half || (rem == half && (val & 1u)))) ++val;
+    // Rounding a subnormal up can carry into the normal range; the result
+    // still fits (exp field 1 at most here... cap defensively at maxBits).
+    const uint32_t cap = (1u << (F.expBits + M)) - 1u;
+    if (val > cap) val = cap;
+    if (F.nanBits != 0 && (val >> M) == maxExp) {
+      // Carried into the all-ones exponent: e5m2 subnormal->tiny normal is
+      // fine (mant 0 => Inf? no: subnormal rounding up gives exp=1,mant=0,
+      // the smallest normal). Only e4m3's exp==maxExp is dangerous, and a
+      // subnormal can never round that far. Unreachable; kept for symmetry.
+      return (sign << (F.fieldWidth - 1)) | F.maxBits;
+    }
+    return (sign << (F.fieldWidth - 1)) | (val & cap);
+  }
+  // Normal range: keep top M bits, round the rest.
+  const int dropBits = 23 - M;
+  uint32_t val = (static_cast<uint32_t>(tExp) << M) | (man >> dropBits);
+  const uint32_t rem = man & ((1u << dropBits) - 1u);
+  const uint32_t half = 1u << (dropBits - 1);
+  if (!roundToZero && (rem > half || (rem == half && (val & 1u)))) ++val;
+  // Rounding may carry into (or inside) the all-ones exponent. Whether that
+  // saturates depends on the format, mirroring the decode rule above:
+  // e4m3 saturates only on the NaN pattern (exp==15, mantissa all ones) —
+  // this is exactly the OFP8 "448..464 rounds to 448" rule, generalized;
+  // e5m2 saturates on anything in exp==31 (Inf or NaN out); no-NaN formats
+  // saturate only past the top binade.
+  {
+    const uint32_t gotExp = val >> M;
+    const uint32_t allMant = (1u << M) - 1u;
+    const bool topNormal =
+        ((F.maxBits >> F.mantBits) & maxExp) == maxExp;
+    if (gotExp > maxExp) return (sign << (F.fieldWidth - 1)) | F.maxBits;
+    if (gotExp == maxExp && F.nanBits != 0) {
+      if (!topNormal) return (sign << (F.fieldWidth - 1)) | F.maxBits;
+      if ((val & allMant) == allMant)
+        return (sign << (F.fieldWidth - 1)) | F.maxBits;
+    }
+    return (sign << (F.fieldWidth - 1)) |
+           (val & ((1u << (F.expBits + M)) - 1u));
+  }
+}
+
+// Place field bits into / extract from the .b8 container.
+uint32_t narrow_pack(uint32_t field, const NarrowFpFormat& F) {
+  const uint32_t mask = (F.fieldWidth == 32) ? 0xffffffffu : ((1u << F.fieldWidth) - 1u);
+  return (field & mask) << F.fieldShift;
+}
+uint32_t narrow_unpack(uint32_t container, const NarrowFpFormat& F) {
+  const uint32_t mask = (F.fieldWidth == 32) ? 0xffffffffu : ((1u << F.fieldWidth) - 1u);
+  return (container >> F.fieldShift) & mask;
+}
+
+const NarrowFpFormat kE4M3 = {4, 3, 7, 0x7Eu, 0x7Fu, 8, 0, 8};
+const NarrowFpFormat kE5M2 = {5, 2, 15, 0x7Bu, 0x7Fu, 8, 0, 8};
+const NarrowFpFormat kE3M2 = {3, 2, 3, 0x3Fu, 0x00u, 8, 0, 6};
+const NarrowFpFormat kE2M3 = {2, 3, 1, 0x3Fu, 0x00u, 8, 0, 6};
+const NarrowFpFormat kE2M1 = {2, 1, 1, 0x0Fu, 0x00u, 8, 2, 4};
 
 }  // namespace
 
@@ -1474,8 +1653,16 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
 
     if (op.find("x2") != std::string::npos &&
         op.rfind("ld.", 0) != 0 && op.rfind("st.", 0) != 0) {
-      // f16x2/bf16x2 fallback for non-memory ops: payload as i32
-      if (A.size() >= 2) {
+      // f16x2/bf16x2 fallback for non-memory ops: payload as i32.
+      // Narrow-float cvt forms (e4m3x2/e5m2x2/...) are NOT bit-copies: they
+      // fall through to the cvt block below, which implements RNE+satfinite.
+      const bool narrowCvt =
+          op.find(".e4m3x2") != std::string::npos ||
+          op.find(".e5m2x2") != std::string::npos ||
+          op.find(".e3m2x2") != std::string::npos ||
+          op.find(".e2m3x2") != std::string::npos ||
+          op.find(".e2m1x2") != std::string::npos;
+      if (!narrowCvt && A.size() >= 2) {
         if (op.rfind("cvt.", 0) == 0 || op.rfind("mov.", 0) == 0) {
           st.setreg(A[0], operand_u64(st, A[1]));
         } else if (op.rfind("add.", 0) == 0 || op.rfind("sub.", 0) == 0 ||
@@ -1501,24 +1688,48 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       // Saturating and explicitly-rounded conversions (cvt.sat.*, cvt.rz/ru/rp/
       // rm/rzi.*) are deliberately not emulated: they need PTX's saturation
       // and rounding rules, so fail loudly instead of silently handing back
-      // the source bits. ".rn" is legal in two cases and falls through to the
-      // ordinary conversion below: the f16/bf16 narrowing handled there, and
-      // integer-to-float ("cvt.rn.f32.s32" from nvcc's threadFence code),
-      // where round-to-nearest-even IS the default conversion.
+      // the source bits. ".rn" stays legal for the f16/bf16 narrowing handled
+      // below, for int->float (round-to-nearest-even IS the default there),
+      // and for the packed narrow-float destinations (e4m3x2/e5m2x2/...),
+      // whose RNE+satfinite semantics are implemented in the packed block.
+      // ".rz" is the truncating counterpart there. ".satfinite" is mandatory
+      // on those packed forms and means clamp-to-MAX_NORM (never Inf/NaN
+      // out). ".relu" clamps negatives to +0. Refused: .rs (needs an rbits
+      // operand with Figure-42 layout), .scaled (needs a scale factor),
+      // .pzo/.ftz, and the x4 packed forms.
+      const bool narrowDst =
+          op.find(".e4m3x2") != std::string::npos ||
+          op.find(".e5m2x2") != std::string::npos ||
+          op.find(".e3m2x2") != std::string::npos ||
+          op.find(".e2m3x2") != std::string::npos ||
+          op.find(".e2m1x2") != std::string::npos;
       {
         std::stringstream mods(full);
         std::string mt;
         while (std::getline(mods, mt, '.')) {
           const bool is_round = mt == "rn" || mt == "rz" || mt == "rm" ||
                                 mt == "rp" || mt == "ru" || mt == "rzi";
-          if (mt != "sat" && !is_round) continue;
-          if (mt == "rn" &&
-              (op.find(".f16") != std::string::npos ||
-               op.find(".bf16") != std::string::npos ||
-               // int -> float, any width: RNE is the only defined behaviour
-               op.find(".f32") != std::string::npos ||
-               op.find(".f64") != std::string::npos))
-            continue;
+          if (mt != "sat" && mt != "satfinite" && mt != "relu" && !is_round) {
+            // Unknown tokens here are either type names (e4m3x2, f32 — fine,
+            // skip) or modifiers we do NOT implement: those must refuse
+            // loudly, never be silently ignored (a skipped .ftz would
+            // corrupt every subnormal; a skipped .rs would change rounding).
+            const bool refused = mt == "rs" || mt == "rna" || mt == "ftz" ||
+                                 mt == "pzo" || mt.find("scaled") != std::string::npos ||
+                                 mt.find(':') != std::string::npos;
+            if (!refused) continue;
+          } else {
+            if (mt == "relu") continue;  // always just a clamp, handled below
+            if (mt == "satfinite" && narrowDst) continue;
+            if ((mt == "rn" || mt == "rz") && narrowDst) continue;
+            if (mt == "rn" &&
+                (op.find(".f16") != std::string::npos ||
+                 op.find(".bf16") != std::string::npos ||
+                 // int -> float, any width: RNE is the only defined behaviour
+                 op.find(".f32") != std::string::npos ||
+                 op.find(".f64") != std::string::npos))
+              continue;
+          }
           if (error)
             *error = "unsupported rounding/saturating conversion '" + op +
                      "' in " + fn.name;
@@ -1527,20 +1738,87 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       }
 
       std::string spec = full;
-      // Drop a leading rounding/saturation modifier so "rn.f32.s32" parses as
-      // dst="f32", src="s32" (the modifier itself was validated above).
-      {
+      // Drop ALL leading rounding/saturation modifiers so
+      // "rn.satfinite.e4m3x2.f32" parses as dst="e4m3x2", src="f32" (each
+      // modifier was validated above).
+      for (;;) {
         const size_t firstDot = spec.find('.');
-        const std::string head = firstDot == std::string::npos ? spec : spec.substr(0, firstDot);
+        const std::string head =
+            firstDot == std::string::npos ? spec : spec.substr(0, firstDot);
         if (head == "rn" || head == "rz" || head == "rm" || head == "rp" ||
-            head == "ru" || head == "rzi" || head == "sat")
+            head == "ru" || head == "rzi" || head == "sat" || head == "satfinite" ||
+            head == "relu" || head == "ftz" || head == "pzo")
           spec = firstDot == std::string::npos ? std::string() : spec.substr(firstDot + 1);
+        else
+          break;
       }
       const size_t dot = spec.find('.');
       const std::string dst = dot == std::string::npos ? spec : spec.substr(0, dot);
       const std::string src = dot == std::string::npos ? "" : spec.substr(dot + 1);
       const uint64_t raw = operand_u64(st, A[1]);
       const uint32_t raw32 = static_cast<uint32_t>(raw);
+
+      // Packed narrow-float conversions (PTX 9.4 cvt section; the forms nvcc
+      // 13 actually emits, verified on cuda_fp8.h output):
+      //   cvt.{rn,rz}.satfinite.e4m3x2.f32  d, a, b   (d.b16: a->upper, b->lower)
+      //   cvt.rn.f16x2.e4m3x2               d, a      (d=2xf16: upper->upper...)
+      // and the e5m2/e3m2/e2m3/e2m1 x bf16x2 analogues. .relu clamps negatives
+      // to +0 (NaN -> canonical NaN for e4m3/e5m2, positive MAX_NORM where the
+      // format has no NaN). x4/.rs/.scaled forms refuse loudly above.
+      const NarrowFpFormat* narrowFmt = nullptr;
+      bool narrowNanToMax = false;
+      if (dst == "e4m3x2") { narrowFmt = &kE4M3; narrowNanToMax = false; }
+      else if (dst == "e5m2x2") { narrowFmt = &kE5M2; narrowNanToMax = false; }
+      else if (dst == "e3m2x2") { narrowFmt = &kE3M2; narrowNanToMax = true; }
+      else if (dst == "e2m3x2") { narrowFmt = &kE2M3; narrowNanToMax = true; }
+      else if (dst == "e2m1x2") { narrowFmt = &kE2M1; narrowNanToMax = true; }
+      if (narrowFmt != nullptr && src == "f32") {
+        if (A.size() < 3) { if (error) *error = "bad " + op + " in " + fn.name; return 0; }
+        const bool rz = op.find(".rz.") != std::string::npos;
+        const bool relu = op.find(".relu") != std::string::npos;
+        const auto convOne = [&](uint32_t bits) -> uint32_t {
+          float v = bit_cast_v<float>(bits);
+          if (relu) {
+            if (std::isnan(v))
+              return narrowNanToMax ? narrow_pack(narrowFmt->maxBits, *narrowFmt)
+                                    : narrow_pack(narrowFmt->nanBits, *narrowFmt);
+            if (!(v >= 0.0f)) return 0;  // negative (incl. -0) -> +0
+            v = v;  // keep value, fall through to normal encode
+          }
+          return narrow_pack(f32_to_narrow(v, *narrowFmt, rz, narrowNanToMax),
+                             *narrowFmt);
+        };
+        const uint32_t hi =
+            convOne(static_cast<uint32_t>(operand_u64(st, A[1])));
+        const uint32_t lo =
+            convOne(static_cast<uint32_t>(operand_u64(st, A[2])));
+        st.setreg(A[0], (hi << 8) | lo);
+        st.pc = next_pc;
+        return 1;
+      }
+      const NarrowFpFormat* narrowSrc = nullptr;
+      if (src == "e4m3x2") narrowSrc = &kE4M3;
+      else if (src == "e5m2x2") narrowSrc = &kE5M2;
+      else if (src == "e3m2x2") narrowSrc = &kE3M2;
+      else if (src == "e2m3x2") narrowSrc = &kE2M3;
+      else if (src == "e2m1x2") narrowSrc = &kE2M1;
+      if (narrowSrc != nullptr && (dst == "f16x2" || dst == "bf16x2")) {
+        const bool toBf16 = (dst == "bf16x2");
+        const bool relu = op.find(".relu") != std::string::npos;
+        const auto convOne = [&](uint32_t packed) -> uint32_t {
+          float v = narrow_to_f32(narrow_unpack(packed, *narrowSrc), *narrowSrc);
+          if (relu) {
+            if (std::isnan(v)) v = std::numeric_limits<float>::quiet_NaN();
+            else if (!(v >= 0.0f)) v = 0.0f;
+          }
+          return toBf16 ? f32_to_bf16_rne(v) : f32_to_f16_rne(v);
+        };
+        const uint32_t hi = convOne((raw32 >> 8) & 0xffu);
+        const uint32_t lo = convOne(raw32 & 0xffu);
+        st.setreg(A[0], (hi << 16) | lo);
+        st.pc = next_pc;
+        return 1;
+      }
 
       // f16 / bf16 conversions (quantization is where the AOT path needs them
       // for FP16/BF16 GEMM tiles; the RNE narrowing matches LLVM fptrunc).
@@ -2183,6 +2461,288 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       else if (is_uni) result = uni;
       else result = any;
       st.preds[dst] = result;
+      st.pc = next_pc;
+      return 1;
+    }
+
+    // ---- mma.sync.aligned (warp-cooperative matrix multiply-accumulate) ----
+    // D = A*B + C over a logical MxNxK tile, gathered from the whole warp's
+    // fragments (g_block_states, same mechanism as shfl/vote) and scattered
+    // back to this thread's D fragment.
+    //
+    // Fragment layouts are PTX ISA 9.7.16.5 (m16n8k16 float/integer,
+    // m16n8k8 float), NOT memory: groupID = lane>>2, tigid = lane&3, and the
+    // per-element (row, col) formulas below are transcribed from those
+    // sections verbatim.
+    //
+    // Accumulation order is UNSPECIFIED by the spec, so ours is documented
+    // instead of guessed: k-ascending single-precision FMA chain per output
+    // element (exact products for f16/bf16/fp8/u8/s8 inputs — all fit f32/s32
+    // mantissas — rounded once per add, like hardware). The AOT path lowers
+    // to the same order, so the two paths are bit-identical; hardware may
+    // differ in the last ulp, which the spec explicitly permits.
+    //
+    // Supported: .row.col only (other layouts refuse loudly); shapes
+    // m16n8k16 and m16n8k8; atype==btype in {f16,bf16,e4m3,e5m2,u8,s8};
+    // dtype==ctype in {f32,f16,s32}. Everything else (sparse, wgmma, f64,
+    // tf32, block-scaling, .col layouts) refuses loudly, never silently.
+    if (op.rfind("mma.sync.", 0) == 0) {
+      if (!g_block_states) {
+        if (error) *error = "mma.sync outside a warp context in " + fn.name;
+        return 0;
+      }
+      // Split "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32".
+      std::vector<std::string> q;
+      {
+        std::stringstream ss(op);
+        std::string t;
+        while (std::getline(ss, t, '.')) q.push_back(t);
+      }
+      // q = [mma,sync,aligned?,shape,row,col,dtype,atype,btype,ctype]
+      std::string shape, alayout, blayout, dtype, atype, btype, ctype;
+      for (size_t i = 0; i < q.size(); ++i) {
+        if (q[i] == "mma" || q[i] == "sync" || q[i] == "aligned") continue;
+        if (q[i].rfind("m", 0) == 0 && q[i].find("n") != std::string::npos &&
+            shape.empty())
+          shape = q[i];
+        else if ((q[i] == "row" || q[i] == "col") && alayout.empty())
+          alayout = q[i];
+        else if ((q[i] == "row" || q[i] == "col") && blayout.empty())
+          blayout = q[i];
+        else if (dtype.empty())
+          dtype = q[i];
+        else if (atype.empty()) atype = q[i];
+        else if (btype.empty()) btype = q[i];
+        else if (ctype.empty()) ctype = q[i];
+      }
+      const bool okShape = shape == "m16n8k16" || shape == "m16n8k8";
+      const bool okLayout = alayout == "row" && blayout == "col";
+      const bool okAB = (atype == "f16" || atype == "bf16" || atype == "e4m3" ||
+                         atype == "e5m2" || atype == "u8" || atype == "s8") &&
+                        atype == btype;
+      const bool okDC = (dtype == "f32" || dtype == "f16" || dtype == "s32") &&
+                        dtype == ctype;
+      // Integer mma needs s32 accumulators; float mma needs float ones.
+      const bool isInt = atype == "u8" || atype == "s8";
+      const bool okMix = (!isInt && dtype != "s32") || (isInt && dtype == "s32");
+      if (!okShape || !okLayout || !okAB || !okDC || !okMix) {
+        if (error)
+          *error = "unsupported mma form '" + op + "' in " + fn.name +
+                   " (supported: .row.col m16n8k16/m16n8k8, "
+                   "f16/bf16/e4m3/e5m2/u8/s8 -> f32/f16/s32)";
+        return 0;
+      }
+      // K is the only shape dimension that varies the loop below (M=16, N=8
+      // are structural in the tile arrays).
+      const int K = (shape == "m16n8k16") ? 16 : 8;
+      // Fragment arities per (shape, atype class).
+      const bool fp16AB = atype == "f16" || atype == "bf16";
+      int nA = 0, nB = 0;  // registers per fragment vector
+      if (shape == "m16n8k16") {
+        nA = fp16AB ? 4 : 2;
+        nB = fp16AB ? 2 : 1;
+      } else {
+        nA = 2;
+        nB = 1;
+      }
+      const int nD = (dtype == "f16") ? 2 : 4;
+      // Split brace groups: {d..}, {a..}, {b..}, {c..}.
+      std::vector<std::vector<std::string>> groups;
+      {
+        std::vector<std::string> cur;
+        for (const auto& a : A) {
+          cur.push_back(vector_reg_name(a));
+          if (!a.empty() && a.back() == '}') {
+            groups.push_back(cur);
+            cur.clear();
+          }
+        }
+        if (!cur.empty()) groups.push_back(cur);
+      }
+      if (groups.size() != 4 || (int)groups[0].size() != nD ||
+          (int)groups[1].size() != nA || (int)groups[2].size() != nB ||
+          (int)groups[3].size() != nD) {
+        if (error)
+          *error = "bad mma fragment groups in '" + op + "' in " + fn.name;
+        return 0;
+      }
+      // Element fetchers: register value -> float (or int64 for the integer
+      // path). f16x2/bf16x2 regs hold two elements (low first); .b32 regs
+      // hold four bytes (low first); f32/s32 regs hold one. The `f16` flag
+      // selects the element format explicitly: A/B fragments use atype,
+      // C/D accumulators are always plain .f16 when dtype is f16.
+      const auto getF16x2 = [&](const ExecState& s, const std::string& r, int idx,
+                                bool isBf16) -> float {
+        const uint32_t v = static_cast<uint32_t>(s.reg(r));
+        const uint16_t h = static_cast<uint16_t>((v >> (16 * (idx & 1))) & 0xffffu);
+        return isBf16 ? bf16_to_f32(h) : f16_to_f32(h);
+      };
+      const auto getB32 = [&](const ExecState& s, const std::string& r,
+                              int idx) -> float {
+        const uint32_t v = static_cast<uint32_t>(s.reg(r));
+        const uint8_t byte = static_cast<uint8_t>((v >> (8 * idx)) & 0xffu);
+        if (atype == "u8") return static_cast<float>(byte);
+        if (atype == "s8") return static_cast<float>(static_cast<int8_t>(byte));
+        const NarrowFpFormat& F = (atype == "e4m3") ? kE4M3 : kE5M2;
+        return narrow_to_f32(byte, F);
+      };
+      const auto getI32 = [&](const ExecState& s, const std::string& r) -> int64_t {
+        return static_cast<int64_t>(static_cast<int32_t>(s.reg(r)));
+      };
+      // Full logical tiles, gathered across the warp.
+      float tA[16][16], tB[16][8], tC[16][8];
+      int64_t iA[16][16], iB[16][8], iC[16][8];
+      for (int i = 0; i < 16; ++i)
+        for (int j = 0; j < 16; ++j) {
+          tA[i][j] = 0.0f;
+          iA[i][j] = 0;
+        }
+      for (int i = 0; i < 16; ++i)
+        for (int j = 0; j < 8; ++j) {
+          tB[i][j] = 0.0f;
+          tC[i][j] = 0.0f;
+          iB[i][j] = 0;
+          iC[i][j] = 0;
+        }
+      const uint32_t linear0 =
+          st.tid[0] + st.tid[1] * st.ntid[0] + st.tid[2] * st.ntid[0] * st.ntid[1];
+      const uint32_t warpBase0 = linear0 - (linear0 % 32);
+      for (uint32_t l = 0; l < 32; ++l) {
+        const size_t si = static_cast<size_t>(warpBase0 + l);
+        if (si >= g_block_states->size()) continue;
+        const ExecState& ls = (*g_block_states)[si];
+        const int g = static_cast<int>(l >> 2);
+        const int t = static_cast<int>(l & 3);
+        // --- A fragment ---
+        if (shape == "m16n8k16" && fp16AB) {
+          for (int s = 0; s < 8; ++s) {
+            const std::string& reg = groups[1][s / 2];
+            const float v = getF16x2(ls, reg, s % 2, atype == "bf16");
+            int r, c;
+            if (s < 2 || (s >= 4 && s < 6)) r = g;
+            else r = g + 8;
+            c = (s < 4) ? (t * 2 + (s & 1)) : (t * 2 + (s & 1) + 8);
+            tA[r][c] = v;
+          }
+        } else if (shape == "m16n8k16") {
+          // e4m3/e5m2/u8/s8: 2x .b32, a0..a7.
+          for (int s = 0; s < 8; ++s) {
+            const std::string& reg = groups[1][s / 4];
+            const int r = (s < 4) ? g : g + 8;
+            const int c = t * 4 + (s & 3);
+            if (isInt) {
+              const uint32_t v = static_cast<uint32_t>(ls.reg(reg));
+              const uint8_t byte = static_cast<uint8_t>((v >> (8 * (s & 3))) & 0xffu);
+              iA[r][c] = (atype == "s8") ? static_cast<int64_t>(static_cast<int8_t>(byte))
+                                         : static_cast<int64_t>(byte);
+            } else {
+              tA[r][c] = getB32(ls, reg, s & 3);
+            }
+          }
+        } else {
+          // m16n8k8 f16/bf16: 2x .f16x2, a0..a3.
+          for (int s = 0; s < 4; ++s) {
+            const std::string& reg = groups[1][s / 2];
+            const float v = getF16x2(ls, reg, s % 2, atype == "bf16");
+            const int r = (s < 2) ? g : g + 8;
+            const int c = t * 2 + (s & 1);
+            tA[r][c] = v;
+          }
+        }
+        // --- B fragment ---
+        if (fp16AB) {
+          const int nb = (shape == "m16n8k16") ? 4 : 2;
+          for (int s = 0; s < nb; ++s) {
+            const std::string& reg = groups[2][s / 2];
+            const float v = getF16x2(ls, reg, s % 2, atype == "bf16");
+            int r, c;
+            if (shape == "m16n8k16") {
+              r = (s < 2) ? (t * 2 + (s & 1)) : (t * 2 + (s & 1) + 8);
+              c = g;
+            } else {
+              r = t * 2 + s;
+              c = g;
+            }
+            tB[r][c] = v;
+          }
+        } else {
+          for (int s = 0; s < 4; ++s) {
+            const std::string& reg = groups[2][0];
+            const int r = t * 4 + s;
+            const int c = g;
+            if (isInt) {
+              const uint32_t v = static_cast<uint32_t>(ls.reg(reg));
+              const uint8_t byte = static_cast<uint8_t>((v >> (8 * s)) & 0xffu);
+              iB[r][c] = (btype == "s8") ? static_cast<int64_t>(static_cast<int8_t>(byte))
+                                         : static_cast<int64_t>(byte);
+            } else {
+              tB[r][c] = getB32(ls, reg, s);
+            }
+          }
+        }
+        // --- C fragment (f32: 4 regs; f16: 2x .f16x2; s32: 4 regs) ---
+        if (dtype == "f16") {
+          for (int s = 0; s < 4; ++s) {
+            const std::string& reg = groups[3][s / 2];
+            const float v = getF16x2(ls, reg, s % 2, false);
+            const int r = (s < 2) ? g : g + 8;
+            const int c = t * 2 + (s & 1);
+            tC[r][c] = v;
+          }
+        } else if (isInt) {
+          for (int s = 0; s < 4; ++s) {
+            const std::string& reg = groups[3][s];
+            const int r = (s < 2) ? g : g + 8;
+            const int c = t * 2 + (s & 1);
+            iC[r][c] = getI32(ls, reg);
+          }
+        } else {
+          for (int s = 0; s < 4; ++s) {
+            const std::string& reg = groups[3][s];
+            const uint32_t v = static_cast<uint32_t>(ls.reg(reg));
+            const int r = (s < 2) ? g : g + 8;
+            const int c = t * 2 + (s & 1);
+            tC[r][c] = bit_cast_v<float>(v);
+          }
+        }
+      }
+      // --- compute + scatter this thread's D fragment ---
+      const uint32_t lane =
+          linear0 - warpBase0;
+      const int g0 = static_cast<int>(lane >> 2);
+      const int t0 = static_cast<int>(lane & 3);
+      if (isInt) {
+        int64_t acc[4];
+        for (int s = 0; s < 4; ++s) {
+          const int r = (s < 2) ? g0 : g0 + 8;
+          const int c = t0 * 2 + (s & 1);
+          int64_t sum = iC[r][c];
+          for (int k = 0; k < K; ++k) sum += iA[r][k] * iB[k][c];
+          acc[s] = sum;
+        }
+        for (int s = 0; s < 4; ++s)
+          st.setreg(groups[0][s], static_cast<uint64_t>(static_cast<uint32_t>(acc[s])));
+      } else {
+        float acc[4];
+        for (int s = 0; s < 4; ++s) {
+          const int r = (s < 2) ? g0 : g0 + 8;
+          const int c = t0 * 2 + (s & 1);
+          float sum = tC[r][c];
+          for (int k = 0; k < K; ++k) sum = std::fma(tA[r][k], tB[k][c], sum);
+          acc[s] = sum;
+        }
+        if (dtype == "f16") {
+          for (int s = 0; s < 2; ++s) {
+            const uint16_t lo = f32_to_f16_rne(acc[s * 2]);
+            const uint16_t hi = f32_to_f16_rne(acc[s * 2 + 1]);
+            st.setreg(groups[0][s],
+                      static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 16));
+          }
+        } else {
+          for (int s = 0; s < 4; ++s)
+            st.setreg(groups[0][s], static_cast<uint64_t>(bit_cast_v<uint32_t>(acc[s])));
+        }
+      }
       st.pc = next_pc;
       return 1;
     }

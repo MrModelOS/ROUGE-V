@@ -1,0 +1,99 @@
+// ROUGE-V canonical kernel: narrow-float packed conversions (FP8/FP6/FP4).
+//
+// One value per call; mode selects the conversion (mirrors test_narrow_fp.cpp,
+// which checks the interpreter on the same vectors — AOT and interpreter must
+// agree bit-for-bit):
+//   mode 0/1: f32 -> e4m3x2 / e5m2x2 packed (same value in both slots)
+//   mode 2/3: e4m3x2 / e5m2x2 packed bytes -> f16x2 bits
+//   mode 4/5: f32 -> e3m2x2 / e2m3x2 packed
+//   mode 6/7: e3m2x2 / e2m3x2 packed bytes -> f16x2 bits
+//   mode 8:   f32 -> e2m1x2 packed
+//   mode 9:   e2m1x2 packed bytes -> f16x2 bits
+// Input in %r2 (f32 bits for encode, packed bytes for decode), output %r3.
+.version 9.4
+.target sm_90
+.address_size 64
+
+.visible .entry fp8_cvt(
+    .param .u64 fp8_cvt_param_0,
+    .param .u32 fp8_cvt_param_1,
+    .param .u32 fp8_cvt_param_2
+)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<3>;
+    .reg .f32 %f<4>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [fp8_cvt_param_0];
+    ld.param.u32 %r1, [fp8_cvt_param_1];
+    ld.param.u32 %r2, [fp8_cvt_param_2];
+    cvta.to.global.u64 %rd1, %rd1;
+
+    // cvt sources are read as raw bit patterns by both paths, so %r1
+    // (holding f32 bits for encode, packed bytes for decode) feeds directly.
+    mov.b32 %r3, %r1;
+    // mode dispatch
+    setp.eq.u32 %p1, %r2, 0;
+    @%p1 bra $L_m0;
+    setp.eq.u32 %p1, %r2, 1;
+    @%p1 bra $L_m1;
+    setp.eq.u32 %p1, %r2, 2;
+    @%p1 bra $L_m2;
+    setp.eq.u32 %p1, %r2, 3;
+    @%p1 bra $L_m3;
+    setp.eq.u32 %p1, %r2, 4;
+    @%p1 bra $L_m4;
+    setp.eq.u32 %p1, %r2, 5;
+    @%p1 bra $L_m5;
+    setp.eq.u32 %p1, %r2, 6;
+    @%p1 bra $L_m6;
+    setp.eq.u32 %p1, %r2, 7;
+    @%p1 bra $L_m7;
+    setp.eq.u32 %p1, %r2, 8;
+    @%p1 bra $L_m8;
+    bra.uni $L_m9;
+
+$L_m0:
+    cvt.rn.satfinite.e4m3x2.f32 %r4, %r3, %r3;
+    mov.u32 %r3, %r4;
+    bra.uni $L_out;
+$L_m1:
+    cvt.rn.satfinite.e5m2x2.f32 %r4, %r3, %r3;
+    mov.u32 %r3, %r4;
+    bra.uni $L_out;
+$L_m2:
+    cvt.rn.f16x2.e4m3x2 %r4, %r3;
+    mov.u32 %r3, %r4;
+    bra.uni $L_out;
+$L_m3:
+    cvt.rn.f16x2.e5m2x2 %r4, %r3;
+    mov.u32 %r3, %r4;
+    bra.uni $L_out;
+$L_m4:
+    cvt.rn.satfinite.e3m2x2.f32 %r4, %r3, %r3;
+    mov.u32 %r3, %r4;
+    bra.uni $L_out;
+$L_m5:
+    cvt.rn.satfinite.e2m3x2.f32 %r4, %r3, %r3;
+    mov.u32 %r3, %r4;
+    bra.uni $L_out;
+$L_m6:
+    cvt.rn.f16x2.e3m2x2 %r4, %r3;
+    mov.u32 %r3, %r4;
+    bra.uni $L_out;
+$L_m7:
+    cvt.rn.f16x2.e2m3x2 %r4, %r3;
+    mov.u32 %r3, %r4;
+    bra.uni $L_out;
+$L_m8:
+    cvt.rn.satfinite.e2m1x2.f32 %r4, %r3, %r3;
+    mov.u32 %r3, %r4;
+    bra.uni $L_out;
+$L_m9:
+    cvt.rn.f16x2.e2m1x2 %r4, %r3;
+    mov.u32 %r3, %r4;
+$L_out:
+    st.global.u32 [%rd1], %r3;
+    ret;
+}

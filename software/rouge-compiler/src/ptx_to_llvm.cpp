@@ -1324,6 +1324,16 @@ class LlvmGen {
 
     if (op == "bra" || op == "bra.uni" || op == "ret" || op == "exit") return true;
 
+    // mma.sync needs warp-cooperative fragment exchange across lanes. The
+    // interpreter executes it exactly (see rouge-ptx/ptx.cpp); the AOT path
+    // lowers it once a cross-lane exchange channel exists (Wave 3, step 2:
+    // per-launch exchange region through the launch descriptor). Refusing
+    // loudly beats silently computing one lane's fragment as the whole tile.
+    if (op.rfind("mma.", 0) == 0 || op.rfind("wmma.", 0) == 0)
+      return fail("warp-cooperative '" + op + "' @ " + std::to_string(idx) +
+                  " is interpreter-only for now (Wave 3 step 2 tracks the AOT"
+                  " exchange lowering)");
+
     return fail("unsupported PTX op '" + op + "' @ " + std::to_string(idx) +
                 " (vectorizing lowering landing in MLIR stage 2)");
   }
@@ -2124,9 +2134,395 @@ class LlvmGen {
     return true;
   }
 
+  // ---- narrow float formats (e4m3 / e5m2 / e3m2 / e2m3 / e2m1) --------------
+  // Bit layouts and special values are the OCP specs (OFP8 Table 1-2, OCP MX
+  // v1.0 Table 7), mirrored from the interpreter (rouge-ptx/ptx.cpp), which
+  // documents the exact spec references. The IR below is branchless integer
+  // arithmetic + selects, op-for-op with the C++ scalar cores, so AOT and
+  // interpreter agree bit-for-bit on every input.
+  //
+  // LLVM IR has no nested instructions: every operation's result is bound to
+  // a fresh SSA name by the helpers below (i32 arithmetic, i1 logic,
+  // selects, float bitcasts).
+  std::string i32op(const std::string& op, const std::string& a,
+                    const std::string& b) {
+    const std::string r = fresh("%b");
+    line("  " + r + " = " + op + " i32 " + a + ", " + b);
+    return r;
+  }
+  std::string i1op(const std::string& op, const std::string& a,
+                   const std::string& b) {
+    const std::string r = fresh("%c");
+    line("  " + r + " = " + op + " i1 " + a + ", " + b);
+    return r;
+  }
+  std::string i32cmp(const std::string& pred, const std::string& a,
+                     const std::string& b) {
+    const std::string r = fresh("%cc");
+    line("  " + r + " = icmp " + pred + " i32 " + a + ", " + b);
+    return r;
+  }
+  std::string i32sel(const std::string& c, const std::string& a,
+                     const std::string& b) {
+    const std::string r = fresh("%sl");
+    line("  " + r + " = select i1 " + c + ", i32 " + a + ", i32 " + b);
+    return r;
+  }
+  std::string f32sel(const std::string& c, const std::string& a,
+                     const std::string& b) {
+    const std::string r = fresh("%sl");
+    line("  " + r + " = select i1 " + c + ", float " + a + ", float " + b);
+    return r;
+  }
+  std::string f32cmp(const std::string& pred, const std::string& a,
+                     const std::string& b) {
+    const std::string r = fresh("%fc");
+    line("  " + r + " = fcmp " + pred + " float " + a + ", " + b);
+    return r;
+  }
+  std::string f32bits(const std::string& f) {
+    const std::string r = fresh("%fb");
+    line("  " + r + " = bitcast float " + f + " to i32");
+    return r;
+  }
+  std::string bitsf32(const std::string& b) {
+    const std::string r = fresh("%bf");
+    line("  " + r + " = bitcast i32 " + b + " to float");
+    return r;
+  }
+  std::string f32const(uint32_t bits) {
+    const std::string r = fresh("%fc");
+    line("  " + r + " = bitcast i32 " + std::to_string(bits) + " to float");
+    return r;
+  }
+  struct NarrowFmt {
+    int E, M, bias;
+    uint32_t maxBits, nanBits;  // field patterns (no sign); nanBits 0 = none
+    int shift, width;           // container placement (.b8; e2m1 central [5:2])
+    bool nanToMax;              // NaN -> positive MAX_NORM (FP6/FP4 rule)
+  };
+  static bool narrow_fmt(const std::string& name, NarrowFmt* out) {
+    if (name == "e4m3x2") *out = {4, 3, 7, 0x7E, 0x7F, 0, 8, false};
+    else if (name == "e5m2x2") *out = {5, 2, 15, 0x7B, 0x7F, 0, 8, false};
+    else if (name == "e3m2x2") *out = {3, 2, 3, 0x3F, 0, 0, 6, true};
+    else if (name == "e2m3x2") *out = {2, 3, 1, 0x3F, 0, 0, 6, true};
+    else if (name == "e2m1x2") *out = {2, 1, 1, 0x0F, 0, 2, 4, true};
+    else return false;
+    return true;
+  }
+
+  // f32 SSA -> narrow field bits (i32, low fieldWidth bits). Mirrors
+  // f32_to_narrow() in the interpreter exactly (same order of checks).
+  // f32 SSA -> narrow field bits (i32, low fieldWidth bits). Mirrors
+  // f32_to_narrow() in the interpreter exactly (same order of checks).
+  std::string emit_fp_encode(const std::string& floatSSA, const NarrowFmt& F,
+                             bool rz, bool relu) {
+    const int W = F.width;
+    const uint32_t maxExp = (1u << F.E) - 1u;
+    const uint32_t allMant = (1u << F.M) - 1u;
+    const uint32_t capNum = (1u << (F.E + F.M)) - 1u;
+    const bool topNormal =
+        ((F.maxBits >> F.M) & maxExp) == maxExp;
+    const std::string Sw = std::to_string(W - 1);
+    const std::string SmaxExp = std::to_string(maxExp);
+    // relu first (float domain, same condition as the interpreter).
+    std::string v = floatSSA;
+    if (relu) {
+      const std::string isNan = f32cmp("uno", v, "0.0");
+      const std::string isNeg = f32cmp("olt", v, "0.0");
+      const std::string qnan = f32const(0x7FC00000u);
+      const std::string pos0 = f32const(0u);
+      v = f32sel(isNan, qnan, v);
+      v = f32sel(isNeg, pos0, v);
+    }
+    const std::string x = f32bits(v);
+    const std::string sign = i32op("lshr", x, "31");
+    const std::string e = i32op("and", i32op("lshr", x, "23"), "255");
+    const std::string man = i32op("and", x, "8388607");
+    const std::string eMax = i32cmp("eq", e, "255");
+    const std::string manNZ = i32cmp("ne", man, "0");
+    const std::string isnan = i1op("and", eMax, manNZ);
+    const std::string manZ = i32cmp("eq", man, "0");
+    const std::string isinf = i1op("and", eMax, manZ);
+    const std::string eZero = i32cmp("eq", e, "0");
+    const std::string iszero = i1op("and", eZero, manZ);
+    const std::string shSign = i32op("shl", sign, Sw);
+    const std::string signedMax = i32op("or", shSign, std::to_string(F.maxBits));
+    const uint32_t nanPat = F.nanToMax ? F.maxBits : F.nanBits;
+    const std::string signedNan = i32op("or", shSign, std::to_string(nanPat));
+    const std::string unbiased = i32op("sub", e, "127");
+    const std::string tExp = i32op("add", unbiased, std::to_string(F.bias));
+    const std::string ovf = i32cmp("sgt", tExp, SmaxExp);
+    const std::string isSub = i32cmp("sle", tExp, "0");
+    const std::string tiny = i32cmp("slt", tExp, std::to_string(-F.M));
+    // Subnormal path.
+    const int mantShift = 23 - F.M;
+    const std::string full = i32op("or", i32op("shl", "1", "23"), man);
+    const std::string shift = i32op("add", i32op("sub", "1", tExp),
+                                    std::to_string(mantShift));
+    const std::string valSub = i32op("lshr", full, shift);
+    const std::string remMask = i32op("sub", i32op("shl", "1", shift), "1");
+    const std::string rem = i32op("and", full, remMask);
+    const std::string half = i32op("shl", "1", i32op("sub", shift, "1"));
+    std::string doInc;
+    if (rz) {
+      doInc = i32cmp("eq", "0", "1");  // false: truncate
+    } else {
+      const std::string gtHalf = i32cmp("ugt", rem, half);
+      const std::string eqHalf = i32cmp("eq", rem, half);
+      const std::string oddLow = i32cmp("eq", i32op("and", valSub, "1"), "1");
+      doInc = i1op("or", gtHalf, i1op("and", eqHalf, oddLow));
+    }
+    const std::string valSubR = i32op("add", valSub, i32sel(doInc, "1", "0"));
+    const std::string valSubC = i32sel(i32cmp("ugt", valSubR, std::to_string(capNum)),
+                                       std::to_string(capNum), valSubR);
+    std::string subCarry;
+    if (F.nanBits != 0) {
+      subCarry = i32cmp("eq", i32op("lshr", valSubC, std::to_string(F.M)), SmaxExp);
+    } else {
+      subCarry = i32cmp("eq", "0", "1");  // false
+    }
+    const std::string subRes =
+        i32sel(subCarry, signedMax,
+               i32op("or", shSign, i32op("and", valSubC, std::to_string(capNum))));
+    // Normal path.
+    const int dropBits = 23 - F.M;
+    const std::string val =
+        i32op("or", i32op("shl", tExp, std::to_string(F.M)),
+              i32op("lshr", man, std::to_string(dropBits)));
+    const std::string remN = i32op("and", man, std::to_string((1u << dropBits) - 1u));
+    const std::string halfN = i32op("shl", "1", std::to_string(dropBits - 1));
+    std::string doIncN;
+    if (rz) {
+      doIncN = i32cmp("eq", "0", "1");
+    } else {
+      const std::string gtH = i32cmp("ugt", remN, halfN);
+      const std::string eqH = i32cmp("eq", remN, halfN);
+      const std::string oddL = i32cmp("eq", i32op("and", val, "1"), "1");
+      doIncN = i1op("or", gtH, i1op("and", eqH, oddL));
+    }
+    const std::string valR = i32op("add", val, i32sel(doIncN, "1", "0"));
+    const std::string gotExp = i32op("lshr", valR, std::to_string(F.M));
+    const std::string pastMax = i32cmp("ugt", gotExp, SmaxExp);
+    const std::string atMax = i32cmp("eq", gotExp, SmaxExp);
+    std::string needMax;
+    if (F.nanBits != 0) {
+      if (!topNormal) {
+        needMax = atMax;  // e5m2: anything in exp==31 saturates
+      } else {
+        // e4m3: only the NaN pattern (mantissa all ones) saturates.
+        needMax = i1op("and", atMax,
+                       i32cmp("eq", i32op("and", valR, std::to_string(allMant)),
+                              std::to_string(allMant)));
+      }
+    } else {
+      needMax = pastMax;  // no-NaN formats saturate only past the top binade
+    }
+    const uint32_t fMask = (F.width == 32) ? 0xffffffffu : ((1u << W) - 1u);
+    const std::string normRes = i32sel(
+        needMax, signedMax,
+        i32op("or", shSign, i32op("and", valR, std::to_string(fMask))));
+    // Priority exactly as in the interpreter.
+    std::string r = i32sel(isSub, subRes, normRes);
+    r = i32sel(tiny, "0", r);
+    r = i32sel(ovf, signedMax, r);
+    r = i32sel(iszero, shSign, r);
+    r = i32sel(isinf, signedMax, r);
+    r = i32sel(isnan, signedNan, r);
+    return r;
+  }
+
+  // Narrow container byte (i32 SSA, low 8 bits) -> f32 SSA. Mirrors
+  // narrow_to_f32() in the interpreter exactly.
+  std::string emit_fp_decode(const std::string& byteSSA, const NarrowFmt& F) {
+    const int W = F.width;
+    const uint32_t maxExp = (1u << F.E) - 1u;
+    const uint32_t allMant = (1u << F.M) - 1u;
+    const bool topNormal =
+        ((F.maxBits >> F.M) & maxExp) == maxExp;
+    const std::string Sw = std::to_string(W - 1);
+    const std::string SmaxExp = std::to_string(maxExp);
+    const std::string SallMant = std::to_string(allMant);
+    std::string field = byteSSA;
+    if (F.shift != 0 || W != 8) {
+      field = i32op("and", i32op("lshr", byteSSA, std::to_string(F.shift)),
+                    std::to_string((1u << W) - 1u));
+    }
+    const std::string sign = i32op("lshr", field, Sw);
+    const std::string exp =
+        i32op("and", i32op("lshr", field, std::to_string(F.M)), SmaxExp);
+    const std::string man = i32op("and", field, SallMant);
+    const std::string fsign = i32op("shl", sign, "31");
+    const std::string isZeroE = i32cmp("eq", exp, "0");
+    const std::string isZeroM = i32cmp("eq", man, "0");
+    const std::string isZero = i1op("and", isZeroE, isZeroM);
+    const std::string zeroRes = bitsf32(fsign);
+    // Subnormal: unrolled normalize (M steps suffice: man < 2^M).
+    std::string curM = man, curS = i32op("sub", "0", "0");
+    const std::string bitM = std::to_string(1u << F.M);
+    for (int i = 0; i < F.M; ++i) {
+      const std::string need = i32cmp("eq", i32op("and", curM, bitM), "0");
+      curM = i32sel(need, i32op("shl", curM, "1"), curM);
+      curS = i32sel(need, i32op("add", curS, "1"), curS);
+    }
+    const std::string normM = i32op("and", curM, SallMant);
+    const std::string subExp =
+        i32op("sub", std::to_string(127 - F.bias + 1), curS);
+    const std::string subBits = i32op(
+        "or", i32op("or", fsign, i32op("shl", subExp, "23")),
+        i32op("shl", i32op("and", normM, SallMant), std::to_string(23 - F.M)));
+    const std::string subRes = bitsf32(subBits);
+    // Top exponent: per-format rule.
+    const std::string isTop = i32cmp("eq", exp, SmaxExp);
+    const std::string normExp = i32op("add", exp, std::to_string(127 - F.bias));
+    const std::string normBits = i32op(
+        "or", i32op("or", fsign, i32op("shl", normExp, "23")),
+        i32op("shl", man, std::to_string(23 - F.M)));
+    const std::string normRes = bitsf32(normBits);
+    std::string topVal;
+    if (F.nanBits != 0 && topNormal) {
+      // e4m3: NaN only when man==allMant.
+      const std::string isAll = i32cmp("eq", man, SallMant);
+      const std::string asNan = bitsf32(i32op("or", fsign, "2143289344"));
+      topVal = f32sel(isAll, asNan, normRes);
+    } else if (F.nanBits != 0) {
+      // e5m2: man==0 -> Inf else NaN.
+      const std::string manZero = i32cmp("eq", man, "0");
+      const std::string asInf = bitsf32(i32op("or", fsign, "2139095040"));
+      const std::string asNan = bitsf32(i32op("or", fsign, "2143289344"));
+      topVal = f32sel(manZero, asInf, asNan);
+    } else {
+      topVal = normRes;
+    }
+    const std::string r1 = f32sel(isTop, topVal, normRes);
+    const std::string manNZ = i32cmp("ne", man, "0");
+    const std::string isSubN = i1op("and", isZeroE, manNZ);
+    const std::string r2 = f32sel(isSubN, subRes, r1);
+    const std::string r3 = f32sel(isZero, zeroRes, r2);
+    return r3;
+  }
+
+  bool emit_narrow_cvt(const rouge::PtxInstruction& ins, size_t idx,
+                       const std::string& spec) {
+    const auto& A = ins.args;
+    const size_t dot = spec.find('.');
+    const std::string dst = dot == std::string::npos ? spec : spec.substr(0, dot);
+    const std::string src = dot == std::string::npos ? "" : spec.substr(dot + 1);
+    const bool rz = ins.op.find(".rz.") != std::string::npos;
+    const bool relu = ins.op.find(".relu") != std::string::npos;
+    NarrowFmt F;
+    // f32 -> packed x2 (d.b16 <- a upper, b lower).
+    if ((dst == "e4m3x2" || dst == "e5m2x2" || dst == "e3m2x2" || dst == "e2m3x2" ||
+         dst == "e2m1x2") &&
+        src == "f32") {
+      if (!narrow_fmt(dst, &F)) return fail("bad narrow type @" + std::to_string(idx));
+      if (A.size() != 3)
+        return fail("bad " + ins.op + " operands @ " + std::to_string(idx));
+      const std::string fa = load_f32(A[1]);
+      const std::string fb = load_f32(A[2]);
+      const std::string ea = emit_fp_encode(fa, F, rz, relu);
+      const std::string eb = emit_fp_encode(fb, F, rz, relu);
+      // Pack into the container (e2m1 central, e3m2/e2m3 low-6, fp8 full).
+      const auto packOne = [&](const std::string& field) {
+        const std::string p = fresh("%pk");
+        if (F.shift == 0 && F.width == 8) {
+          line("  " + p + " = and i32 " + field + ", 255");
+        } else {
+          line("  " + p + " = shl i32 " +
+               i32op("and", field, std::to_string((1u << F.width) - 1u)) + ", " +
+               std::to_string(F.shift));
+        }
+        return p;
+      };
+      const std::string pa = packOne(ea);
+      const std::string pb = packOne(eb);
+      const std::string both = fresh("%pb");
+      line("  " + both + " = or i32 " + i32op("shl", pa, "8") + ", " + pb);
+      // The packed payload is 16 bits; a .b16 destination takes it truncated,
+      // a wider register (nvcc uses .b32 for the packed pair) takes it as-is.
+      if (is_reg(A[0]) && reg_bits(A[0]) == 16) {
+        const std::string narrow = fresh("%nw");
+        line("  " + narrow + " = trunc i32 " + both + " to i16");
+        store_reg(A[0], narrow);
+      } else {
+        store_reg(A[0], both);
+      }
+      return true;
+    }
+    // packed x2 -> f16x2/bf16x2 (d = two halves).
+    if ((dst == "f16x2" || dst == "bf16x2") &&
+        (src == "e4m3x2" || src == "e5m2x2" || src == "e3m2x2" || src == "e2m3x2" ||
+         src == "e2m1x2")) {
+      if (!narrow_fmt(src, &F)) return fail("bad narrow type @" + std::to_string(idx));
+      if (A.size() != 2)
+        return fail("bad " + ins.op + " operands @ " + std::to_string(idx));
+      std::string aval16 = operand(A[1]);
+      // Source is a .b16 register holding two packed bytes.
+      if (is_reg(A[1]) && reg_bits(A[1]) != 16) {
+        const std::string t = fresh("%t");
+        line("  " + t + " = trunc " + reg_type(A[1]) + " " + aval16 + " to i16");
+        aval16 = t;
+      }
+      const std::string aval = fresh("%av");
+      line("  " + aval + " = zext i16 " + aval16 + " to i32");
+      const char* halfTy = dst == "f16x2" ? "half" : "bfloat";
+      const auto cvtOne = [&](const std::string& byteSSA) {
+        const std::string f = emit_fp_decode(byteSSA, F);
+        // relu on the way out mirrors the interpreter (clamp negatives).
+        std::string g = f;
+        if (relu) {
+          const std::string isNan = fresh("%qn");
+          line("  " + isNan + " = fcmp uno float " + f + ", 0.0");
+          const std::string isNeg = fresh("%qg");
+          line("  " + isNeg + " = fcmp olt float " + f + ", 0.0");
+          const std::string qnan = fresh("%qq");
+          line("  " + qnan + " = bitcast i32 2139095040 to float");
+          const std::string pos0 = fresh("%qz");
+          line("  " + pos0 + " = bitcast i32 0 to float");
+          const std::string g2 = fresh("%q2");
+          line("  " + g2 + " = select i1 " + isNan + ", float " + qnan + ", float " + f);
+          g = fresh("%q3");
+          line("  " + g + " = select i1 " + isNeg + ", float " + pos0 + ", float " + g2);
+        }
+        const std::string h = fresh("%qh");
+        line("  " + h + " = fptrunc float " + g + " to " + halfTy);
+        const std::string b = fresh("%qb");
+        line("  " + b + " = bitcast " + std::string(halfTy) + " " + h + " to i16");
+        return b;
+      };
+      const std::string hi8 = i32op("and", i32op("lshr", aval, "8"), "255");
+      const std::string lo8 = i32op("and", aval, "255");
+      const std::string hi = cvtOne(hi8);
+      const std::string lo = cvtOne(lo8);
+      const std::string hi32 = fresh("%hc");
+      line("  " + hi32 + " = zext i16 " + hi + " to i32");
+      const std::string lo32 = fresh("%lc");
+      line("  " + lo32 + " = zext i16 " + lo + " to i32");
+      const std::string both = fresh("%cb");
+      line("  " + both + " = or i32 " + i32op("shl", hi32, "16") + ", " + lo32);
+      store_reg(A[0], both);
+      return true;
+    }
+    return fail("unsupported narrow conversion '" + ins.op + "' @ " +
+                std::to_string(idx) + " (x4/.rs/.scaled forms refuse loudly)");
+  }
+
   bool emit_cvt(const rouge::PtxInstruction& ins, size_t idx) {
     const auto& A = ins.args;
-    if (A.size() != 2) return fail("bad cvt operands @ " + std::to_string(idx));
+    // Packed narrow-float forms take three operands (d, a, b); everything
+    // else takes two. The arity is validated per form below.
+    if (A.size() != 2) {
+      const std::string& op = ins.op;
+      const bool narrow3 =
+          (op.find(".e4m3x2") != std::string::npos ||
+           op.find(".e5m2x2") != std::string::npos ||
+           op.find(".e3m2x2") != std::string::npos ||
+           op.find(".e2m3x2") != std::string::npos ||
+           op.find(".e2m1x2") != std::string::npos) &&
+          op.find(".f32") != std::string::npos;
+      if (!narrow3 || A.size() != 3)
+        return fail("bad cvt operands @ " + std::to_string(idx));
+    }
     std::string spec = ins.op.substr(4);  // "u64.u32", "u32.u64", "rn.bf16.f32"...
 
     // A "cvt.<mod>." prefix carries PTX saturation / rounding rules that the
@@ -2147,9 +2543,9 @@ class LlvmGen {
       const size_t d = strip.find('.');
       if (d == std::string::npos) break;
       const std::string head = strip.substr(0, d);
-      const bool isMod = head == "sat" || head == "rn" || head == "rz" ||
-                         head == "rzi" || head == "rp" || head == "ru" ||
-                         head == "rm";
+      const bool isMod = head == "sat" || head == "satfinite" || head == "relu" ||
+                         head == "rn" || head == "rz" || head == "rzi" ||
+                         head == "rp" || head == "ru" || head == "rm";
       if (!isMod) break;
       mod = head;
       strip = strip.substr(d + 1);
@@ -2163,9 +2559,23 @@ class LlvmGen {
       const auto isFloat = [](const std::string& t) {
         return t == "f32" || t == "f64" || t == "f16" || t == "bf16";
       };
+      // Narrow-float packed destinations carry mandatory .satfinite (clamp to
+      // MAX_NORM) with .rn/.rz rounding; .relu is a plain clamp. x4, .rs and
+      // .scaled companions refuse below, mirroring the interpreter.
+      const auto isNarrow = [](const std::string& t) {
+        return t == "e4m3x2" || t == "e5m2x2" || t == "e3m2x2" ||
+               t == "e2m3x2" || t == "e2m1x2";
+      };
+      // Narrow-float packed types on either side (as destination with
+      // mandatory .satfinite, or as source): .rn/.rz rounding plus
+      // .satfinite/.relu clamps, all implemented below and in the interpreter.
+      const bool narrowDst = isNarrow(dstTy);
+      const bool narrowSrc = isNarrow(srcTy);
       const bool ok =
           mod.empty() || (mod == "rn" && isFloat(dstTy)) ||
-          ((mod == "rz" || mod == "rzi") && !isFloat(dstTy) && isFloat(srcTy));
+          ((mod == "rz" || mod == "rzi") && !isFloat(dstTy) && isFloat(srcTy)) ||
+          ((mod == "rn" || mod == "rz") && (narrowDst || narrowSrc)) ||
+          ((mod == "satfinite" || mod == "relu") && (narrowDst || narrowSrc));
       if (!ok) {
         return fail("unsupported rounding/saturating conversion '" + ins.op +
                     "' @ " + std::to_string(idx) +
@@ -2181,7 +2591,17 @@ class LlvmGen {
     // f16x2/bf16x2 fallback: 32-bit payload as i32 (2×i16 bit pattern).
     // Keep it simple — bit-copy through i32; unpack to 2× half can be added
     // when vector lowering lands in MLIR.
-    if (spec.find("x2") != std::string::npos) {
+    // Narrow-float cvt forms (e4m3x2/...) are NOT bit-copies: they are routed
+    // to emit_narrow_cvt below, which implements RNE+satfinite in integer IR.
+    // NOTE: spec is already modifier-stripped here ("e4m3x2.f32"), so the
+    // names match WITHOUT a leading dot (unlike ins.op, which keeps it).
+    const bool narrowX2 =
+        spec.find("e4m3x2") != std::string::npos ||
+        spec.find("e5m2x2") != std::string::npos ||
+        spec.find("e3m2x2") != std::string::npos ||
+        spec.find("e2m3x2") != std::string::npos ||
+        spec.find("e2m1x2") != std::string::npos;
+    if (!narrowX2 && spec.find("x2") != std::string::npos) {
       std::string val = operand(A[1]);
       const std::string dstTy = reg_type(A[0]);
       if (is_reg(A[1]) && reg_type(A[1]) != dstTy) {
@@ -2195,6 +2615,13 @@ class LlvmGen {
       store_reg(A[0], val);
       return true;
     }
+
+    // Narrow-float packed conversions (e4m3x2/e5m2x2/e3m2x2/e2m3x2/e2m1x2):
+    // same RNE+satfinite semantics as the interpreter (see rouge-ptx/ptx.cpp),
+    // lowered to branchless integer IR below so every target (host, NVPTX,
+    // AMD) executes them identically. x4/.rs/.scaled forms refuse loudly in
+    // the gate above, like the interpreter.
+    if (narrowX2) return emit_narrow_cvt(ins, idx, spec);
 
     // f16 / bf16 conversions: LLVM half / bfloat with fpext / fptrunc, which
     // round exactly like the interpreter's software conversions.

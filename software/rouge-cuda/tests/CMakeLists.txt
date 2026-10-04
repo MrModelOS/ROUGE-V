@@ -92,6 +92,20 @@ if(ROUGE_REAL_CUDA_INCLUDE AND ROUGE_PYTHON3)
   add_executable(test_driver_occupancy test_driver_occupancy.cpp)
   target_link_libraries(test_driver_occupancy PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
   add_test(NAME driver_occupancy COMMAND test_driver_occupancy)
+
+  # mma.sync: каноническое ядро против хост-эталона (побитово).
+  add_executable(test_mma test_mma.cpp)
+  target_include_directories(test_mma PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(test_mma PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
+  add_test(NAME mma COMMAND test_mma ${KERNEL_DIR})
+
+  # Narrow float форматы: исчерпывающая проверка через настоящий cvt.
+  add_executable(test_narrow_fp test_narrow_fp.cpp)
+  target_include_directories(test_narrow_fp PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(test_narrow_fp PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
+  add_test(NAME narrow_fp COMMAND test_narrow_fp)
 else()
   message(STATUS "device_prop_layout: SKIP (needs real CUDA headers and python3)")
 endif()

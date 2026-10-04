@@ -1,0 +1,170 @@
+// ROUGE-V canonical kernel: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32.
+//
+// One warp (32 threads) computes a 16x8 D tile: D = C + A*B with
+// A = 16x16 f16, B = 16x8 f16, C = 16x8 f32 (zeros here).
+// Fragments are built from lane arithmetic with mov/shl/or (no ldmatrix),
+// so this kernel tests exactly the interpreter's fragment gather + FMA
+// chain + scatter. The host reference replicates the PTX ISA 9.7.16.5.8
+// lane formulas, so any mapping deviation fails bit-exactly.
+//
+// Element values: A[r][c] = r*16+c, B[r][c] = 1000+r*8+c (as f16).
+// D is stored as 4xf32 per lane at out[lane*4 + s].
+.version 9.4
+.target sm_80
+.address_size 64
+
+.visible .entry mma_tile(
+    .param .u64 mma_tile_param_0
+)
+{
+    .reg .pred %p<2>;
+    .reg .f16 %h<4>;
+    .reg .f32 %f<12>;
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<4>;
+    .reg .f16x2 %a<4>;
+    .reg .f16x2 %b<2>;
+    .reg .f32 %c<4>;
+    .reg .f32 %d<4>;
+
+    ld.param.u64 %rd1, [mma_tile_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+
+    mov.u32 %r1, %tid.x;
+    shr.u32 %r2, %r1, 2;        // g = lane >> 2
+    and.b32 %r3, %r1, 3;        // t = lane & 3
+    shl.b32 %r4, %r3, 1;        // t*2
+
+    // ---- A fragment: 8 f16 values, rows g/g+8 x cols 2t..2t+1 + 8-half ----
+    // s=0: r=g+0, c=t*2+0
+    add.s32 %r5, %r2, 0;
+    add.s32 %r6, %r4, 0;
+    shl.b32 %r7, %r5, 4;
+    add.s32 %r7, %r7, %r6;
+    cvt.f32.s32 %f1, %r7;
+    cvt.f16.f32 %h1, %f1;
+    mov.u32 %r10, %h1;
+    // s=1: r=g+0, c=t*2+1
+    add.s32 %r6, %r4, 1;
+    shl.b32 %r7, %r5, 4;
+    add.s32 %r7, %r7, %r6;
+    cvt.f32.s32 %f1, %r7;
+    cvt.f16.f32 %h1, %f1;
+    mov.u32 %r11, %h1;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r10, %r10, %r11;
+    mov.u32 %a0, %r10;
+    // s=2: r=g+8, c=t*2+0
+    add.s32 %r5, %r2, 8;
+    add.s32 %r6, %r4, 0;
+    shl.b32 %r7, %r5, 4;
+    add.s32 %r7, %r7, %r6;
+    cvt.f32.s32 %f1, %r7;
+    cvt.f16.f32 %h1, %f1;
+    mov.u32 %r10, %h1;
+    // s=3: r=g+8, c=t*2+1
+    add.s32 %r6, %r4, 1;
+    shl.b32 %r7, %r5, 4;
+    add.s32 %r7, %r7, %r6;
+    cvt.f32.s32 %f1, %r7;
+    cvt.f16.f32 %h1, %f1;
+    mov.u32 %r11, %h1;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r10, %r10, %r11;
+    mov.u32 %a1, %r10;
+    // s=4: r=g+0, c=t*2+8
+    add.s32 %r5, %r2, 0;
+    add.s32 %r6, %r4, 8;
+    shl.b32 %r7, %r5, 4;
+    add.s32 %r7, %r7, %r6;
+    cvt.f32.s32 %f1, %r7;
+    cvt.f16.f32 %h1, %f1;
+    mov.u32 %r10, %h1;
+    // s=5: r=g+0, c=t*2+9
+    add.s32 %r6, %r4, 9;
+    shl.b32 %r7, %r5, 4;
+    add.s32 %r7, %r7, %r6;
+    cvt.f32.s32 %f1, %r7;
+    cvt.f16.f32 %h1, %f1;
+    mov.u32 %r11, %h1;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r10, %r10, %r11;
+    mov.u32 %a2, %r10;
+    // s=6: r=g+8, c=t*2+8
+    add.s32 %r5, %r2, 8;
+    add.s32 %r6, %r4, 8;
+    shl.b32 %r7, %r5, 4;
+    add.s32 %r7, %r7, %r6;
+    cvt.f32.s32 %f1, %r7;
+    cvt.f16.f32 %h1, %f1;
+    mov.u32 %r10, %h1;
+    // s=7: r=g+8, c=t*2+9
+    add.s32 %r6, %r4, 9;
+    shl.b32 %r7, %r5, 4;
+    add.s32 %r7, %r7, %r6;
+    cvt.f32.s32 %f1, %r7;
+    cvt.f16.f32 %h1, %f1;
+    mov.u32 %r11, %h1;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r10, %r10, %r11;
+    mov.u32 %a3, %r10;
+
+    // ---- B fragment: 4 f16 values, rows 2t..2t+1 (+8) x col g ----
+    // s=0: r=t*2+0, c=g ; val = 1000 + r*8 + c
+    add.s32 %r6, %r4, 0;
+    shl.b32 %r7, %r6, 3;
+    add.s32 %r7, %r7, %r2;
+    add.s32 %r7, %r7, 1000;
+    cvt.f32.s32 %f1, %r7;
+    cvt.f16.f32 %h1, %f1;
+    mov.u32 %r10, %h1;
+    // s=1: r=t*2+1, c=g
+    add.s32 %r6, %r4, 1;
+    shl.b32 %r7, %r6, 3;
+    add.s32 %r7, %r7, %r2;
+    add.s32 %r7, %r7, 1000;
+    cvt.f32.s32 %f1, %r7;
+    cvt.f16.f32 %h1, %f1;
+    mov.u32 %r11, %h1;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r10, %r10, %r11;
+    mov.u32 %b0, %r10;
+    // s=2: r=t*2+8, c=g
+    add.s32 %r6, %r4, 8;
+    shl.b32 %r7, %r6, 3;
+    add.s32 %r7, %r7, %r2;
+    add.s32 %r7, %r7, 1000;
+    cvt.f32.s32 %f1, %r7;
+    cvt.f16.f32 %h1, %f1;
+    mov.u32 %r10, %h1;
+    // s=3: r=t*2+9, c=g
+    add.s32 %r6, %r4, 9;
+    shl.b32 %r7, %r6, 3;
+    add.s32 %r7, %r7, %r2;
+    add.s32 %r7, %r7, 1000;
+    cvt.f32.s32 %f1, %r7;
+    cvt.f16.f32 %h1, %f1;
+    mov.u32 %r11, %h1;
+    shl.b32 %r11, %r11, 16;
+    or.b32 %r10, %r10, %r11;
+    mov.u32 %b1, %r10;
+
+    // ---- C = 0 ----
+    mov.f32 %c0, 0f00000000;
+    mov.f32 %c1, 0f00000000;
+    mov.f32 %c2, 0f00000000;
+    mov.f32 %c3, 0f00000000;
+
+    // ---- the mma itself ----
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%c0, %c1, %c2, %c3};
+
+    // ---- store D: out[lane*4 + s] ----
+    shl.b32 %r8, %r1, 2;        // lane*4 (element index)
+    shl.b32 %r9, %r8, 2;        // lane*16 (byte offset)
+    add.s64 %rd2, %rd1, %r9;
+    st.global.f32 [%rd2], %d0;
+    st.global.f32 [%rd2+4], %d1;
+    st.global.f32 [%rd2+8], %d2;
+    st.global.f32 [%rd2+12], %d3;
+    ret;
+}

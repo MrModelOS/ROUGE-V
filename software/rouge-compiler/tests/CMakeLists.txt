@@ -32,7 +32,7 @@ target_link_libraries(test_ptx_to_llvm_warp PRIVATE rouge-compiler-lib rouge-ptx
 add_test(NAME compiler_ptx_to_llvm_warp COMMAND test_ptx_to_llvm_warp)
 
 # Stage 1 always runs: PTX -> LLVM IR via our translator CLI.
-foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all)
+foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt)
   add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
     COMMAND ptx2ir ${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kern}.ptx
@@ -45,7 +45,7 @@ endforeach()
 find_program(CLANG_EXECUTABLE clang)
 if(CLANG_EXECUTABLE)
   # Compile one IR module per canonical kernel: ptx2ir -> clang -O2 -> .o
-  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all)
+  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt)
     add_custom_command(
       OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.o
       COMMAND ${CLANG_EXECUTABLE} -O2 -c ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
@@ -80,6 +80,15 @@ if(CLANG_EXECUTABLE)
                  ${CMAKE_CURRENT_BINARY_DIR}/gemm_tile.o)
   target_link_libraries(test_aot_gemm_tile PRIVATE rouge-runtime)
   add_test(NAME aot_native_gemm_tile COMMAND test_aot_gemm_tile)
+
+  # Test 2k: narrow-float packed conversions (fp8_cvt kernel, AOT vs interpreter).
+  add_executable(test_aot_fp8_cvt test_aot_fp8_cvt.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/fp8_cvt.o)
+  target_link_libraries(test_aot_fp8_cvt PRIVATE rouge-runtime rouge-ptx)
+  target_include_directories(test_aot_fp8_cvt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
+  add_test(NAME aot_native_fp8_cvt COMMAND test_aot_fp8_cvt
+           ${CMAKE_CURRENT_SOURCE_DIR}/kernels/fp8_cvt.ptx)
 
   # Test 2f: cas / exch / min / max (atom_cas kernel).
   add_executable(test_aot_atom_cas test_aot_atom_cas.cpp
