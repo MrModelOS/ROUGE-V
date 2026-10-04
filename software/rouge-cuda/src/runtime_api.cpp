@@ -5,6 +5,8 @@
 #include "rouge_internal.h"
 
 #include <cstring>
+#include <cstdio>
+#include <unistd.h>
 #include <string>
 
 namespace {
@@ -115,6 +117,127 @@ cudaError_t cudaStreamDestroy(cudaStream_t stream) {
   delete static_cast<int*>(stream);
   tls_last_error = cudaSuccess;
   return cudaSuccess;
+}
+
+cudaError_t cudaSetDevice(int device) {
+  if (device != 0) {
+    tls_last_error = cudaErrorInvalidDevice;
+    return tls_last_error;
+  }
+  tls_last_error = cudaSuccess;
+  return cudaSuccess;
+}
+
+cudaError_t cudaGetDevice(int *device) {
+  if (device == nullptr) {
+    tls_last_error = cudaErrorInvalidValue;
+    return tls_last_error;
+  }
+  *device = 0;
+  tls_last_error = cudaSuccess;
+  return cudaSuccess;
+}
+
+cudaError_t cudaDeviceReset(void) {
+  // Everything the backend owns is process-wide host memory owned by the
+  // program; a reset has nothing to invalidate. Reported honestly rather than
+  // pretending to tear down a context that does not exist.
+  tls_last_error = cudaSuccess;
+  return cudaSuccess;
+}
+
+cudaError_t cudaGetDeviceProperties(rouge_cuda_device_prop *prop, int device) {
+  if (prop == nullptr || device != 0) {
+    tls_last_error = device != 0 ? cudaErrorInvalidDevice : cudaErrorInvalidValue;
+    return tls_last_error;
+  }
+  std::memset(prop, 0, sizeof(*prop));
+  std::snprintf(prop->name, sizeof(prop->name), "ROUGE CPU-emulation device");
+  prop->uuid.bytes[0] = 'R';
+  prop->totalGlobalMem = static_cast<size_t>(sysconf(_SC_PHYS_PAGES)) *
+                         static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  prop->sharedMemPerBlock = 48u * 1024u;  // the real default for sm_70 and older
+  prop->sharedMemPerBlockOptin = 64u * 1024u;
+  prop->sharedMemPerMultiprocessor = 96u * 1024u;
+  prop->regsPerBlock = 65536;
+  prop->regsPerMultiprocessor = 65536;
+  prop->warpSize = 32;
+  prop->maxThreadsPerBlock = 1024;
+  prop->maxThreadsPerMultiProcessor = 2048;
+  prop->maxThreadsDim[0] = 1024;
+  prop->maxThreadsDim[1] = 1024;
+  prop->maxThreadsDim[2] = 64;
+  prop->maxGridSize[0] = 2147483647;
+  prop->maxGridSize[1] = 65535;
+  prop->maxGridSize[2] = 65535;
+  prop->multiProcessorCount = 1;
+  prop->canMapHostMemory = 1;
+  prop->concurrentKernels = 0;   // the backend runs one kernel at a time
+  prop->ECCEnabled = 0;
+  prop->major = 7;
+  prop->minor = 5;                // reference validation target (sm_75)
+  // Clocks are reported as 0: no GPU clock exists to measure, and a guessed
+  // number here would be a fabricated specification.
+  // Clocks are left at zero from the memset: no GPU clock exists to measure,
+  // and a plausible-looking number here would be a fabricated specification.
+  prop->integrated = 1;
+  prop->asyncEngineCount = 0;
+  prop->unifiedAddressing = 1;
+  tls_last_error = cudaSuccess;
+  return cudaSuccess;
+}
+
+cudaError_t cudaPeekAtLastError(void) {
+  // Peek must not clear the sticky error, which is the only reason to prefer
+  // it over cudaGetLastError.
+  return tls_last_error;
+}
+
+cudaError_t cudaMallocHost(void **ptr, size_t size) {
+  if (ptr == nullptr) {
+    tls_last_error = cudaErrorInvalidValue;
+    return tls_last_error;
+  }
+  if (size == 0) size = 1;
+  void *p = std::malloc(size);
+  if (p == nullptr) {
+    tls_last_error = cudaErrorMemoryAllocation;
+    return tls_last_error;
+  }
+  *ptr = p;
+  tls_last_error = cudaSuccess;
+  return cudaSuccess;
+}
+
+cudaError_t cudaHostAlloc(void **ptr, size_t size, unsigned int /*flags*/) {
+  return cudaMallocHost(ptr, size);
+}
+
+cudaError_t cudaFreeHost(void *ptr) {
+  std::free(ptr);
+  tls_last_error = cudaSuccess;
+  return cudaSuccess;
+}
+
+cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, cudaMemcpyKind kind,
+                            cudaStream_t /*stream*/) {
+  // The backend executes every launch synchronously, so an async copy is a
+  // plain copy: ordering with respect to kernels is already guaranteed.
+  return cudaMemcpy(dst, src, count, kind);
+}
+
+cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
+  if (devPtr == nullptr) {
+    tls_last_error = cudaErrorInvalidValue;
+    return tls_last_error;
+  }
+  std::memset(devPtr, value & 0xff, count);
+  tls_last_error = cudaSuccess;
+  return cudaSuccess;
+}
+
+cudaError_t cudaStreamCreateWithFlags(cudaStream_t *pStream, unsigned int /*flags*/) {
+  return cudaStreamCreate(pStream);
 }
 
 }  // extern "C"

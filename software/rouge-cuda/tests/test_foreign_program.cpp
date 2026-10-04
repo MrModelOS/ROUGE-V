@@ -23,14 +23,26 @@ static int fail(const char* what) {
 
 // Strips the compat layer's own diagnostics ("[ROUGE-CUDA] ...") so the
 // comparison is about the PROGRAM's output only, not about our logging.
+// The device name is also normalized: the real stack reports the physical
+// card ("NVIDIA GeForce MX450") while the shim honestly reports itself
+// ("ROUGE CPU-emulation device") — the name differing is correct behaviour,
+// everything else must agree.
 static std::string program_output_only(const std::string& text) {
   std::string out;
   size_t pos = 0;
   while (pos < text.size()) {
     size_t end = text.find('\n', pos);
     if (end == std::string::npos) end = text.size();
-    const std::string line = text.substr(pos, end - pos);
+    std::string line = text.substr(pos, end - pos);
     if (line.rfind("[ROUGE-CUDA]", 0) != 0) {
+      const std::string marker = "name=";
+      size_t at = line.find(marker);
+      if (at != std::string::npos) {
+        size_t stop = line.find(" err=", at);
+        if (stop == std::string::npos) stop = line.size();
+        line.erase(at, stop - at);
+        line.insert(at, "name=<device>");
+      }
       out += line;
       out += '\n';
     }

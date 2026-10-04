@@ -43,6 +43,33 @@ target_compile_definitions(test_interposer PRIVATE ROUGE_SHARED_LIB="$<TARGET_FI
 target_link_libraries(test_interposer PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
 add_test(NAME interposer COMMAND test_interposer)
 
+# ---- Раскладка cudaDeviceProp: сверка с настоящим заголовком NVIDIA -------
+# Наш заголовок — ABI-контракт, поэтому offsets обязаны совпадать байт в
+# байт. Настоящая структура извлекается из driver_types.h на этапе configure
+# (только структура, без остального заголовка — он конфликтовал бы с нашим).
+# Без настоящих заголовков или без python3 тест пропускается, а не падает.
+find_path(ROUGE_REAL_CUDA_INCLUDE driver_types.h
+  PATHS /opt/cuda/include /usr/local/cuda/include /usr/include)
+find_program(ROUGE_PYTHON3 python3)
+if(ROUGE_REAL_CUDA_INCLUDE AND ROUGE_PYTHON3)
+  add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/real_cuda_device_prop.h
+    COMMAND ${ROUGE_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/gen_real_prop_header.py
+            ${ROUGE_REAL_CUDA_INCLUDE}/driver_types.h
+            ${CMAKE_CURRENT_BINARY_DIR}/real_cuda_device_prop.h
+    DEPENDS ${ROUGE_REAL_CUDA_INCLUDE}/driver_types.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/gen_real_prop_header.py)
+  add_custom_target(real_prop_header
+    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/real_cuda_device_prop.h)
+  add_executable(test_device_prop_layout test_device_prop_layout.cpp)
+  target_include_directories(test_device_prop_layout PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include ${CMAKE_CURRENT_BINARY_DIR})
+  add_dependencies(test_device_prop_layout real_prop_header)
+  add_test(NAME device_prop_layout COMMAND test_device_prop_layout)
+else()
+  message(STATUS "device_prop_layout: SKIP (needs real CUDA headers and python3)")
+endif()
+
 # ---- Волна 1: целая чужая программа, собранная настоящим nvcc --------------
 # The program source lives in programs/ and is compiled by nvcc at test time.
 # Without nvcc the test reports SKIP; it never needs a GPU.
@@ -60,14 +87,15 @@ endif()
 if(ROUGE_NVCC_PROG)
   add_executable(test_foreign_program test_foreign_program.cpp)
   target_link_libraries(test_foreign_program PRIVATE ${CMAKE_DL_LIBS})
-  set(_fp_src ${CMAKE_CURRENT_SOURCE_DIR}/programs/wave1_vadd.cu)
+  set(_fp_dir ${CMAKE_CURRENT_SOURCE_DIR}/programs)
   set(_fp_work ${CMAKE_CURRENT_BINARY_DIR}/foreign-program)
   add_test(NAME foreign_program
     COMMAND ${CMAKE_COMMAND}
       -DNVCC=${ROUGE_NVCC_PROG}
-      -DSRC=${_fp_src}
+      "-DPROGRAMS=${_fp_dir}/wave1_vadd.cu;${_fp_dir}/wave1_api.cu"
       -DWORK_DIR=${_fp_work}
       -DSHIM=$<TARGET_FILE:rouge-cuda>
+      -DTEST_BIN=$<TARGET_FILE:test_foreign_program>
       -P ${CMAKE_CURRENT_SOURCE_DIR}/foreign_program.cmake)
 else()
   message(STATUS "foreign_program: SKIP (nvcc not found)")

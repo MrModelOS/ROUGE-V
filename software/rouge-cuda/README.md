@@ -90,6 +90,27 @@ LD_LIBRARY_PATH=$PWD/imposter ROUGE_CUDA_FORCE_EMU=1 ./foreign_app kernel.ptx
 печатают `OK`; тест сравнивает выводы и валит прогон при расхождении.
 GPU для этого не нужен вообще.
 
+## Покрытие Runtime API (Волна 1)
+
+Помимо запуска, настоящие программы читают свойства устройства и
+пользуются pinned-памятью, стримами и асинхронными копиями. Всё это
+реализовано и проверено программой `tests/programs/wave1_api.cu`
+(тот же принцип: сборка `nvcc` + сборка против шима, сравнение выводов):
+
+- `cudaSetDevice` / `cudaGetDevice` / `cudaGetDeviceCount` / `cudaDeviceReset`;
+- `cudaGetDeviceProperties` — структура `rouge_cuda_device_prop` повторяет
+  раскладку настоящего `cudaDeviceProp` поле в поле (93 поля); тест
+  `device_prop_layout` сверяет `offsetof`/`sizeof` каждого поля с настоящим
+  заголовком на этапе сборки. Значения честные: имя и UUID наши, память —
+  физическая (sysconf), `major.minor` = 7.5 (референсный таргет), варп 32,
+  часы — нули (измерять нечего, выдумывать нельзя);
+- `cudaMallocHost` / `cudaHostAlloc` / `cudaFreeHost` (pinned = обычная куча:
+  DMA гнать некуда, unified addressing = 1);
+- `cudaMemcpyAsync` / `cudaMemset` / `cudaPeekAtLastError` (не сбрасывает
+  sticky-ошибку, в отличие от Get);
+- `cudaStreamCreateWithFlags` (флаги принимаются, бэкенд синхронный —
+  это задокументировано, а не спрятано).
+
 ## Структура
 
 ```
