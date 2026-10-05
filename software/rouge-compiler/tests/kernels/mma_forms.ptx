@@ -1,0 +1,782 @@
+// ROUGE-V canonical kernels: every supported mma.sync form (Wave 3 step 2).
+//
+// Per form two entries share the fragment counts (nA/nB/nD) but differ
+// in values:
+//   <form>_ones: every A/B element is exactly 1.0 (or 1), C is 0, so every
+//     D element is exactly K (16 or 8) — hand-verifiable bit patterns that
+//     prove decode, accumulation and encode for the form.
+//   <form>_lane: A = BASE|lane, B = BASE|(lane+100), C = 0 — every lane
+//     publishes distinct fragments, so any peer mix-up in the exchange
+//     changes D. The reference is the interpreter itself (AOT test).
+// 1.0 payloads: f16 0x3C00, bf16 0x3F80, e4m3 0x38, e5m2 0x3C, u8/s8 0x01.
+.version 9.4
+.target sm_75
+.address_size 64
+
+.visible .entry mma_bf16k16f32_ones(
+    .param .u64 mma_bf16k16f32_ones_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %d2;
+    .reg .b32 %d3;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %a2;
+    .reg .b32 %a3;
+    .reg .b32 %b0;
+    .reg .b32 %b1;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %c2;
+    .reg .b32 %c3;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_bf16k16f32_ones_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %a0, 1065369472;
+    mov.u32 %a1, 1065369472;
+    mov.u32 %a2, 1065369472;
+    mov.u32 %a3, 1065369472;
+    mov.u32 %b0, 1065369472;
+    mov.u32 %b1, 1065369472;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %c3, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mov.u32 %d2, 0;
+    mov.u32 %d3, 0;
+    mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%c0, %c1, %c2, %c3};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 4;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+8], %d2;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+12], %d3;
+    ret;
+}
+
+.visible .entry mma_bf16k16f32_lane(
+    .param .u64 mma_bf16k16f32_lane_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %d2;
+    .reg .b32 %d3;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %a2;
+    .reg .b32 %a3;
+    .reg .b32 %b0;
+    .reg .b32 %b1;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %c2;
+    .reg .b32 %c3;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_bf16k16f32_lane_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    or.b32 %a0, %r1, 16256;
+    or.b32 %a1, %r1, 16256;
+    or.b32 %a2, %r1, 16256;
+    or.b32 %a3, %r1, 16256;
+    add.s32 %r1, %r1, 100;
+    or.b32 %b0, %r1, 16256;
+    or.b32 %b1, %r1, 16256;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %c3, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mov.u32 %d2, 0;
+    mov.u32 %d3, 0;
+    mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%c0, %c1, %c2, %c3};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 4;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+8], %d2;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+12], %d3;
+    ret;
+}
+
+.visible .entry mma_e4m3k16f32_ones(
+    .param .u64 mma_e4m3k16f32_ones_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %d2;
+    .reg .b32 %d3;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %b0;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %c2;
+    .reg .b32 %c3;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_e4m3k16f32_ones_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %a0, 943208504;
+    mov.u32 %a1, 943208504;
+    mov.u32 %b0, 943208504;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %c3, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mov.u32 %d2, 0;
+    mov.u32 %d3, 0;
+    mma.sync.aligned.m16n8k16.row.col.f32.e4m3.e4m3.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1}, {%b0}, {%c0, %c1, %c2, %c3};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 4;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+8], %d2;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+12], %d3;
+    ret;
+}
+
+.visible .entry mma_e4m3k16f32_lane(
+    .param .u64 mma_e4m3k16f32_lane_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %d2;
+    .reg .b32 %d3;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %b0;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %c2;
+    .reg .b32 %c3;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_e4m3k16f32_lane_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %a0, %r1;
+    mov.u32 %a1, %r1;
+    add.s32 %r1, %r1, 100;
+    mov.u32 %b0, %r1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %c3, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mov.u32 %d2, 0;
+    mov.u32 %d3, 0;
+    mma.sync.aligned.m16n8k16.row.col.f32.e4m3.e4m3.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1}, {%b0}, {%c0, %c1, %c2, %c3};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 4;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+8], %d2;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+12], %d3;
+    ret;
+}
+
+.visible .entry mma_e5m2k16f32_ones(
+    .param .u64 mma_e5m2k16f32_ones_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %d2;
+    .reg .b32 %d3;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %b0;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %c2;
+    .reg .b32 %c3;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_e5m2k16f32_ones_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %a0, 1010580540;
+    mov.u32 %a1, 1010580540;
+    mov.u32 %b0, 1010580540;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %c3, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mov.u32 %d2, 0;
+    mov.u32 %d3, 0;
+    mma.sync.aligned.m16n8k16.row.col.f32.e5m2.e5m2.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1}, {%b0}, {%c0, %c1, %c2, %c3};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 4;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+8], %d2;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+12], %d3;
+    ret;
+}
+
+.visible .entry mma_e5m2k16f32_lane(
+    .param .u64 mma_e5m2k16f32_lane_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %d2;
+    .reg .b32 %d3;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %b0;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %c2;
+    .reg .b32 %c3;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_e5m2k16f32_lane_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %a0, %r1;
+    mov.u32 %a1, %r1;
+    add.s32 %r1, %r1, 100;
+    mov.u32 %b0, %r1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %c3, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mov.u32 %d2, 0;
+    mov.u32 %d3, 0;
+    mma.sync.aligned.m16n8k16.row.col.f32.e5m2.e5m2.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1}, {%b0}, {%c0, %c1, %c2, %c3};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 4;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+8], %d2;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+12], %d3;
+    ret;
+}
+
+.visible .entry mma_u8k16s32_ones(
+    .param .u64 mma_u8k16s32_ones_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %d2;
+    .reg .b32 %d3;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %b0;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %c2;
+    .reg .b32 %c3;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_u8k16s32_ones_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %a0, 16843009;
+    mov.u32 %a1, 16843009;
+    mov.u32 %b0, 16843009;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %c3, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mov.u32 %d2, 0;
+    mov.u32 %d3, 0;
+    mma.sync.aligned.m16n8k16.row.col.s32.u8.u8.s32 {%d0, %d1, %d2, %d3}, {%a0, %a1}, {%b0}, {%c0, %c1, %c2, %c3};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 4;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+8], %d2;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+12], %d3;
+    ret;
+}
+
+.visible .entry mma_u8k16s32_lane(
+    .param .u64 mma_u8k16s32_lane_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %d2;
+    .reg .b32 %d3;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %b0;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %c2;
+    .reg .b32 %c3;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_u8k16s32_lane_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %a0, %r1;
+    mov.u32 %a1, %r1;
+    add.s32 %r1, %r1, 100;
+    mov.u32 %b0, %r1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %c3, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mov.u32 %d2, 0;
+    mov.u32 %d3, 0;
+    mma.sync.aligned.m16n8k16.row.col.s32.u8.u8.s32 {%d0, %d1, %d2, %d3}, {%a0, %a1}, {%b0}, {%c0, %c1, %c2, %c3};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 4;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+8], %d2;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+12], %d3;
+    ret;
+}
+
+.visible .entry mma_s8k16s32_ones(
+    .param .u64 mma_s8k16s32_ones_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %d2;
+    .reg .b32 %d3;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %b0;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %c2;
+    .reg .b32 %c3;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_s8k16s32_ones_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %a0, 16843009;
+    mov.u32 %a1, 16843009;
+    mov.u32 %b0, 16843009;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %c3, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mov.u32 %d2, 0;
+    mov.u32 %d3, 0;
+    mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%d0, %d1, %d2, %d3}, {%a0, %a1}, {%b0}, {%c0, %c1, %c2, %c3};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 4;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+8], %d2;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+12], %d3;
+    ret;
+}
+
+.visible .entry mma_s8k16s32_lane(
+    .param .u64 mma_s8k16s32_lane_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %d2;
+    .reg .b32 %d3;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %b0;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %c2;
+    .reg .b32 %c3;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_s8k16s32_lane_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %a0, %r1;
+    mov.u32 %a1, %r1;
+    add.s32 %r1, %r1, 100;
+    mov.u32 %b0, %r1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %c3, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mov.u32 %d2, 0;
+    mov.u32 %d3, 0;
+    mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%d0, %d1, %d2, %d3}, {%a0, %a1}, {%b0}, {%c0, %c1, %c2, %c3};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 4;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+8], %d2;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+12], %d3;
+    ret;
+}
+
+.visible .entry mma_f16k16f16_ones(
+    .param .u64 mma_f16k16f16_ones_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %a2;
+    .reg .b32 %a3;
+    .reg .b32 %b0;
+    .reg .b32 %b1;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_f16k16f16_ones_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %a0, 1006648320;
+    mov.u32 %a1, 1006648320;
+    mov.u32 %a2, 1006648320;
+    mov.u32 %a3, 1006648320;
+    mov.u32 %b0, 1006648320;
+    mov.u32 %b1, 1006648320;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%d0, %d1}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%c0, %c1};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 3;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    ret;
+}
+
+.visible .entry mma_f16k16f16_lane(
+    .param .u64 mma_f16k16f16_lane_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %a2;
+    .reg .b32 %a3;
+    .reg .b32 %b0;
+    .reg .b32 %b1;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_f16k16f16_lane_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    or.b32 %a0, %r1, 15360;
+    or.b32 %a1, %r1, 15360;
+    or.b32 %a2, %r1, 15360;
+    or.b32 %a3, %r1, 15360;
+    add.s32 %r1, %r1, 100;
+    or.b32 %b0, %r1, 15360;
+    or.b32 %b1, %r1, 15360;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%d0, %d1}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%c0, %c1};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 3;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    ret;
+}
+
+.visible .entry mma_f16k8f32_ones(
+    .param .u64 mma_f16k8f32_ones_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %d2;
+    .reg .b32 %d3;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %b0;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %c2;
+    .reg .b32 %c3;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_f16k8f32_ones_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %a0, 1006648320;
+    mov.u32 %a1, 1006648320;
+    mov.u32 %b0, 1006648320;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %c3, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mov.u32 %d2, 0;
+    mov.u32 %d3, 0;
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1}, {%b0}, {%c0, %c1, %c2, %c3};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 4;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+8], %d2;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+12], %d3;
+    ret;
+}
+
+.visible .entry mma_f16k8f32_lane(
+    .param .u64 mma_f16k8f32_lane_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %d2;
+    .reg .b32 %d3;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %b0;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %c2;
+    .reg .b32 %c3;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_f16k8f32_lane_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    or.b32 %a0, %r1, 15360;
+    or.b32 %a1, %r1, 15360;
+    add.s32 %r1, %r1, 100;
+    or.b32 %b0, %r1, 15360;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %c2, 0;
+    mov.u32 %c3, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mov.u32 %d2, 0;
+    mov.u32 %d3, 0;
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1}, {%b0}, {%c0, %c1, %c2, %c3};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 4;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+8], %d2;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+12], %d3;
+    ret;
+}
+
+.visible .entry mma_bf16k8f16_ones(
+    .param .u64 mma_bf16k8f16_ones_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %b0;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_bf16k8f16_ones_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %a0, 1065369472;
+    mov.u32 %a1, 1065369472;
+    mov.u32 %b0, 1065369472;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mma.sync.aligned.m16n8k8.row.col.f16.bf16.bf16.f16 {%d0, %d1}, {%a0, %a1}, {%b0}, {%c0, %c1};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 3;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    ret;
+}
+
+.visible .entry mma_bf16k8f16_lane(
+    .param .u64 mma_bf16k8f16_lane_param_0
+)
+{
+    .reg .b32 %d0;
+    .reg .b32 %d1;
+    .reg .b32 %a0;
+    .reg .b32 %a1;
+    .reg .b32 %b0;
+    .reg .b32 %c0;
+    .reg .b32 %c1;
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [mma_bf16k8f16_lane_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    or.b32 %a0, %r1, 16256;
+    or.b32 %a1, %r1, 16256;
+    add.s32 %r1, %r1, 100;
+    or.b32 %b0, %r1, 16256;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %c0, 0;
+    mov.u32 %c1, 0;
+    mov.u32 %d0, 0;
+    mov.u32 %d1, 0;
+    mma.sync.aligned.m16n8k8.row.col.f16.bf16.bf16.f16 {%d0, %d1}, {%a0, %a1}, {%b0}, {%c0, %c1};
+    mov.u32 %r1, %tid.x;
+    shl.b32 %r1, %r1, 3;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+0], %d0;
+    mul.wide.u32 %rd2, %r1, 1;
+    add.s64 %rd2, %rd1, %rd2;
+    st.global.u32 [%rd2+4], %d1;
+    ret;
+}

@@ -72,6 +72,34 @@ if(CLANG_EXECUTABLE)
       COMMENT "[rouge-compiler] clang: ${entry}.ll -> native object (AOT)")
   endforeach()
 
+  # The mma forms kernel has sixteen entries (eight forms x ones/lane), so
+  # ptx2ir runs once per entry (it translates one .entry per module).
+  set(MMA_FORMS_OBJS "")
+  foreach(entry
+      mma_bf16k16f32_ones mma_bf16k16f32_lane
+      mma_e4m3k16f32_ones mma_e4m3k16f32_lane
+      mma_e5m2k16f32_ones mma_e5m2k16f32_lane
+      mma_u8k16s32_ones mma_u8k16s32_lane
+      mma_s8k16s32_ones mma_s8k16s32_lane
+      mma_f16k16f16_ones mma_f16k16f16_lane
+      mma_f16k8f32_ones mma_f16k8f32_lane
+      mma_bf16k8f16_ones mma_bf16k8f16_lane)
+    add_custom_command(
+      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${entry}.ll
+      COMMAND ptx2ir --entry ${entry}
+              ${CMAKE_CURRENT_SOURCE_DIR}/kernels/mma_forms.ptx
+              ${CMAKE_CURRENT_BINARY_DIR}/${entry}.ll
+      DEPENDS ptx2ir ${CMAKE_CURRENT_SOURCE_DIR}/kernels/mma_forms.ptx
+      COMMENT "[rouge-compiler] ptx2ir: mma_forms.ptx[${entry}] -> ${entry}.ll")
+    add_custom_command(
+      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${entry}.o
+      COMMAND ${CLANG_EXECUTABLE} -O2 -c ${CMAKE_CURRENT_BINARY_DIR}/${entry}.ll
+              -o ${CMAKE_CURRENT_BINARY_DIR}/${entry}.o
+      DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/${entry}.ll
+      COMMENT "[rouge-compiler] clang: ${entry}.ll -> native object (AOT)")
+    list(APPEND MMA_FORMS_OBJS ${CMAKE_CURRENT_BINARY_DIR}/${entry}.o)
+  endforeach()
+
   add_executable(test_aot_native test_aot_native.cpp ${CMAKE_CURRENT_BINARY_DIR}/vadd.o)
   add_test(NAME aot_native_vadd COMMAND test_aot_native)
 
@@ -128,6 +156,15 @@ if(CLANG_EXECUTABLE)
     ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
   add_test(NAME aot_native_ldmatrix_tile COMMAND test_aot_ldmatrix_tile
            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ldmatrix_tile.ptx)
+
+  # Test 2o: every supported mma.sync form — ones against hand bits,
+  # lane-varying fragments AOT against the interpreter.
+  add_executable(test_aot_mma_forms test_aot_mma_forms.cpp ${MMA_FORMS_OBJS})
+  target_link_libraries(test_aot_mma_forms PRIVATE rouge-runtime rouge-ptx)
+  target_include_directories(test_aot_mma_forms PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
+  add_test(NAME aot_native_mma_forms COMMAND test_aot_mma_forms
+           ${CMAKE_CURRENT_SOURCE_DIR}/kernels/mma_forms.ptx)
 
   # Test 2f: cas / exch / min / max (atom_cas kernel).
   add_executable(test_aot_atom_cas test_aot_atom_cas.cpp

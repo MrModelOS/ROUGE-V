@@ -1565,8 +1565,12 @@ class LlvmGen {
   }
 
   // One byte of a packed .b32 fragment register (e4m3/e5m2/u8/s8: four).
+  // The mask applies to every position, including byte 0: the word carries
+  // three other elements alongside, and returning it whole would multiply by
+  // the packed word instead of the element (caught by the ones-forms: the
+  // lane tests passed by accident, their high bytes being zero).
   std::string frag_byte(const std::string& word, int which) {
-    if (which == 0) return word;
+    if (which == 0) return i32op("and", word, "255");
     const std::string sh = fresh("%bw");
     line("  " + sh + " = lshr i32 " + word + ", " + std::to_string(8 * which));
     return i32op("and", sh, "255");

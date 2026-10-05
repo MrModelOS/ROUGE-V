@@ -100,6 +100,13 @@ if(ROUGE_REAL_CUDA_INCLUDE AND ROUGE_PYTHON3)
   target_link_libraries(test_mma PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
   add_test(NAME mma COMMAND test_mma ${KERNEL_DIR})
 
+  # mma: все поддерживаемые формы, uniform-1.0 против ручных битов D==K.
+  add_executable(test_mma_forms test_mma_forms.cpp)
+  target_include_directories(test_mma_forms PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(test_mma_forms PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
+  add_test(NAME mma_forms COMMAND test_mma_forms ${KERNEL_DIR})
+
   # ldmatrix/stmatrix: roundtrip + transpose + x4.
   add_executable(test_ldmatrix test_ldmatrix.cpp)
   target_include_directories(test_ldmatrix PRIVATE
