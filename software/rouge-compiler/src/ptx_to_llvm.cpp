@@ -1408,6 +1408,19 @@ class LlvmGen {
   }
 
   // ---- exchange region --------------------------------------------------
+  //
+  // One context per collective: the exchange base, the linear tid and the warp
+  // base are computed ONCE, then every publish/read addresses peers by offset
+  // from them. The first version recomputed base+linear from the launch
+  // descriptor on every word (134 base loads and 538 tid loads for a single
+  // mma) — straight-line IR, so no LICM could ever clean it up. The cached
+  // form emits 1 base load and 5 spec loads per collective.
+
+  struct ExchangeCtx {
+    std::string base;  // i64 exchange region base
+    std::string warp;  // i32 warp base ((linear & ~31))
+    std::string own;   // ptr this lane's slot
+  };
 
   std::string load_exchange_base() {
     const std::string gep = fresh("%xg");
@@ -1432,28 +1445,28 @@ class LlvmGen {
     return i32op("add", b, c);
   }
 
-  // Slot of peer lane `lane' ((linear & ~31) + lane) as a `ptr` SSA.
-  std::string peer_slot_ptr(const std::string& lane) {
-    const std::string base = load_exchange_base();
+  ExchangeCtx exchange_ctx() {
+    ExchangeCtx x;
+    x.base = load_exchange_base();
     const std::string lin = linear_tid();
-    const std::string warp = i32op("and", lin, "-32");
-    const std::string peer = i32op("add", warp, lane);
+    x.warp = i32op("and", lin, "-32");
+    const std::string off = i32op("mul", lin, std::to_string(kExSlot));
+    const std::string z = fresh("%oz");
+    line("  " + z + " = zext i32 " + off + " to i64");
+    const std::string a = fresh("%oa");
+    line("  " + a + " = add i64 " + x.base + ", " + z);
+    x.own = inttoptr_as(a, "ptr");
+    return x;
+  }
+
+  // Slot of peer lane `lane' (warp + lane) as a `ptr` SSA.
+  std::string peer_slot_ctx(const ExchangeCtx& x, const std::string& lane) {
+    const std::string peer = i32op("add", x.warp, lane);
     const std::string off = i32op("mul", peer, std::to_string(kExSlot));
     const std::string z = fresh("%pz");
     line("  " + z + " = zext i32 " + off + " to i64");
     const std::string a = fresh("%pa");
-    line("  " + a + " = add i64 " + base + ", " + z);
-    return inttoptr_as(a, "ptr");
-  }
-
-  // This thread's own slot.
-  std::string own_slot_ptr() {
-    const std::string base = load_exchange_base();
-    const std::string off = i32op("mul", linear_tid(), std::to_string(kExSlot));
-    const std::string z = fresh("%oz");
-    line("  " + z + " = zext i32 " + off + " to i64");
-    const std::string a = fresh("%oa");
-    line("  " + a + " = add i64 " + base + ", " + z);
+    line("  " + a + " = add i64 " + x.base + ", " + z);
     return inttoptr_as(a, "ptr");
   }
 
@@ -1466,33 +1479,44 @@ class LlvmGen {
   }
 
   // Publish one fragment word of this lane.
-  void publish_slot(const std::string& reg, int index) {
+  void publish_slot_ctx(const ExchangeCtx& x, const std::string& reg,
+                        int index) {
     std::string v = operand(reg);
     if (is_reg(reg) && reg_type(reg) != "i32")
       v = fit_reg(reg, v, reg_type(reg));
     if (index < 0 || index >= kExMaxFrag) return;
     const std::string f =
-        slot_field(own_slot_ptr(), kExFragOff + 4 * index, "%pf");
+        slot_field(x.own, kExFragOff + 4 * index, "%pf");
     line("  store i32 " + v + ", ptr " + f + ", align 4");
   }
 
   // Read word `word' published by peer lane `lane'.
-  std::string read_frag(const std::string& lane, int word) {
-    const std::string f = slot_field(peer_slot_ptr(lane),
+  std::string read_frag_ctx(const ExchangeCtx& x, const std::string& lane,
+                            int word) {
+    const std::string f = slot_field(peer_slot_ctx(x, lane),
                                      kExFragOff + 4 * word, "%rf");
     const std::string v = fresh("%rv");
     line("  " + v + " = load i32, ptr " + f + ", align 4");
     return v;
   }
 
+  // This lane's own published word `index' (read back from the slot).
+  std::string own_slot_word_ctx(const ExchangeCtx& x, int index) {
+    const std::string f =
+        slot_field(x.own, kExFragOff + 4 * index, "%ow");
+    const std::string v = fresh("%ov");
+    line("  " + v + " = load i32, ptr " + f + ", align 4");
+    return v;
+  }
+
   // Publish / read the row address a lane computed (ldmatrix/stmatrix).
-  void publish_row_addr(const std::string& addr) {
-    const std::string f = slot_field(own_slot_ptr(), kExAddrOff, "%pa");
+  void publish_row_addr_ctx(const ExchangeCtx& x, const std::string& addr) {
+    const std::string f = slot_field(x.own, kExAddrOff, "%pa");
     line("  store i64 " + addr + ", ptr " + f + ", align 8");
   }
-  std::string read_peer_row(const std::string& lane) {
+  std::string read_peer_row_ctx(const ExchangeCtx& x, const std::string& lane) {
     const std::string f =
-        slot_field(peer_slot_ptr(lane), kExAddrOff, "%ra");
+        slot_field(peer_slot_ctx(x, lane), kExAddrOff, "%ra");
     const std::string v = fresh("%rw");
     line("  " + v + " = load i64, ptr " + f + ", align 8");
     return v;
@@ -1732,8 +1756,11 @@ class LlvmGen {
                   "}, {" + std::to_string(F.nD) + "})");
 
     // Publish A and B, then read the peers. C and D stay in registers.
-    for (int i = 0; i < F.nA; ++i) publish_slot(groups[1][i], i);
-    for (int i = 0; i < F.nB; ++i) publish_slot(groups[2][i], F.nA + i);
+    // The exchange context (base + warp + own slot) is computed once here;
+    // every peer read below addresses by offset from it.
+    const ExchangeCtx x = exchange_ctx();
+    for (int i = 0; i < F.nA; ++i) publish_slot_ctx(x, groups[1][i], i);
+    for (int i = 0; i < F.nB; ++i) publish_slot_ctx(x, groups[2][i], F.nA + i);
     line("  call void @__rouge_syncthreads(ptr %launch)");
 
     // This lane's D geometry: g = lane>>2 (row group), t = lane&3 (column
@@ -1779,17 +1806,18 @@ class LlvmGen {
         const std::string bLane = i32op("add", col4s, std::to_string(bConst));
         if (F.isInt) {
           const std::string a =
-              decode_ab_i32(read_frag(aLane, aReg), atype, aWithin);
-          const std::string b =
-              decode_ab_i32(read_frag(bLane, F.nA + bReg), btype, bWithin);
+              decode_ab_i32(read_frag_ctx(x, aLane, aReg), atype, aWithin);
+          const std::string b = decode_ab_i32(
+              read_frag_ctx(x, bLane, F.nA + bReg), btype, bWithin);
           const std::string p = i32op("mul", a, b);
           acc = i32op("add", acc, p);
           continue;
         }
-        const std::string a = decode_ab_f(read_frag(aLane, aReg), atype,
-                                          aWithin, F.perByte);
-        const std::string b = decode_ab_f(read_frag(bLane, F.nA + bReg), btype,
-                                          bWithin, F.perByte);
+        const std::string a = decode_ab_f(read_frag_ctx(x, aLane, aReg),
+                                          atype, aWithin, F.perByte);
+        const std::string b =
+            decode_ab_f(read_frag_ctx(x, bLane, F.nA + bReg), btype, bWithin,
+                        F.perByte);
         const std::string f = fresh("%mf");
         line("  " + f + " = call float @llvm.fma.f32(float " + a + ", float " + b +
              ", float " + acc + ")");
@@ -1904,7 +1932,8 @@ class LlvmGen {
       line("  " + a + " = add i64 " + rowAddr + ", " + std::to_string(addrOff));
       rowAddr = a;
     }
-    publish_row_addr(rowAddr);
+    const ExchangeCtx x = exchange_ctx();
+    publish_row_addr_ctx(x, rowAddr);
     line("  call void @__rouge_syncthreads(ptr %launch)");
 
     const std::string lane = lane_index();
@@ -1923,7 +1952,7 @@ class LlvmGen {
         const std::string c =
             trans ? fixed : i32op("add", e0, std::to_string(e));
         const std::string provider = i32op("add", std::to_string(m * 8), r);
-        const std::string base = read_peer_row(provider);
+        const std::string base = read_peer_row_ctx(x, provider);
         const std::string byteOff =
             i32op("mul", c, "2");  // i32 column index -> i32 byte count
         const std::string bo64 = fresh("%bo");

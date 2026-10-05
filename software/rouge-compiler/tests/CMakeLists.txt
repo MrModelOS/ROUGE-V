@@ -176,6 +176,18 @@ if(CLANG_EXECUTABLE)
   add_test(NAME aot_native_mma_pipe COMMAND test_aot_mma_pipe
            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/mma_pipe.ptx)
 
+  # Benchmark (not a check): AOT against the interpreter on the collective
+  # kernels, steady team of 32 threads. Always exits 0; correctness belongs
+  # to test_aot_*. Links the already built kernel objects.
+  add_executable(bench_collective bench_collective.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/mma_pipe.o
+                 ${CMAKE_CURRENT_BINARY_DIR}/ldmatrix_x4.o)
+  target_link_libraries(bench_collective PRIVATE rouge-runtime rouge-ptx)
+  target_include_directories(bench_collective PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
+  add_test(NAME bench_collective COMMAND bench_collective
+           ${CMAKE_CURRENT_SOURCE_DIR}/kernels)
+
   # Test 2f: cas / exch / min / max (atom_cas kernel).
   add_executable(test_aot_atom_cas test_aot_atom_cas.cpp
                  ${CMAKE_CURRENT_BINARY_DIR}/atom_cas.o)

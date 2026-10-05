@@ -13,6 +13,8 @@
  */
 #pragma once
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -51,6 +53,20 @@ typedef struct RougeGemmProfile {
  * M/N/K <= 0   -> ничего не делать (C не трогается). */
 void rouge_gemm_f32(int M, int N, int K, const float *A, const float *B, float *C,
                     const RougeGemmConfig *cfg);
+
+/* FP8 GEMM (Wave 2): C[M][N] f32 = A[M][K] e4m3 * B[K][N] e4m3, накопление
+ * в f32. Формат входов — OCP OFP8 E4M3 (bias 7, max 448): те же таблицы,
+ * что в PTX-интерпретаторе и в mma.lowering (e4m3-входы mma). Реализация:
+ * decode в f32-буферы + тот же блочный rouge_gemm_f32 (автотюнер shared).
+ * M/N/K <= 0 или NULL-указатели -> ничего не делать. */
+void rouge_gemm_e4m3(int M, int N, int K, const uint8_t *A, const uint8_t *B,
+                     float *C, const RougeGemmConfig *cfg);
+
+/* Квантование f32 <-> OCP E4M3 (RNE, satfinite в знаковый MAX_NORM;
+ * NaN -> знаковый NaN 0x7F, Inf -> знаковый MAX 0x7E, signed zero хранится).
+ * Дословная транскрипция f32_to_narrow/narrow_to_f32 интерпретатора. */
+uint8_t rouge_quantize_e4m3(float f);
+float rouge_dequantize_e4m3(uint8_t u);
 
 /* Конфиг по умолчанию (умеренный: панели 64x64x32, unroll 2, split_k 1). */
 RougeGemmConfig rouge_gemm_default_config(void);

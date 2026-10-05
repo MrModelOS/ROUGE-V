@@ -25,6 +25,7 @@ endif()
 add_library(rouge-numerics STATIC
   src/gemm.cpp
   src/autotune.cpp
+  src/fp8.cpp
 )
 target_include_directories(rouge-numerics PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
