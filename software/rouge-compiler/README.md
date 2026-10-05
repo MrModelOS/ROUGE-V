@@ -25,7 +25,17 @@ ptx2ir ──► LLVM IR (define void @kernel(... %argN, ptr %launch))
 смещение 0..44: 12×i32 — tid/ctaid/ntid/nctaid × xyz
 смещение 48   : i64     — база scratchpad блока (.shared)
 смещение 56   : i64     — хендл барьера блока (bar.sync → __rouge_syncthreads)
+смещение 64   : i64     — база обменной области варпа (mma/ldmatrix/stmatrix;
+                          NULL, если кернел без варп-коллективов)
 ```
+
+`bar.sync` транслируется в `call void @__rouge_syncthreads(ptr %launch)` —
+реализация живёт в `runtime/rouge_runtime.cpp` (хост: `pthread_barrier`;
+целевой RISC-V: кастомный барьер/`fence`).
+
+Обменная область варпа: 64 байта на поток блока (`rouge_exchange_alloc(n)`),
+слот `+0` — i64 адрес строки (ldmatrix/stmatrix), `+8` — до 14×i32 слов
+фрагментов (mma A/B). Коллектив публикует, барьер, читает слова соседей.
 
 `bar.sync` транслируется в `call void @__rouge_syncthreads(ptr %launch)` —
 реализация живёт в `runtime/rouge_runtime.cpp` (хост: `pthread_barrier`;
@@ -120,8 +130,11 @@ global — `addrspace(1)` у обоих GPU-бэкендов, shared — `addrsp
 | Варп-шаффлы и голосования | `shfl.sync.*` + легаси `shfl.*`, включая предикатную форму `d\|p` (NVPTX: NVVM-интринсик + предикат из `%laneid`; хост: скаляр); `vote.sync.{any,all,uni}` (NVPTX: `llvm.nvvm.vote.*.sync`); `activemask.b32` (NVPTX: `llvm.nvvm.activemask`) |
 | Атомики | `atom.add.{u32,s32,u64,s64,f32}` (→ `atomicrmw`, возвращает старое), `red.add.*` (без возврата), `monotonic` |
 
-Неподдерживаемое (`mma.*`, split-фазные
-`arrive`/`red`/`mbarrier.*`, `%clock64` на хосте)
+| Варп-коллективы матричные | `mma.sync.aligned` (хост: обмен фрагментами; NVPTX: отказ), `ldmatrix`/`stmatrix.sync.aligned.m8n8.x{1,2,4}[.trans].b16` (хост: обмен адресами; NVPTX: отказ) |
+
+Неподдерживаемое (`wmma.*`, `movmatrix`, split-фазные
+`arrive`/`red`/`mbarrier.*`, `%clock64` на хосте, `mma`/`ldmatrix`/`stmatrix`
+на NVPTX)
 транслятор **отклоняет с ошибкой** — честный отказ, а не тихий мискомпил.
 
 ## Почему alloca-стиль

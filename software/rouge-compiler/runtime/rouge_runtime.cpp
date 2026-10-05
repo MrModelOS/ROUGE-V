@@ -127,3 +127,79 @@ extern "C" void __rouge_syncthreads(const void* launch) {
   auto* b = reinterpret_cast<pthread_barrier_t*>(ld->barrier);
   if (b) pthread_barrier_wait(b);
 }
+
+// ---- narrow float conversions --------------------------------------------
+//
+// Transcribed from the interpreter's f16_to_f32 / f32_to_f16_rne /
+// bf16_to_f32 / f32_to_bf16_rne (rouge-ptx/ptx.cpp), which are the behavioural
+// reference: subnormals normalised and rebiased, inf/NaN packed with the
+// payload shifted across, overflow to infinity, underflow to a signed zero, and
+// round-to-nearest-even with the tie broken on the retained low bit.
+extern "C" float rouge_f16_to_f32(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  const uint32_t exp = (h >> 10) & 0x1fu;
+  const uint32_t man = h & 0x3ffu;
+  uint32_t bits;
+  if (exp == 0) {
+    if (man == 0) {
+      bits = sign;  // +-0
+    } else {
+      uint32_t m = man;
+      uint32_t shift = 0;
+      while ((m & 0x400u) == 0) { m <<= 1; ++shift; }
+      m &= 0x3ffu;
+      bits = sign | ((113u - shift) << 23) | (m << 13);
+    }
+  } else if (exp == 0x1fu) {
+    bits = sign | 0x7f800000u | (man << 13);  // inf / NaN
+  } else {
+    bits = sign | ((exp - 15u + 127u) << 23) | (man << 13);
+  }
+  float out;
+  std::memcpy(&out, &bits, 4);
+  return out;
+}
+
+extern "C" uint16_t rouge_f32_to_f16_rne(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, 4);
+  const uint16_t sign = static_cast<uint16_t>((x >> 16) & 0x8000u);
+  const uint32_t e = (x >> 23) & 0xffu;
+  const uint32_t man = x & 0x7fffffu;
+  if (e == 0xffu) {  // inf / NaN
+    return man ? static_cast<uint16_t>(sign | 0x7e00u)  // quiet NaN
+               : static_cast<uint16_t>(sign | 0x7c00u);
+  }
+  const int exp = static_cast<int>(e) - 127 + 15;
+  if (exp >= 0x1f) return static_cast<uint16_t>(sign | 0x7c00u);  // overflow
+  if (exp <= 0) {                                                   // subnormal
+    if (exp < -10) return sign;                                    // underflow
+    const uint32_t m = man | 0x800000u;                            // implicit 1
+    const uint32_t shift = static_cast<uint32_t>(14 - exp);
+    uint32_t val = m >> shift;
+    const uint32_t rem = m & ((1u << shift) - 1u);
+    const uint32_t half = 1u << (shift - 1);
+    if (rem > half || (rem == half && (val & 1u))) ++val;
+    return static_cast<uint16_t>(sign | val);
+  }
+  uint32_t val = (static_cast<uint32_t>(exp) << 10) | (man >> 13);
+  const uint32_t rem = man & 0x1fffu;
+  if (rem > 0x1000u || (rem == 0x1000u && (val & 1u))) ++val;  // may carry to inf
+  return static_cast<uint16_t>(sign | val);
+}
+
+extern "C" float rouge_bf16_to_f32(uint16_t b) {
+  const uint32_t bits = static_cast<uint32_t>(b) << 16;
+  float out;
+  std::memcpy(&out, &bits, 4);
+  return out;
+}
+
+extern "C" uint16_t rouge_f32_to_bf16_rne(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, 4);
+  if (((x >> 23) & 0xffu) == 0xffu)  // inf / NaN pass through
+    return static_cast<uint16_t>((x >> 16) & 0xffffu);
+  const uint32_t lsb = (x >> 16) & 1u;
+  return static_cast<uint16_t>((x + 0x7fffu + lsb) >> 16);
+}

@@ -14,6 +14,7 @@
 )
 {
     .reg .pred %p<2>;
+    .reg .b16 %h<4>;
     .reg .b32 %r<16>;
     .reg .b64 %rd<8>;
     .reg .f32 %f<4>;
@@ -35,10 +36,12 @@
     shl.b32 %r5, %r3, 3;        // row*8
     add.s32 %r5, %r5, %r4;      // row*8+col0
     cvt.f32.s32 %f1, %r5;
-    cvt.f16.f32 %r6, %f1;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r6, %h1;
     add.s32 %r5, %r5, 1;
     cvt.f32.s32 %f1, %r5;
-    cvt.f16.f32 %r7, %f1;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r7, %h1;
     shl.b32 %r7, %r7, 16;
     or.b32 %r6, %r6, %r7;       // packed pair
     shl.b32 %r7, %r3, 4;        // row*16 bytes
@@ -78,8 +81,10 @@
     // unpack the pair to two f32 stores for easy host comparison
     and.b32 %r12, %r10, 65535;
     shr.u32 %r13, %r10, 16;
-    cvt.f32.f16 %f2, %r12;
-    cvt.f32.f16 %f3, %r13;
+    cvt.u16.u32 %h2, %r12;
+    cvt.f32.f16 %f2, %h2;
+    cvt.u16.u32 %h3, %r13;
+    cvt.f32.f16 %f3, %h3;
     st.global.f32 [%rd5], %f2;
     st.global.f32 [%rd5+4], %f3;
     ret;
@@ -89,6 +94,7 @@
     .param .u64 ldmatrix_trans_param_0
 )
 {
+    .reg .b16 %h<4>;
     .reg .b32 %r<16>;
     .reg .b64 %rd<8>;
     .reg .f32 %f<4>;
@@ -109,10 +115,12 @@
     shl.b32 %r5, %r3, 3;
     add.s32 %r5, %r5, %r4;
     cvt.f32.s32 %f1, %r5;
-    cvt.f16.f32 %r6, %f1;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r6, %h1;
     add.s32 %r5, %r5, 1;
     cvt.f32.s32 %f1, %r5;
-    cvt.f16.f32 %r7, %f1;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r7, %h1;
     shl.b32 %r7, %r7, 16;
     or.b32 %r6, %r6, %r7;
     shl.b32 %r7, %r3, 4;
@@ -147,8 +155,10 @@
     add.s64 %rd5, %rd1, %r11;
     and.b32 %r12, %r10, 65535;
     shr.u32 %r13, %r10, 16;
-    cvt.f32.f16 %f2, %r12;
-    cvt.f32.f16 %f3, %r13;
+    cvt.u16.u32 %h2, %r12;
+    cvt.f32.f16 %f2, %h2;
+    cvt.u16.u32 %h3, %r13;
+    cvt.f32.f16 %f3, %h3;
     st.global.f32 [%rd5], %f2;
     st.global.f32 [%rd5+4], %f3;
     ret;
@@ -161,6 +171,7 @@
     .param .u64 ldmatrix_x4_param_0
 )
 {
+    .reg .b16 %h<4>;
     .reg .b32 %r<20>;
     .reg .b64 %rd<8>;
     .reg .f32 %f<4>;
@@ -187,37 +198,45 @@
     add.s64 %rd4, %rd4, %r10;    // tiles_in + m*128 + row*16
     // Four columns of two elements each (col0 = 0, 2, 4, 6).
     cvt.f32.s32 %f1, %r6;
-    cvt.f16.f32 %r11, %f1;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r11, %h1;
     add.s32 %r6, %r6, 1;
     cvt.f32.s32 %f1, %r6;
-    cvt.f16.f32 %r12, %f1;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r12, %h1;
     shl.b32 %r12, %r12, 16;
     or.b32 %r11, %r11, %r12;
     st.shared.b32 [%rd4], %r11;
     add.s32 %r6, %r6, 1;
     cvt.f32.s32 %f1, %r6;
-    cvt.f16.f32 %r11, %f1;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r11, %h1;
     add.s32 %r6, %r6, 1;
     cvt.f32.s32 %f1, %r6;
-    cvt.f16.f32 %r12, %f1;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r12, %h1;
     shl.b32 %r12, %r12, 16;
     or.b32 %r11, %r11, %r12;
     st.shared.b32 [%rd4+4], %r11;
     add.s32 %r6, %r6, 1;
     cvt.f32.s32 %f1, %r6;
-    cvt.f16.f32 %r11, %f1;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r11, %h1;
     add.s32 %r6, %r6, 1;
     cvt.f32.s32 %f1, %r6;
-    cvt.f16.f32 %r12, %f1;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r12, %h1;
     shl.b32 %r12, %r12, 16;
     or.b32 %r11, %r11, %r12;
     st.shared.b32 [%rd4+8], %r11;
     add.s32 %r6, %r6, 1;
     cvt.f32.s32 %f1, %r6;
-    cvt.f16.f32 %r11, %f1;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r11, %h1;
     add.s32 %r6, %r6, 1;
     cvt.f32.s32 %f1, %r6;
-    cvt.f16.f32 %r12, %f1;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r12, %h1;
     shl.b32 %r12, %r12, 16;
     or.b32 %r11, %r11, %r12;
     st.shared.b32 [%rd4+12], %r11;
@@ -259,8 +278,10 @@
     add.s64 %rd6, %rd1, %rd5;
     and.b32 %r16, %r15, 65535;
     shr.u32 %r17, %r15, 16;
-    cvt.f32.f16 %f2, %r16;
-    cvt.f32.f16 %f3, %r17;
+    cvt.u16.u32 %h2, %r16;
+    cvt.f32.f16 %f2, %h2;
+    cvt.u16.u32 %h3, %r17;
+    cvt.f32.f16 %f3, %h3;
     st.global.f32 [%rd6], %f2;
     st.global.f32 [%rd6+4], %f3;
 
@@ -277,8 +298,10 @@
     add.s64 %rd6, %rd1, %rd5;
     and.b32 %r16, %r15, 65535;
     shr.u32 %r17, %r15, 16;
-    cvt.f32.f16 %f2, %r16;
-    cvt.f32.f16 %f3, %r17;
+    cvt.u16.u32 %h2, %r16;
+    cvt.f32.f16 %f2, %h2;
+    cvt.u16.u32 %h3, %r17;
+    cvt.f32.f16 %f3, %h3;
     st.global.f32 [%rd6], %f2;
     st.global.f32 [%rd6+4], %f3;
 
@@ -295,8 +318,10 @@
     add.s64 %rd6, %rd1, %rd5;
     and.b32 %r16, %r15, 65535;
     shr.u32 %r17, %r15, 16;
-    cvt.f32.f16 %f2, %r16;
-    cvt.f32.f16 %f3, %r17;
+    cvt.u16.u32 %h2, %r16;
+    cvt.f32.f16 %f2, %h2;
+    cvt.u16.u32 %h3, %r17;
+    cvt.f32.f16 %f3, %h3;
     st.global.f32 [%rd6], %f2;
     st.global.f32 [%rd6+4], %f3;
 
@@ -313,8 +338,10 @@
     add.s64 %rd6, %rd1, %rd5;
     and.b32 %r16, %r15, 65535;
     shr.u32 %r17, %r15, 16;
-    cvt.f32.f16 %f2, %r16;
-    cvt.f32.f16 %f3, %r17;
+    cvt.u16.u32 %h2, %r16;
+    cvt.f32.f16 %f2, %h2;
+    cvt.u16.u32 %h3, %r17;
+    cvt.f32.f16 %f3, %h3;
     st.global.f32 [%rd6], %f2;
     st.global.f32 [%rd6+4], %f3;
     ret;

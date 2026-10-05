@@ -32,7 +32,7 @@ target_link_libraries(test_ptx_to_llvm_warp PRIVATE rouge-compiler-lib rouge-ptx
 add_test(NAME compiler_ptx_to_llvm_warp COMMAND test_ptx_to_llvm_warp)
 
 # Stage 1 always runs: PTX -> LLVM IR via our translator CLI.
-foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt)
+foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt mma_tile)
   add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
     COMMAND ptx2ir ${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kern}.ptx
@@ -45,13 +45,31 @@ endforeach()
 find_program(CLANG_EXECUTABLE clang)
 if(CLANG_EXECUTABLE)
   # Compile one IR module per canonical kernel: ptx2ir -> clang -O2 -> .o
-  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt)
+  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt mma_tile)
     add_custom_command(
       OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.o
       COMMAND ${CLANG_EXECUTABLE} -O2 -c ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
               -o ${CMAKE_CURRENT_BINARY_DIR}/${kern}.o
       DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
       COMMENT "[rouge-compiler] clang: ${kern}.ll -> native object (AOT)")
+  endforeach()
+
+  # The ldmatrix kernel has three entries, so ptx2ir runs once per entry (it
+  # translates one .entry per module).
+  foreach(entry ldmatrix_tile ldmatrix_trans ldmatrix_x4)
+    add_custom_command(
+      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${entry}.ll
+      COMMAND ptx2ir --entry ${entry}
+              ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ldmatrix_tile.ptx
+              ${CMAKE_CURRENT_BINARY_DIR}/${entry}.ll
+      DEPENDS ptx2ir ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ldmatrix_tile.ptx
+      COMMENT "[rouge-compiler] ptx2ir: ldmatrix_tile.ptx[${entry}] -> ${entry}.ll")
+    add_custom_command(
+      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${entry}.o
+      COMMAND ${CLANG_EXECUTABLE} -O2 -c ${CMAKE_CURRENT_BINARY_DIR}/${entry}.ll
+              -o ${CMAKE_CURRENT_BINARY_DIR}/${entry}.o
+      DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/${entry}.ll
+      COMMENT "[rouge-compiler] clang: ${entry}.ll -> native object (AOT)")
   endforeach()
 
   add_executable(test_aot_native test_aot_native.cpp ${CMAKE_CURRENT_BINARY_DIR}/vadd.o)
@@ -89,6 +107,27 @@ if(CLANG_EXECUTABLE)
     ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
   add_test(NAME aot_native_fp8_cvt COMMAND test_aot_fp8_cvt
            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/fp8_cvt.ptx)
+
+  # Test 2m: mma.sync through the per-block exchange region, AOT vs
+  # interpreter vs the PTX ISA lane formulas.
+  add_executable(test_aot_mma_tile test_aot_mma_tile.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/mma_tile.o)
+  target_link_libraries(test_aot_mma_tile PRIVATE rouge-runtime rouge-ptx)
+  target_include_directories(test_aot_mma_tile PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
+  add_test(NAME aot_native_mma_tile COMMAND test_aot_mma_tile
+           ${CMAKE_CURRENT_SOURCE_DIR}/kernels/mma_tile.ptx)
+
+  # Test 2n: ldmatrix/stmatrix x4 roundtrip through the address exchange.
+  add_executable(test_aot_ldmatrix_tile test_aot_ldmatrix_tile.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/ldmatrix_tile.o
+                 ${CMAKE_CURRENT_BINARY_DIR}/ldmatrix_trans.o
+                 ${CMAKE_CURRENT_BINARY_DIR}/ldmatrix_x4.o)
+  target_link_libraries(test_aot_ldmatrix_tile PRIVATE rouge-runtime rouge-ptx)
+  target_include_directories(test_aot_ldmatrix_tile PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
+  add_test(NAME aot_native_ldmatrix_tile COMMAND test_aot_ldmatrix_tile
+           ${CMAKE_CURRENT_SOURCE_DIR}/kernels/ldmatrix_tile.ptx)
 
   # Test 2f: cas / exch / min / max (atom_cas kernel).
   add_executable(test_aot_atom_cas test_aot_atom_cas.cpp

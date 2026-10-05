@@ -158,6 +158,7 @@ class LlvmGen {
       return "";
     }
     build_block_names();
+    if (!scan_warp_collectives()) return "";
     emit_header();
     emit_signature();
     emit_allocas();
@@ -1324,21 +1325,623 @@ class LlvmGen {
 
     if (op == "bra" || op == "bra.uni" || op == "ret" || op == "exit") return true;
 
-    // mma.sync / ldmatrix / stmatrix need warp-cooperative fragment exchange
-    // across lanes. The interpreter executes them exactly (see
-    // rouge-ptx/ptx.cpp); the AOT path lowers them once a cross-lane exchange
-    // channel exists (Wave 3, step 2: per-launch exchange region through the
-    // launch descriptor). Refusing loudly beats silently computing one lane's
-    // fragment as the whole tile.
-    if (op.rfind("mma.", 0) == 0 || op.rfind("wmma.", 0) == 0 ||
-        op.rfind("ldmatrix.", 0) == 0 || op.rfind("stmatrix.", 0) == 0 ||
-        op.rfind("movmatrix.", 0) == 0)
+    // Warp collectives: mma.sync exchanges fragments, ldmatrix/stmatrix only
+    // row addresses, both through the per-block exchange region named by the
+    // launch descriptor (see scan_warp_collectives). A GPU target is refused in
+    // the pre-scan, where the missing region is diagnosed once.
+    if (op.rfind("mma.", 0) == 0) return emit_mma(ins, idx);
+    if (op.rfind("ldmatrix.", 0) == 0 || op.rfind("stmatrix.", 0) == 0)
+      return emit_matrix_move(ins, idx);
+    if (op.rfind("wmma.", 0) == 0 || op.rfind("movmatrix.", 0) == 0)
       return fail("warp-cooperative '" + op + "' @ " + std::to_string(idx) +
-                  " is interpreter-only for now (Wave 3 step 2 tracks the AOT"
-                  " exchange lowering)");
+                  " is not lowered (wmma is a different matrix API; movmatrix"
+                  " is a warp-wide permutation): refused loudly rather than"
+                  " lowered as something else");
 
     return fail("unsupported PTX op '" + op + "' @ " + std::to_string(idx) +
                 " (vectorizing lowering landing in MLIR stage 2)");
+  }
+
+  // ===================== warp collectives ============================
+  //
+  // The host runs one OS thread per lane, so a lane cannot read a neighbour's
+  // register the way a warp can. Two mechanisms bridge that, both rooted in the
+  // launch descriptor:
+  //
+  //  * mma.sync publishes its A/B fragments into a per-block exchange region
+  //    (64 bytes per thread, named at descriptor offset 64) and reads the
+  //    peers' words after a block barrier. The C/D fragments stay local: the
+  //    tensor-core layout puts every element a lane's D fragment needs into
+  //    exactly the peers whose A/B fragments it publishes, so only A and B
+  //    cross lanes.
+  //  * ldmatrix/stmatrix only need each lane's row START ADDRESS; the data
+  //    itself lives in shared memory, so just the address is published.
+  //
+  // The block barrier is stronger than warp scope (it also waits for the
+  // block's other warps): correct, not free. Both are refused on a GPU target,
+  // where the hardware instructions do the work (see scan_warp_collectives).
+
+  static constexpr int kExSlot = 64;     // bytes per thread
+  static constexpr int kExAddrOff = 0;   // row-address field
+  static constexpr int kExFragOff = 8;   // first fragment word
+  static constexpr int kExMaxFrag = 14;  // (64 - 8) / 4
+
+  static bool is_warp_collective_op(const std::string& op) {
+    return op.rfind("mma.", 0) == 0 || op.rfind("wmma.", 0) == 0 ||
+           op.rfind("ldmatrix.", 0) == 0 || op.rfind("stmatrix.", 0) == 0 ||
+           op.rfind("movmatrix.", 0) == 0;
+  }
+
+  // Collect what the body needs before the signature is printed: the barrier
+  // declare and the fragment helpers, plus the refusal for GPU targets (there
+  // the exchange region has no place, and a silently wrong tile is worse than
+  // a loud error).
+  bool scan_warp_collectives() {
+    for (const auto& ins : body_) {
+      if (!is_warp_collective_op(ins.op)) continue;
+      if (gpu_kernel())
+        return fail("warp-cooperative '" + ins.op + "' is interpreter-only for"
+                    " now: the AOT lowering uses the per-block exchange region"
+                    " of a host launch descriptor, and a GPU kernel has no such"
+                    " region (NVVM mma / shared-window lowering pending)");
+      use_sync_ = true;  // publishing and reading are separated by a barrier
+      if (ins.op.rfind("mma.", 0) == 0) {
+        // Half-precision decode/encode goes through the host runtime, so both
+        // paths run the very same conversion code instead of two independent
+        // transcriptions of the same table. Float accumulation needs the FMA
+        // intrinsic declared up front with the signature (the body that calls
+        // it is emitted afterwards).
+        const std::string ty = ins.op;
+        if (ty.find(".bf16") != std::string::npos)
+          intrinsics_.insert("declare float @rouge_bf16_to_f32(i16)");
+        if (ty.find(".f16") != std::string::npos) {
+          intrinsics_.insert("declare float @rouge_f16_to_f32(i16)");
+          intrinsics_.insert("declare i16 @rouge_f32_to_f16_rne(float)");
+        }
+        if (ty.find(".u8") == std::string::npos &&
+            ty.find(".s8") == std::string::npos)
+          intrinsics_.insert(
+              "declare float @llvm.fma.f32(float, float, float)");
+      }
+    }
+    return true;
+  }
+
+  // ---- exchange region --------------------------------------------------
+
+  std::string load_exchange_base() {
+    const std::string gep = fresh("%xg");
+    line("  " + gep + " = getelementptr inbounds i8, ptr %launch, i64 64");
+    const std::string v = fresh("%eb");
+    line("  " + v + " = load i64, ptr " + gep + ", align 8");
+    return v;
+  }
+
+  // Linear thread index in the block: tid.x + tid.y*ntid.x + tid.z*ntid.x*ntid.y
+  // (the flattening the interpreter uses to find a warp's lanes).
+  std::string linear_tid() {
+    const std::string tx = load_spec("tid.x");
+    const std::string ty = load_spec("tid.y");
+    const std::string tz = load_spec("tid.z");
+    const std::string nx = load_spec("ntid.x");
+    const std::string ny = load_spec("ntid.y");
+    const std::string a = i32op("mul", ty, nx);
+    const std::string b = i32op("add", a, tx);
+    const std::string xy = i32op("mul", nx, ny);
+    const std::string c = i32op("mul", tz, xy);
+    return i32op("add", b, c);
+  }
+
+  // Slot of peer lane `lane' ((linear & ~31) + lane) as a `ptr` SSA.
+  std::string peer_slot_ptr(const std::string& lane) {
+    const std::string base = load_exchange_base();
+    const std::string lin = linear_tid();
+    const std::string warp = i32op("and", lin, "-32");
+    const std::string peer = i32op("add", warp, lane);
+    const std::string off = i32op("mul", peer, std::to_string(kExSlot));
+    const std::string z = fresh("%pz");
+    line("  " + z + " = zext i32 " + off + " to i64");
+    const std::string a = fresh("%pa");
+    line("  " + a + " = add i64 " + base + ", " + z);
+    return inttoptr_as(a, "ptr");
+  }
+
+  // This thread's own slot.
+  std::string own_slot_ptr() {
+    const std::string base = load_exchange_base();
+    const std::string off = i32op("mul", linear_tid(), std::to_string(kExSlot));
+    const std::string z = fresh("%oz");
+    line("  " + z + " = zext i32 " + off + " to i64");
+    const std::string a = fresh("%oa");
+    line("  " + a + " = add i64 " + base + ", " + z);
+    return inttoptr_as(a, "ptr");
+  }
+
+  // Field at a byte offset inside a slot.
+  std::string slot_field(const std::string& slotPtr, int byteOff, const char* tag) {
+    const std::string f = fresh(tag);
+    line("  " + f + " = getelementptr inbounds i8, ptr " + slotPtr + ", i64 " +
+         std::to_string(byteOff));
+    return f;
+  }
+
+  // Publish one fragment word of this lane.
+  void publish_slot(const std::string& reg, int index) {
+    std::string v = operand(reg);
+    if (is_reg(reg) && reg_type(reg) != "i32")
+      v = fit_reg(reg, v, reg_type(reg));
+    if (index < 0 || index >= kExMaxFrag) return;
+    const std::string f =
+        slot_field(own_slot_ptr(), kExFragOff + 4 * index, "%pf");
+    line("  store i32 " + v + ", ptr " + f + ", align 4");
+  }
+
+  // Read word `word' published by peer lane `lane'.
+  std::string read_frag(const std::string& lane, int word) {
+    const std::string f = slot_field(peer_slot_ptr(lane),
+                                     kExFragOff + 4 * word, "%rf");
+    const std::string v = fresh("%rv");
+    line("  " + v + " = load i32, ptr " + f + ", align 4");
+    return v;
+  }
+
+  // Publish / read the row address a lane computed (ldmatrix/stmatrix).
+  void publish_row_addr(const std::string& addr) {
+    const std::string f = slot_field(own_slot_ptr(), kExAddrOff, "%pa");
+    line("  store i64 " + addr + ", ptr " + f + ", align 8");
+  }
+  std::string read_peer_row(const std::string& lane) {
+    const std::string f =
+        slot_field(peer_slot_ptr(lane), kExAddrOff, "%ra");
+    const std::string v = fresh("%rw");
+    line("  " + v + " = load i64, ptr " + f + ", align 8");
+    return v;
+  }
+
+  // Lane index inside the warp. PTX numbers lanes by (tid.x % 32, tid.y % 32);
+  // the block shapes the collectives support are 1-D, so tid.x % 32 is it.
+  std::string lane_index() {
+    const std::string t = load_spec("tid.x");
+    return i32op("and", t, "31");
+  }
+
+  // Split operands into brace groups. Operands usually arrive split on ',',
+  // so a group is a run of tokens between braces ("{%d0", "d1", ..., "d3}");
+  // a single "{d0 d1 d2 d3}" token (whitespace-separated) is split the same
+  // way, so both spellings give the same groups.
+  static std::vector<std::vector<std::string>> brace_groups(
+      const std::vector<std::string>& args) {
+    std::vector<std::vector<std::string>> groups;
+    std::vector<std::string> cur;
+    bool inGroup = false;
+    const auto flush = [&]() {
+      if (!cur.empty()) {
+        groups.push_back(cur);
+        cur.clear();
+      }
+      inGroup = false;
+    };
+    for (const auto& a : args) {
+      std::string t = a;
+      const bool opens = t.find('{') != std::string::npos;
+      const bool closes = t.find('}') != std::string::npos;
+      if (opens && !cur.empty()) flush();
+      if (opens) inGroup = true;
+      // Split "{d0 d1}" into its registers; commas are already gone.
+      std::string tok;
+      for (size_t i = 0; i <= t.size(); ++i) {
+        const char c = i < t.size() ? t[i] : ' ';
+        if (c == ' ' || c == '\t' || c == ',') {
+          if (!tok.empty()) {
+            const std::string r = clean_operand(tok);
+            if (!r.empty()) cur.push_back(r);
+            tok.clear();
+          }
+        } else {
+          tok += c;
+        }
+      }
+      if (closes) flush();
+    }
+    flush();
+    return groups;
+  }
+
+  // ---- fragment element access -----------------------------------------
+
+  // One half of a packed fragment register (two halfs per .f16x2, low first).
+  std::string frag_half(const std::string& word, int which) {
+    const std::string z = fresh("%hw");
+    if (which == 0) {
+      line("  " + z + " = and i32 " + word + ", 65535");
+    } else {
+      const std::string t = fresh("%hw");
+      line("  " + t + " = lshr i32 " + word + ", 16");
+      line("  " + z + " = and i32 " + t + ", 65535");
+    }
+    const std::string h = fresh("%hh");
+    line("  " + h + " = trunc i32 " + z + " to i16");
+    return h;
+  }
+
+  // One byte of a packed .b32 fragment register (e4m3/e5m2/u8/s8: four).
+  std::string frag_byte(const std::string& word, int which) {
+    if (which == 0) return word;
+    const std::string sh = fresh("%bw");
+    line("  " + sh + " = lshr i32 " + word + ", " + std::to_string(8 * which));
+    return i32op("and", sh, "255");
+  }
+
+  // A/B element as f32. Half formats go through the host runtime (same code as
+  // the interpreter, so the paths are bit-identical by construction); the
+  // narrow floats through the shared branchless decoder.
+  std::string decode_ab_f(const std::string& word, const std::string& type,
+                          int within, bool perByte) {
+    if (!perByte) {
+      const std::string h = frag_half(word, within);
+      const std::string f = fresh("%ab");
+      line("  " + f + " = call float @rouge_" +
+           std::string(type == "bf16" ? "bf16_to_f32" : "f16_to_f32") + "(i16 " +
+           h + ")");
+      return f;
+    }
+    const std::string b = frag_byte(word, within);
+    NarrowFmt NF;
+    narrow_fmt(type == "e4m3" ? "e4m3x2" : "e5m2x2", &NF);
+    return emit_fp_decode(b, NF);
+  }
+
+  // A/B element as an exact i32 (integer mma: |a|,|b| <= 255).
+  std::string decode_ab_i32(const std::string& word, const std::string& type,
+                            int within) {
+    const std::string b = frag_byte(word, within);
+    if (type != "s8") return b;  // u8: the masked byte is the value
+    const std::string t = fresh("%b8");
+    line("  " + t + " = trunc i32 " + b + " to i8");
+    const std::string s = fresh("%is");
+    line("  " + s + " = sext i8 " + t + " to i32");
+    return s;
+  }
+
+  // ---- mma.sync ---------------------------------------------------------
+
+  // Where a fragment element lives, transcribed from the interpreter's gather
+  // (PTX ISA 9.7.16.5.8): register index, element inside it, and the lane that
+  // owns it — groupID g = lane>>2 owns rows r%8 and r%8+8, tigid = lane&3 owns
+  // the column group. Everything but the row/column OFFSET relative to this
+  // lane's own g/t is a compile-time constant, so no tile arrays are needed.
+  struct MmaFrag {
+    int K = 0, nA = 0, nB = 0, nD = 0;
+    bool fp16AB = false, isInt = false, dF16 = false;
+    bool perByte = false;  // A/B registers hold four bytes, not two halfs
+    // A element (rOff in {0,8}, k): register, element inside it, and the
+    // compile-time part of the owning lane. The full owner is g*4 + laneConst,
+    // where g = lane>>2 is this lane's own row group (a runtime SSA value):
+    // rows repeat every 8, so r%8 = g for both r = g and r = g+8.
+    void aLoc(int rOff, int k, int* reg, int* within,
+              int* laneConst) const {
+      if (fp16AB && K == 16) {
+        const int s = (k >= 8 ? 4 : 0) + (rOff >= 8 ? 2 : 0) + (k & 1);
+        *reg = s / 2;
+        *within = s % 2;
+        *laneConst = (k >> 1) & 3;
+      } else if (K == 16) {
+        const int s = (rOff >= 8 ? 4 : 0) + (k & 3);
+        *reg = s / 4;
+        *within = s % 4;
+        *laneConst = (k >> 2) & 3;
+      } else {
+        const int s = (rOff >= 8 ? 2 : 0) + (k & 1);
+        *reg = s / 2;
+        *within = s % 2;
+        *laneConst = (k >> 1) & 3;
+      }
+    }
+    // B element (k, col): register, element inside it, and the compile-time
+    // part of the owning lane. The full owner is col*4 + laneConst, where col
+    // is this lane's own column (a runtime SSA value).
+    void bLoc(int k, int* reg, int* within, int* laneConst) const {
+      if (fp16AB && K == 16) {
+        const int s = (k >= 8 ? 2 : 0) + (k & 1);
+        *reg = s / 2;
+        *within = s % 2;
+        *laneConst = (k >> 1) & 3;
+      } else if (K == 16) {
+        *reg = 0;  // a single .b32 holds all four bytes
+        *within = k & 3;
+        *laneConst = (k >> 2) & 3;
+      } else {
+        const int s = k & 1;
+        *reg = 0;
+        *within = s;
+        *laneConst = (k >> 1) & 3;
+      }
+    }
+    // C/D element (rOff in {0,8}, cBit in {0,1}): index inside the fragment.
+    int cElem(int rOff, int cBit) const {
+      return (rOff >= 8 ? 2 : 0) + cBit;
+    }
+  };
+
+  bool emit_mma(const rouge::PtxInstruction& ins, size_t idx) {
+    const auto& A = ins.args;
+    // Split "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32".
+    std::string shape, alayout, blayout, dtype, atype, btype, ctype;
+    {
+      std::vector<std::string> q;
+      std::stringstream ss(ins.op);
+      std::string t;
+      while (std::getline(ss, t, '.')) q.push_back(t);
+      for (const auto& s : q) {
+        if (s == "mma" || s == "sync" || s == "aligned") continue;
+        if (s.rfind("m", 0) == 0 && s.find("n") != std::string::npos &&
+            shape.empty())
+          shape = s;
+        else if ((s == "row" || s == "col") && alayout.empty()) alayout = s;
+        else if ((s == "row" || s == "col") && blayout.empty()) blayout = s;
+        else if (dtype.empty()) dtype = s;
+        else if (atype.empty()) atype = s;
+        else if (btype.empty()) btype = s;
+        else if (ctype.empty()) ctype = s;
+      }
+    }
+    const bool okShape = shape == "m16n8k16" || shape == "m16n8k8";
+    const bool okLayout = alayout == "row" && blayout == "col";
+    const bool okAB = (atype == "f16" || atype == "bf16" || atype == "e4m3" ||
+                       atype == "e5m2" || atype == "u8" || atype == "s8") &&
+                      atype == btype;
+    const bool okDC = (dtype == "f32" || dtype == "f16" || dtype == "s32") &&
+                      dtype == ctype;
+    const bool isInt = atype == "u8" || atype == "s8";
+    const bool okMix = (!isInt && dtype != "s32") || (isInt && dtype == "s32");
+    // m16n8k8 exists for f16/bf16 only; the byte-packed forms are k16.
+    const bool okShapeType =
+        (shape == "m16n8k8" && (atype == "f16" || atype == "bf16")) ||
+        shape == "m16n8k16";
+    if (!okShape || !okLayout || !okAB || !okDC || !okMix || !okShapeType)
+      return fail("unsupported PTX op '" + ins.op + "' @ " + std::to_string(idx) +
+                  " (supported: .row.col m16n8k16 with "
+                  "f16/bf16/e4m3/e5m2/u8/s8 -> f32/f16/s32, and m16n8k8 with"
+                  " f16/bf16 -> f32/f16)");
+    MmaFrag F;
+    F.K = (shape == "m16n8k16") ? 16 : 8;
+    F.fp16AB = (atype == "f16" || atype == "bf16");
+    F.isInt = isInt;
+    F.dF16 = (dtype == "f16");
+    F.perByte = !F.fp16AB;
+    F.nA = (shape == "m16n8k16") ? (F.fp16AB ? 4 : 2) : 2;
+    F.nB = (shape == "m16n8k16") ? (F.fp16AB ? 2 : 1) : 1;
+    F.nD = F.dF16 ? 2 : 4;
+    if (F.nA + F.nB > kExMaxFrag)
+      return fail("mma fragments need " + std::to_string(F.nA + F.nB) +
+                  " exchange words, the slot holds " +
+                  std::to_string(kExMaxFrag) + " @ " + std::to_string(idx));
+
+    const auto groups = brace_groups(A);
+    if (groups.size() != 4 || static_cast<int>(groups[0].size()) != F.nD ||
+        static_cast<int>(groups[1].size()) != F.nA ||
+        static_cast<int>(groups[2].size()) != F.nB ||
+        static_cast<int>(groups[3].size()) != F.nD)
+      return fail("bad mma fragment groups in '" + ins.op + "' @ " +
+                  std::to_string(idx) + " (want {" + std::to_string(F.nD) +
+                  "}, {" + std::to_string(F.nA) + "}, {" + std::to_string(F.nB) +
+                  "}, {" + std::to_string(F.nD) + "})");
+
+    // Publish A and B, then read the peers. C and D stay in registers.
+    for (int i = 0; i < F.nA; ++i) publish_slot(groups[1][i], i);
+    for (int i = 0; i < F.nB; ++i) publish_slot(groups[2][i], F.nA + i);
+    line("  call void @__rouge_syncthreads(ptr %launch)");
+
+    // This lane's D geometry: g = lane>>2 (row group), t = lane&3 (column
+    // group), so its four outputs are rows g/g+8 x columns 2t/2t+1.
+    const std::string lane = lane_index();
+    const std::string g0 = i32op("lshr", lane, "2");
+    const std::string t0 = i32op("and", lane, "3");
+    const std::string cPair = i32op("mul", t0, "2");
+
+    // Owner lanes are runtime values: A element (r,k) lives in lane
+    // g*4 + aConst (g = lane>>2), B element (k,c) in lane col*4 + bConst.
+    const std::string g4 = i32op("shl", g0, "2");
+    const std::string col4 = i32op("shl", cPair, "2");
+
+    for (int s = 0; s < 4; ++s) {
+      const int rOff = (s < 2) ? 0 : 8;
+      const int cBit = s & 1;
+      // This output's column: 2t + cBit. col*4 below must use the full
+      // column (not col&7: columns are 0..7 here, so the mask is a no-op,
+      // but the shift has to apply to the pair base plus the bit).
+      const std::string colBit =
+          cBit ? i32op("add", cPair, "1") : cPair;
+      const std::string col4s = cBit ? i32op("shl", colBit, "2") : col4;
+      // C element from this lane's own C fragment.
+      std::string acc;
+      if (F.isInt) {
+        acc = operand(groups[3][F.cElem(rOff, cBit)]);
+      } else if (F.dF16) {
+        const std::string h = frag_half(operand(groups[3][s / 2]), s % 2);
+        const std::string f = fresh("%cf");
+        line("  " + f + " = call float @rouge_f16_to_f32(i16 " + h + ")");
+        acc = f;
+      } else {
+        acc = bitsf32(operand(groups[3][s]));
+      }
+      // k-ascending accumulation, the same order the interpreter uses.
+      for (int k = 0; k < F.K; ++k) {
+        int aReg = 0, aWithin = 0, aConst = 0;
+        F.aLoc(rOff, k, &aReg, &aWithin, &aConst);
+        int bReg = 0, bWithin = 0, bConst = 0;
+        F.bLoc(k, &bReg, &bWithin, &bConst);
+        const std::string aLane = i32op("add", g4, std::to_string(aConst));
+        const std::string bLane = i32op("add", col4s, std::to_string(bConst));
+        if (F.isInt) {
+          const std::string a =
+              decode_ab_i32(read_frag(aLane, aReg), atype, aWithin);
+          const std::string b =
+              decode_ab_i32(read_frag(bLane, F.nA + bReg), btype, bWithin);
+          const std::string p = i32op("mul", a, b);
+          acc = i32op("add", acc, p);
+          continue;
+        }
+        const std::string a = decode_ab_f(read_frag(aLane, aReg), atype,
+                                          aWithin, F.perByte);
+        const std::string b = decode_ab_f(read_frag(bLane, F.nA + bReg), btype,
+                                          bWithin, F.perByte);
+        const std::string f = fresh("%mf");
+        line("  " + f + " = call float @llvm.fma.f32(float " + a + ", float " + b +
+             ", float " + acc + ")");
+        acc = f;
+      }
+      // Scatter the D element.
+      if (F.dF16) {
+        const std::string h = fresh("%dh");
+        line("  " + h + " = call i16 @rouge_f32_to_f16_rne(float " + acc + ")");
+        const std::string z = fresh("%dz");
+        line("  " + z + " = zext i16 " + h + " to i32");
+        if (s % 2 == 0) {
+          store_reg(groups[0][s / 2], z);
+        } else {
+          // Second half of the packed .f16x2 register: read-modify-write so
+          // the half just stored by the previous iteration survives.
+          const std::string prev = load_reg(groups[0][s / 2]);
+          const std::string sh = i32op("shl", z, "16");
+          const std::string keep = i32op("and", prev, "65535");
+          store_reg(groups[0][s / 2], i32op("or", keep, sh));
+        }
+        continue;
+      }
+      store_reg(groups[0][s], F.isInt ? acc : f32bits(acc));
+    }
+    // The next collective in this kernel would publish into the same slots
+    // while slower lanes are still reading this one's words. A second barrier
+    // closes that window (the PTX has only one, because on hardware the warp
+    // retires in lockstep; here lanes are OS threads).
+    line("  call void @__rouge_syncthreads(ptr %launch)");
+    return true;
+  }
+
+  // ---- ldmatrix / stmatrix ---------------------------------------------
+
+  // One or more 8x8 .b16 matrices collectively moved between shared memory and
+  // registers (PTX ISA 9.7.16.5.15/16). Eight threads per matrix publish the
+  // row-start addresses (lanes 0-7 matrix 0, 8-15 matrix 1, ...), a group of
+  // four consecutive threads moves one row, and EVERY thread receives a
+  // fragment of EVERY matrix: thread t takes row t%8, elements (t%4)*2 and +1.
+  // .trans swaps the receive side to columns while the addresses keep naming
+  // rows, so coverage stays complete.
+  bool emit_matrix_move(const rouge::PtxInstruction& ins, size_t idx) {
+    const bool isLoad = ins.op[0] == 'l';
+    std::string shape, num, type;
+    bool trans = false;
+    {
+      std::vector<std::string> q;
+      std::stringstream ss(ins.op);
+      std::string t;
+      while (std::getline(ss, t, '.')) q.push_back(t);
+      for (const auto& s : q) {
+        if (s == "ldmatrix" || s == "stmatrix" || s == "sync" || s == "aligned")
+          continue;
+        else if (s == "m8n8") shape = s;
+        else if (s == "x1" || s == "x2" || s == "x4") num = s;
+        else if (s == "trans") trans = true;
+        else if (s == "shared" || s == "shared::cta") continue;
+        else if (s == "b16") type = s;
+        else
+          return fail("unsupported PTX op '" + ins.op + "' @ " +
+                      std::to_string(idx) + " (qualifier '" + s + "' is not"
+                      " lowered)");
+      }
+    }
+    if (shape != "m8n8" || type != "b16" ||
+        (num != "x1" && num != "x2" && num != "x4"))
+      return fail("unsupported PTX op '" + ins.op + "' @ " + std::to_string(idx) +
+                  " (supported: .m8n8.x{1,2,4}[.trans].b16)");
+    const int nMat = (num == "x4") ? 4 : (num == "x2") ? 2 : 1;
+    const auto groups = brace_groups(ins.args);
+    if (groups.size() != 2 ||
+        static_cast<int>(groups[isLoad ? 0 : 1].size()) != nMat)
+      return fail("bad " + ins.op + " operands @ " + std::to_string(idx));
+    const std::vector<std::string>& fragRegs = groups[isLoad ? 0 : 1];
+    // Address operand: [reg], [reg+off] or [shared symbol].
+    const std::string inner = strip_brackets(groups[isLoad ? 1 : 0][0]);
+    std::string addrBase;
+    int64_t addrOff = 0;
+    {
+      std::string base;
+      int64_t off = 0;
+      if (split_reg_offset(inner, &base, &off)) {
+        addrBase = base;
+        addrOff = off;
+      } else {
+        addrBase = inner;
+      }
+    }
+    std::string rowAddr;
+    if (is_reg(addrBase)) {
+      // A 32-bit address register is legal PTX (nvcc materialises a demoted
+      // local array's address that way), and the exchange slot holds an i64:
+      // widen explicitly, or the store would carry the wrong width.
+      std::string v = operand(addrBase);
+      if (reg_type(addrBase) != "i64") {
+        const std::string t = reg_type(addrBase);
+        const std::string z = fresh("%aw");
+        line("  " + z + " = zext " + t + " " + v + " to i64");
+        v = z;
+      }
+      rowAddr = v;
+    } else {
+      // A bare .shared/.local symbol resolves exactly as it does for ld/st.
+      const std::string p = resolve_addr(groups[isLoad ? 1 : 0][0], "shared");
+      const std::string v = fresh("%pi");
+      line("  " + v + " = ptrtoint " + pt(p) + " " + p + " to i64");
+      rowAddr = v;
+    }
+    if (addrOff != 0) {
+      const std::string a = fresh("%ra");
+      line("  " + a + " = add i64 " + rowAddr + ", " + std::to_string(addrOff));
+      rowAddr = a;
+    }
+    publish_row_addr(rowAddr);
+    line("  call void @__rouge_syncthreads(ptr %launch)");
+
+    const std::string lane = lane_index();
+    const std::string fixed = i32op("and", lane, "7");   // row (or column)
+    const std::string e0 = i32op("mul", i32op("and", lane, "3"), "2");
+    for (int m = 0; m < nMat; ++m) {
+      std::string packed;
+      for (int e = 0; e < 2; ++e) {
+        // .trans: the thread takes column `fixed', rows e0+e. Plain: row
+        // `fixed', columns e0+e. Both read the address the row's owner
+        // published, so coverage is complete either way.
+        const std::string r =
+            trans ? i32op("add", e0, std::to_string(e)) : fixed;
+        const std::string c =
+            trans ? fixed : i32op("add", e0, std::to_string(e));
+        const std::string provider = i32op("add", std::to_string(m * 8), r);
+        const std::string base = read_peer_row(provider);
+        const std::string byteOff =
+            i32op("mul", c, "2");  // i32 column index -> i32 byte count
+        const std::string bo64 = fresh("%bo");
+        line("  " + bo64 + " = zext i32 " + byteOff + " to i64");
+        const std::string at = fresh("%at");
+        line("  " + at + " = add i64 " + base + ", " + bo64);
+        const std::string shp = inttoptr_as(at, shared_ptr_ty());
+        if (isLoad) {
+          const std::string v = fresh("%mv");
+          line("  " + v + " = load i16, " + pt(shp) + " " + shp + ", align 2");
+          const std::string z = fresh("%mz");
+          line("  " + z + " = zext i16 " + v + " to i32");
+          packed = (e == 0) ? z : i32op("or", packed, i32op("shl", z, "16"));
+        } else {
+          const std::string h = frag_half(operand(fragRegs[m]), e);
+          line("  store i16 " + h + ", " + pt(shp) + " " + shp + ", align 2");
+        }
+      }
+      if (isLoad) store_reg(fragRegs[m], packed);
+    }
+    // See emit_mma: the next collective must not overwrite the published
+    // addresses before every lane has read them.
+    line("  call void @__rouge_syncthreads(ptr %launch)");
+    return true;
   }
 
   // =================== integer ALU / select / predicate ALU ===============
@@ -1960,11 +2563,26 @@ class LlvmGen {
       store_f32(A[0], r);
       return true;
     }
-    // Integer: u32/s32/u64/s64.
+    // Integer: u32/s32/u64/s64. Both operands are fitted to the destination
+    // width: PTX allows a narrower register as a source of a wider arithmetic
+    // op ("add.s64 %rd2, %rd1, %r9" is what nvcc emits for pointer maths), and
+    // the interpreter reads such a register zero-extended. Without the fit the
+    // emitted IR mixed i32 into an i64 expression and clang rejected it.
     const std::string ty = reg_type(A[0]);
     const char* ll = op[0] == 'a' ? "add" : op[0] == 's' ? "sub" : "mul";
-    const std::string x = operand(A[1]);
-    const std::string y = operand(A[2]);
+    const auto fit_src = [&](const std::string& tok) {
+      std::string v = operand(tok);
+      const std::string srcTy =
+          is_reg(tok) ? reg_type(tok)
+                      : (int_type_bits(op) == 64 ? "i64" : "i32");
+      if (srcTy == ty) return v;
+      const std::string t = fresh("%t");
+      line("  " + t + " = " + (type_bits(ty) > type_bits(srcTy) ? "zext" : "trunc") +
+           " " + srcTy + " " + v + " to " + ty);
+      return t;
+    };
+    const std::string x = fit_src(A[1]);
+    const std::string y = fit_src(A[2]);
     const std::string r = fresh("%r");
     line("  " + r + " = " + ll + " " + ty + " " + x + ", " + y);
     store_reg(A[0], r);

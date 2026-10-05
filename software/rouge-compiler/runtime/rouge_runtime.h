@@ -71,6 +71,20 @@ void rouge_exchange_free(void* p);
 // RISC-V). A null launch descriptor or a null barrier handle is a no-op.
 void __rouge_syncthreads(const void* launch);
 
+// Narrow float conversions shared by the AOT warp-collective lowering.
+//
+// binary16 / bfloat16 <-> binary32, round-to-nearest-even. These are the very
+// same routines the PTX interpreter uses (rouge-ptx/ptx.cpp), so the AOT and
+// interpreted paths agree on every one of the 65536 half patterns by
+// construction rather than by two independent transcriptions of the same
+// table. Hardware semantics per IEEE 754 / PTX ISA 9.7.9: subnormals are
+// preserved, overflow saturates to infinity, underflow rounds to a signed
+// zero, and a NaN becomes a quiet NaN with the sign kept.
+float rouge_f16_to_f32(uint16_t h);
+uint16_t rouge_f32_to_f16_rne(float f);
+float rouge_bf16_to_f32(uint16_t b);
+uint16_t rouge_f32_to_bf16_rne(float f);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
