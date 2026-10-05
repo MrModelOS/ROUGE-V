@@ -107,6 +107,13 @@ if(ROUGE_REAL_CUDA_INCLUDE AND ROUGE_PYTHON3)
   target_link_libraries(test_mma_forms PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
   add_test(NAME mma_forms COMMAND test_mma_forms ${KERNEL_DIR})
 
+  # mma: сквозной пайплайн fill -> ldmatrix.x4 + x2.trans -> mma -> global.
+  add_executable(test_mma_pipe test_mma_pipe.cpp)
+  target_include_directories(test_mma_pipe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(test_mma_pipe PRIVATE rouge-cuda-static ${CMAKE_DL_LIBS})
+  add_test(NAME mma_pipe COMMAND test_mma_pipe ${KERNEL_DIR})
+
   # ldmatrix/stmatrix: roundtrip + transpose + x4.
   add_executable(test_ldmatrix test_ldmatrix.cpp)
   target_include_directories(test_ldmatrix PRIVATE

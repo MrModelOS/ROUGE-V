@@ -32,7 +32,7 @@ target_link_libraries(test_ptx_to_llvm_warp PRIVATE rouge-compiler-lib rouge-ptx
 add_test(NAME compiler_ptx_to_llvm_warp COMMAND test_ptx_to_llvm_warp)
 
 # Stage 1 always runs: PTX -> LLVM IR via our translator CLI.
-foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt mma_tile)
+foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt mma_tile mma_pipe)
   add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
     COMMAND ptx2ir ${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kern}.ptx
@@ -45,7 +45,7 @@ endforeach()
 find_program(CLANG_EXECUTABLE clang)
 if(CLANG_EXECUTABLE)
   # Compile one IR module per canonical kernel: ptx2ir -> clang -O2 -> .o
-  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt mma_tile)
+  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt mma_tile mma_pipe)
     add_custom_command(
       OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.o
       COMMAND ${CLANG_EXECUTABLE} -O2 -c ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
@@ -165,6 +165,16 @@ if(CLANG_EXECUTABLE)
     ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
   add_test(NAME aot_native_mma_forms COMMAND test_aot_mma_forms
            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/mma_forms.ptx)
+
+  # Test 2p: the full tensor pipeline (fill -> ldmatrix.x4 + x2.trans ->
+  # mma -> global), AOT against the interpreter and the hand tile reference.
+  add_executable(test_aot_mma_pipe test_aot_mma_pipe.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/mma_pipe.o)
+  target_link_libraries(test_aot_mma_pipe PRIVATE rouge-runtime rouge-ptx)
+  target_include_directories(test_aot_mma_pipe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
+  add_test(NAME aot_native_mma_pipe COMMAND test_aot_mma_pipe
+           ${CMAKE_CURRENT_SOURCE_DIR}/kernels/mma_pipe.ptx)
 
   # Test 2f: cas / exch / min / max (atom_cas kernel).
   add_executable(test_aot_atom_cas test_aot_atom_cas.cpp

@@ -1,0 +1,164 @@
+// ROUGE-V canonical kernel: the full tensor pipeline in one kernel.
+//
+// One warp (32 threads) computes a 16x8 D tile, D = A*B with A = 16x16 f16 and
+// B = 16x8 f16, entirely through warp collectives: the tiles are filled into
+// .shared, loaded with ldmatrix (A as four 8x8 matrices, B as two 8x8 with
+// .trans, whose column receive side matches mma's B fragment), multiplied with
+// mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32, and stored to global.
+//
+// This is the kernel the ldmatrix x4 fix was made for: every thread receives
+// a fragment of every matrix, and ldmatrix fragments ARE mma fragments
+// (PTX ISA 9.7.16.5.15/5.8). Values match mma_tile.ptx exactly
+// (A[r][c] = r*16+c, B[r][c] = 1000+r*8+c, C = 0), so the host reference is
+// the same k-ascending FMA chain and any deviation — in EITHER collective —
+// fails bit-exactly.
+//
+// A tile layout (16x16 f16 = 512 bytes): four 8x8 blocks, m = tid>>3 gives
+// the block (0 TL, 1 BL, 2 TR, 3 BR) and r = tid&7 the row inside it:
+//   fullRow = (m&1)*8 + r, fullCol = (m>>1)*8,
+//   addr = A + fullRow*32 + fullCol*2.
+// B tile layout (16x8 f16 = 256 bytes): two stacked 8x8 blocks, m2 = (tid>>3)&1
+// (lanes 16-31 repeat valid addresses per the sm_75 note):
+//   addr = B + (m2*8 + r)*16.
+.version 9.4
+.target sm_75
+.address_size 64
+
+.visible .entry mma_pipe(
+    .param .u64 mma_pipe_param_0
+)
+{
+    .reg .b16 %h<4>;
+    .reg .b32 %r<24>;
+    .reg .b32 %a<4>;
+    .reg .b32 %b<2>;
+    .reg .f32 %c<4>;
+    .reg .f32 %d<4>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<8>;
+    .shared .align 2 .b8 tileA[512];
+    .shared .align 2 .b8 tileB[256];
+
+    ld.param.u64 %rd1, [mma_pipe_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.shared.u64 %rd2, tileA;
+    cvta.to.shared.u64 %rd3, tileB;
+
+    mov.u32 %r2, %tid.x;
+
+    // ---- fill A: A[tid*8+i] = tid*8+i, four pair stores ----
+    shl.b32 %r11, %r2, 3;       // value base tid*8
+    shl.b32 %r12, %r2, 4;       // byte base tid*16
+    add.s64 %rd4, %rd2, %r12;
+    cvt.f32.s32 %f1, %r11;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r13, %h1;
+    add.s32 %r11, %r11, 1;
+    cvt.f32.s32 %f1, %r11;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r14, %h1;
+    shl.b32 %r14, %r14, 16;
+    or.b32 %r13, %r13, %r14;
+    st.shared.b32 [%rd4], %r13;
+    add.s32 %r11, %r11, 1;
+    cvt.f32.s32 %f1, %r11;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r13, %h1;
+    add.s32 %r11, %r11, 1;
+    cvt.f32.s32 %f1, %r11;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r14, %h1;
+    shl.b32 %r14, %r14, 16;
+    or.b32 %r13, %r13, %r14;
+    st.shared.b32 [%rd4+4], %r13;
+    add.s32 %r11, %r11, 1;
+    cvt.f32.s32 %f1, %r11;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r13, %h1;
+    add.s32 %r11, %r11, 1;
+    cvt.f32.s32 %f1, %r11;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r14, %h1;
+    shl.b32 %r14, %r14, 16;
+    or.b32 %r13, %r13, %r14;
+    st.shared.b32 [%rd4+8], %r13;
+    add.s32 %r11, %r11, 1;
+    cvt.f32.s32 %f1, %r11;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r13, %h1;
+    add.s32 %r11, %r11, 1;
+    cvt.f32.s32 %f1, %r11;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r14, %h1;
+    shl.b32 %r14, %r14, 16;
+    or.b32 %r13, %r13, %r14;
+    st.shared.b32 [%rd4+12], %r13;
+
+    // ---- fill B: B[tid*4+i] = 1000+tid*4+i, two pair stores ----
+    shl.b32 %r11, %r2, 2;
+    add.s32 %r11, %r11, 1000;
+    shl.b32 %r12, %r2, 3;
+    add.s64 %rd5, %rd3, %r12;
+    cvt.f32.s32 %f1, %r11;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r13, %h1;
+    add.s32 %r11, %r11, 1;
+    cvt.f32.s32 %f1, %r11;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r14, %h1;
+    shl.b32 %r14, %r14, 16;
+    or.b32 %r13, %r13, %r14;
+    st.shared.b32 [%rd5], %r13;
+    add.s32 %r11, %r11, 1;
+    cvt.f32.s32 %f1, %r11;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r13, %h1;
+    add.s32 %r11, %r11, 1;
+    cvt.f32.s32 %f1, %r11;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r14, %h1;
+    shl.b32 %r14, %r14, 16;
+    or.b32 %r13, %r13, %r14;
+    st.shared.b32 [%rd5+4], %r13;
+
+    bar.sync 0;
+
+    // ---- A row address: block m = tid>>3, row r = tid&7 ----
+    shr.u32 %r4, %r2, 3;        // m
+    and.b32 %r3, %r2, 7;        // r
+    and.b32 %r5, %r4, 1;
+    shl.b32 %r5, %r5, 3;        // (m&1)*8
+    add.s32 %r5, %r5, %r3;      // fullRow
+    shr.u32 %r6, %r4, 1;
+    shl.b32 %r6, %r6, 3;        // fullCol halfs
+    shl.b32 %r7, %r5, 5;        // fullRow*32
+    shl.b32 %r8, %r6, 1;        // fullCol*2
+    add.s64 %rd4, %rd2, %r7;
+    add.s64 %rd4, %rd4, %r8;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%a0, %a1, %a2, %a3}, [%rd4];
+
+    // ---- B row address: block m2 = (tid>>3)&1, row r = tid&7 ----
+    shr.u32 %r9, %r2, 3;
+    and.b32 %r9, %r9, 1;        // m2
+    shl.b32 %r10, %r9, 3;       // m2*8
+    add.s32 %r10, %r10, %r3;    // fullRow
+    shl.b32 %r10, %r10, 4;      // *16 bytes
+    add.s64 %rd5, %rd3, %r10;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%b0, %b1}, [%rd5];
+
+    // ---- multiply-accumulate, C = 0 ----
+    mov.f32 %c0, 0f00000000;
+    mov.f32 %c1, 0f00000000;
+    mov.f32 %c2, 0f00000000;
+    mov.f32 %c3, 0f00000000;
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%c0, %c1, %c2, %c3};
+
+    // ---- store D: out[lane*4 + s] ----
+    shl.b32 %r15, %r2, 4;       // lane*16 bytes
+    add.s64 %rd6, %rd1, %r15;
+    st.global.f32 [%rd6], %d0;
+    st.global.f32 [%rd6+4], %d1;
+    st.global.f32 [%rd6+8], %d2;
+    st.global.f32 [%rd6+12], %d3;
+    ret;
+}

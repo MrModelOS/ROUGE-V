@@ -1908,7 +1908,9 @@ class LlvmGen {
     line("  call void @__rouge_syncthreads(ptr %launch)");
 
     const std::string lane = lane_index();
-    const std::string fixed = i32op("and", lane, "7");   // row (or column)
+    // Thread t takes row t>>2, elements (t%4)*2 and +1 (.trans: column t>>2,
+    // rows (t%4)*2) — a group of four consecutive threads moves one whole row.
+    const std::string fixed = i32op("lshr", lane, "2");
     const std::string e0 = i32op("mul", i32op("and", lane, "3"), "2");
     for (int m = 0; m < nMat; ++m) {
       std::string packed;
@@ -2476,7 +2478,10 @@ class LlvmGen {
     // f16x2/bf16x2 fallback: keep payload as i32 (vector of 2×half).
     // Real packed arithmetic will be vectorized in MLIR stage 2; for AOT
     // correctness just preserve bit pattern (or do i32 add) so codegen does not fail.
-    if (op.find("x2") != std::string::npos) {
+    // Matched on the full type names: a bare "x2" also occurs in matrix
+    // multiplicities (ldmatrix.x2), which must never take this fallback.
+    if (op.find(".f16x2") != std::string::npos ||
+        op.find(".bf16x2") != std::string::npos) {
       // Fallback: bit-copy first source to dest (or i32 add for add.*)
       if (fma) {
         store_reg(A[0], operand(A[1]));
@@ -3226,7 +3231,8 @@ class LlvmGen {
         spec.find("e3m2x2") != std::string::npos ||
         spec.find("e2m3x2") != std::string::npos ||
         spec.find("e2m1x2") != std::string::npos;
-    if (!narrowX2 && spec.find("x2") != std::string::npos) {
+    if (!narrowX2 && (spec.find(".f16x2") != std::string::npos ||
+                       spec.find(".bf16x2") != std::string::npos)) {
       std::string val = operand(A[1]);
       const std::string dstTy = reg_type(A[0]);
       if (is_reg(A[1]) && reg_type(A[1]) != dstTy) {
@@ -3805,7 +3811,8 @@ class LlvmGen {
                      ins.op.rfind(".b64") != std::string::npos ||
                      ins.op.rfind(".f64") != std::string::npos;
     std::string addr = resolve_addr(A[1], op_space(ins.op));
-    if (ins.op.find("x2") != std::string::npos) {
+    if (ins.op.find(".f16x2") != std::string::npos ||
+        ins.op.find(".bf16x2") != std::string::npos) {
       // f16x2/bf16x2: 32-bit payload (2×half) as i32
       const std::string v = fresh("%v");
       line("  " + v + " = load i32, " + pt(addr) + " " + addr + ", align 4");
@@ -3909,7 +3916,8 @@ class LlvmGen {
                      ins.op.rfind(".b64") != std::string::npos ||
                      ins.op.rfind(".f64") != std::string::npos;
     std::string addr = resolve_addr(A[0], op_space(ins.op));
-    if (ins.op.find("x2") != std::string::npos) {
+    if (ins.op.find(".f16x2") != std::string::npos ||
+        ins.op.find(".bf16x2") != std::string::npos) {
       // f16x2/bf16x2: 32-bit payload as i32
       line("  store i32 " + operand(A[1]) + ", " + pt(addr) + " " + addr + ", align 4");
       return true;

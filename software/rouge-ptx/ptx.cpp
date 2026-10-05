@@ -1651,7 +1651,14 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       return 1;
     }
 
-    if (op.find("x2") != std::string::npos &&
+    // f16x2/bf16x2 fallback for non-memory ops: payload as i32. Matched on the
+    // full ".f16x2"/".bf16x2" type names, never on a bare "x2": the latter also
+    // occurs in matrix-instruction multiplicities (ldmatrix.x2, stmatrix.x2),
+    // which this fallback used to swallow silently — every .x2 matrix move
+    // executed as a no-op bit-copy with zeroed destinations (caught by the
+    // mma_pipe kernel, the first .x2 user; .x1/.x4 never contain "x2").
+    if ((op.find(".f16x2") != std::string::npos ||
+         op.find(".bf16x2") != std::string::npos) &&
         op.rfind("ld.", 0) != 0 && op.rfind("st.", 0) != 0) {
       // f16x2/bf16x2 fallback for non-memory ops: payload as i32.
       // Narrow-float cvt forms (e4m3x2/e5m2x2/...) are NOT bit-copies: they
@@ -2882,16 +2889,19 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       // Every thread receives a fragment from EVERY matrix (PTX ISA
       // 9.7.16.5.15: "each component of the vector expression holds a fragment
       // from the corresponding matrix"; for .x2 the second matrix lands in the
-      // next register *in each thread*). Thread t takes row t%8 of each matrix,
-      // elements (t%4)*2 and +1; the row's start address comes from the lane
-      // that provided it: threads 0-7 for matrix 0, 8-15 for matrix 1, and so
-      // on (the .num table in the spec). With .trans the thread takes column
-      // elements instead; the addresses still name rows, so coverage holds.
+      // next register *in each thread*). Thread t takes row t>>2, elements
+      // (t%4)*2 and +1: a group of four consecutive threads moves one whole
+      // row (16 bytes), thread 0 the first fragment, and so on. The row's
+      // start address comes from the lane that provided it: threads 0-7 for
+      // matrix 0, 8-15 for matrix 1, and so on (the .num table in the spec).
+      // With .trans the thread takes column t>>2, rows (t%4)*2 instead; the
+      // addresses still name rows, so coverage holds. This is the layout that
+      // feeds mma.sync directly (ldmatrix fragments ARE mma fragments).
       for (uint32_t l = 0; l < 32; ++l) {
         const size_t si = static_cast<size_t>(warpBase0 + l);
         if (si >= g_block_states->size()) continue;
         const int e0 = static_cast<int>((l % 4) * 2);
-        const int fixed = static_cast<int>(l % 8);
+        const int fixed = static_cast<int>(l >> 2);
         for (int m = 0; m < nMat; ++m) {
           uint16_t els[2] = {0, 0};
           for (int e = 0; e < 2; ++e) {

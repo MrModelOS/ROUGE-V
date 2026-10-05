@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
     EXPECT_TRUE(run_entry(*prog, fi, out));
     int bad = 0;
     for (int tid = 0; tid < 32; ++tid) {
-      const int row = tid % 8, col0 = (tid % 4) * 2;
+      const int row = tid >> 2, col0 = (tid % 4) * 2;
       for (int e = 0; e < 2; ++e) {
         const float want = (float)(row * 8 + col0 + e);
         if (out[tid * 2 + e] != want) {
@@ -92,15 +92,15 @@ int main(int argc, char** argv) {
     EXPECT_TRUE(bad == 0);
   }
 
-  // Transposed load: thread tid holds column tid%8, rows (tid%4)*2..+1,
+  // Transposed load: thread tid holds column tid>>2, rows (tid%4)*2..+1,
   // stored back to the same row layout, so out[tid*2+e] == in[col][row+e]
-  // with col = tid%8, row = (tid%4)*2.
+  // with col = tid>>2, row = (tid%4)*2.
   {
     float out[64] = {0};
     EXPECT_TRUE(run_entry(*prog, ft, out));
     int bad = 0;
     for (int tid = 0; tid < 32; ++tid) {
-      const int col = tid % 8, row0 = (tid % 4) * 2;
+      const int col = tid >> 2, row0 = (tid % 4) * 2;
       for (int e = 0; e < 2; ++e) {
         // in[r][c] = r*8+c; we read column `col', rows row0+e.
         const float want = (float)((row0 + e) * 8 + col);
@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
   }
 
   // x4: four matrices; EVERY thread gets a fragment of every matrix
-  // (PTX ISA 9.7.16.5.15). Thread tid holds matrix k, row tid%8, columns
+  // (PTX ISA 9.7.16.5.15). Thread tid holds matrix k, row tid>>2, columns
   // (tid%4)*2 and +1, written out at out[k*64 + tid*2 + e].
   {
     const int fx = fn_index(prog, "ldmatrix_x4");
@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
       EXPECT_TRUE(run_entry(*prog, fx, out));
       int bad = 0;
       for (int tid = 0; tid < 32; ++tid) {
-        const int row = tid % 8, col0 = (tid % 4) * 2;
+        const int row = tid >> 2, col0 = (tid % 4) * 2;
         for (int k = 0; k < 4; ++k) {
           for (int e = 0; e < 2; ++e) {
             const float want = (float)(k * 128 + 100 + row * 8 + col0 + e);
