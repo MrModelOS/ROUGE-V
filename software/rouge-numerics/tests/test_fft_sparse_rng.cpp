@@ -82,9 +82,50 @@ int main() {
       ++failures;
     }
   }
+  // --- FFT произвольных n (медленный путь) против long double-эталона ---
+  // ВНИМАНИЕ: эталон здесь — тот же прямой DFT, но в long double (другая
+  // точность и независимый подсчёт тригонометрии), плюс roundtrip.
+  for (int n : {3, 5, 6, 7, 9, 12, 100, 127}) {
+    std::vector<RougeComplex> in(n), got(n);
+    for (auto &c : in) {
+      c.re = dist(rng);
+      c.im = dist(rng);
+    }
+    EXPECT_TRUE(rouge_fft_f32(n, in.data(), got.data(), 0) == 0);
+    double md = 0.0, sc = 1.0;
+    for (int k = 0; k < n; ++k) {
+      long double re = 0, im = 0;
+      for (int j = 0; j < n; ++j) {
+        const long double a =
+            -2.0L * 3.14159265358979323846L * k * j / n;
+        re += (long double)in[j].re * std::cos(a) -
+              (long double)in[j].im * std::sin(a);
+        im += (long double)in[j].re * std::sin(a) +
+              (long double)in[j].im * std::cos(a);
+      }
+      md = std::max(md, std::fabs((double)got[k].re - (double)re));
+      md = std::max(md, std::fabs((double)got[k].im - (double)im));
+      sc = std::max(sc, (double)std::fabs((double)re));
+    }
+    if (md / sc > 1e-5) {
+      std::printf("fft slow path n=%d rel %g\n", n, md / sc);
+      ++failures;
+    }
+    std::vector<RougeComplex> back(n);
+    EXPECT_TRUE(rouge_fft_f32(n, got.data(), back.data(), 1) == 0);
+    md = 0.0;
+    for (int i = 0; i < n; ++i) {
+      md = std::max(md, std::fabs((double)back[i].re - in[i].re));
+      md = std::max(md, std::fabs((double)back[i].im - in[i].im));
+    }
+    if (md > 1e-4) {
+      std::printf("fft slow roundtrip n=%d abs %g\n", n, md);
+      ++failures;
+    }
+  }
   {
-    RougeComplex a[3] = {}, b[3] = {};
-    EXPECT_TRUE(rouge_fft_f32(3, a, b, 0) == -1);  // не степень двойки
+    RougeComplex a[4] = {}, b[4] = {};
+    EXPECT_TRUE(rouge_fft_f32(0, a, b, 0) == -1);
     EXPECT_TRUE(rouge_fft_f32(4, nullptr, b, 0) == -1);
   }
 

@@ -89,6 +89,80 @@ cudnnStatus_t cudnnConvolutionForward(
     void *workSpace, size_t workSpaceSizeInBytes, const void *beta,
     const cudnnTensorDescriptor_t yDesc, void *y);
 
+/* --- Поэлементные операции (Wave 2, только FLOAT NCHW) --- */
+
+typedef enum {
+  CUDNN_ACTIVATION_SIGMOID = 0,
+  CUDNN_ACTIVATION_RELU = 1,
+  CUDNN_ACTIVATION_TANH = 2,
+  CUDNN_ACTIVATION_CLIPPED_RELU = 3
+} cudnnActivationMode_t;
+
+typedef enum {
+  CUDNN_NOT_PROPAGATE_NAN = 0,
+  CUDNN_PROPAGATE_NAN = 1
+} cudnnNanPropagation_t;
+
+typedef struct rouge_cudnn_act *cudnnActivationDescriptor_t;
+
+cudnnStatus_t cudnnCreateActivationDescriptor(cudnnActivationDescriptor_t *d);
+cudnnStatus_t cudnnSetActivationDescriptor(cudnnActivationDescriptor_t d,
+                                           cudnnActivationMode_t mode,
+                                           cudnnNanPropagation_t reluNanOpt,
+                                           double coef);
+cudnnStatus_t cudnnDestroyActivationDescriptor(cudnnActivationDescriptor_t d);
+
+/* y = alpha*act(x) + beta*y. CLIPPED_RELU режет на [-coef, coef]... точнее на
+ * [0, coef] при coef>0 (как в cuDNN: min(max(0,x), coef)); coef<=0 -> RELU. */
+cudnnStatus_t cudnnActivationForward(cudnnHandle_t handle,
+                                     cudnnActivationDescriptor_t actDesc,
+                                     const void *alpha,
+                                     const cudnnTensorDescriptor_t xDesc,
+                                     const void *x, const void *beta,
+                                     const cudnnTensorDescriptor_t yDesc,
+                                     void *y);
+
+/* B = alpha1*A + alpha2*B; дескрипторы обязаны совпадать по dims (без
+ * broadcast — иначе NOT_SUPPORTED вместо тихого неверного счёта). */
+cudnnStatus_t cudnnAddTensor(cudnnHandle_t handle, const void *alpha1,
+                             const cudnnTensorDescriptor_t aDesc, const void *A,
+                             const void *alpha2,
+                             const cudnnTensorDescriptor_t bDesc, void *B);
+
+typedef enum {
+  CUDNN_SOFTMAX_FAST = 0,
+  CUDNN_SOFTMAX_ACCURATE = 1,
+  CUDNN_SOFTMAX_LOG = 2
+} cudnnSoftmaxAlgorithm_t;
+
+typedef enum {
+  CUDNN_SOFTMAX_MODE_INSTANCE = 0,
+  CUDNN_SOFTMAX_MODE_CHANNEL = 1
+} cudnnSoftmaxMode_t;
+
+/* y = alpha*softmax(x) + beta*y. INSTANCE: по C*H*W на каждый n; CHANNEL: по C
+ * на каждый (n,h,w). LOG возвращает log-softmax. */
+cudnnStatus_t cudnnSoftmaxForward(
+    cudnnHandle_t handle, cudnnSoftmaxAlgorithm_t algo,
+    cudnnSoftmaxMode_t mode, const void *alpha,
+    const cudnnTensorDescriptor_t xDesc, const void *x, const void *beta,
+    const cudnnTensorDescriptor_t yDesc, void *y);
+
+typedef enum {
+  CUDNN_BATCHNORM_SPATIAL = 0,
+  CUDNN_BATCHNORM_PER_ACTIVATION = 1
+} cudnnBatchNormMode_t;
+
+/* Inference BatchNorm NCHW: y = alpha*((x-mean)/sqrt(var+eps)*scale+bias)+beta*y.
+ * bnScaleBiasMeanVarDesc — 1×C×1×1 FLOAT-дескриптор четырёх векторов. */
+cudnnStatus_t cudnnBatchNormalizationForwardInference(
+    cudnnHandle_t handle, cudnnBatchNormMode_t mode, const void *alpha,
+    const void *beta, const cudnnTensorDescriptor_t xDesc, const void *x,
+    const cudnnTensorDescriptor_t yDesc, void *y,
+    const cudnnTensorDescriptor_t bnScaleBiasMeanVarDesc, const void *scale,
+    const void *bias, const void *estimatedMean, const void *estimatedVariance,
+    double epsilon);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

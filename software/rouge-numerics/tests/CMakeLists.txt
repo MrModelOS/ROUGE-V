@@ -24,6 +24,22 @@ target_link_libraries(test_gemm_f16 PRIVATE rouge-numerics)
 target_compile_options(test_gemm_f16 PRIVATE -Wall -Wextra)
 add_test(NAME gemm_f16 COMMAND test_gemm_f16)
 
+add_executable(test_gemm_f64 test_gemm_f64.cpp)
+target_link_libraries(test_gemm_f64 PRIVATE rouge-numerics)
+target_compile_options(test_gemm_f64 PRIVATE -Wall -Wextra)
+add_test(NAME gemm_f64 COMMAND test_gemm_f64)
+# FP64 идёт тем же ISA-диспетчером — проверить все три пути, как для f32.
+foreach(isa base avx2 avx512)
+  add_test(NAME gemm_f64_isa_${isa} COMMAND test_gemm_f64)
+  set_tests_properties(gemm_f64_isa_${isa} PROPERTIES
+    ENVIRONMENT "ROUGE_NUMERICS_ISA=${isa}")
+endforeach()
+
+add_executable(test_complex test_complex.cpp)
+target_link_libraries(test_complex PRIVATE rouge-numerics)
+target_compile_options(test_complex PRIVATE -Wall -Wextra)
+add_test(NAME complex COMMAND test_complex)
+
 add_executable(test_conv test_conv.cpp)
 target_link_libraries(test_conv PRIVATE rouge-numerics)
 target_compile_options(test_conv PRIVATE -Wall -Wextra)
@@ -33,6 +49,11 @@ add_executable(test_winograd test_winograd.cpp)
 target_link_libraries(test_winograd PRIVATE rouge-numerics)
 target_compile_options(test_winograd PRIVATE -Wall -Wextra)
 add_test(NAME winograd COMMAND test_winograd)
+
+add_executable(test_implicit test_implicit.cpp)
+target_link_libraries(test_implicit PRIVATE rouge-numerics)
+target_compile_options(test_implicit PRIVATE -Wall -Wextra)
+add_test(NAME implicit COMMAND test_implicit)
 
 add_executable(test_attention test_attention.cpp)
 target_link_libraries(test_attention PRIVATE rouge-numerics)

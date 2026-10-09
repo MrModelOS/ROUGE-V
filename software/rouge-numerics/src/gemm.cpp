@@ -78,10 +78,75 @@
 #undef ROUGE_KERNEL_NAME
 #endif
 
+// ---------------------------------------------------------------------------
+// FP64: тот же блочный алгоритм для double. Векторные регистры вдвое уже по
+// элементам, поэтому NR вдвое меньше; диспетчер ISA и нормализация конфига
+// ниже — общие с f32 (один и тот же процессор — один и тот же вариант).
+// ---------------------------------------------------------------------------
+
+#define ROUGE_KERNEL_NAME dbase
+#define ROUGE_KERNEL_TARGET
+#define ROUGE_KERNEL_MR 4
+#define ROUGE_KERNEL_NR 4
+#define ROUGE_KERNEL_ELEM double
+#define ROUGE_KERNEL_CALL GemmCall64
+#define ROUGE_KERNEL_PACK_A pack_a64
+#define ROUGE_KERNEL_PACK_B pack_b64
+#include "gemm_kernel.inc"
+#undef ROUGE_KERNEL_TARGET
+#undef ROUGE_KERNEL_MR
+#undef ROUGE_KERNEL_NR
+#undef ROUGE_KERNEL_NAME
+#undef ROUGE_KERNEL_ELEM
+#undef ROUGE_KERNEL_CALL
+#undef ROUGE_KERNEL_PACK_A
+#undef ROUGE_KERNEL_PACK_B
+
+#if ROUGE_HAVE_AVX2
+#define ROUGE_KERNEL_NAME davx2
+#define ROUGE_KERNEL_TARGET __attribute__((target("avx2,fma")))
+#define ROUGE_KERNEL_MR 4
+#define ROUGE_KERNEL_NR 8
+#define ROUGE_KERNEL_ELEM double
+#define ROUGE_KERNEL_CALL GemmCall64
+#define ROUGE_KERNEL_PACK_A pack_a64
+#define ROUGE_KERNEL_PACK_B pack_b64
+#include "gemm_kernel.inc"
+#undef ROUGE_KERNEL_TARGET
+#undef ROUGE_KERNEL_MR
+#undef ROUGE_KERNEL_NR
+#undef ROUGE_KERNEL_NAME
+#undef ROUGE_KERNEL_ELEM
+#undef ROUGE_KERNEL_CALL
+#undef ROUGE_KERNEL_PACK_A
+#undef ROUGE_KERNEL_PACK_B
+#endif
+
+#if ROUGE_HAVE_AVX512
+#define ROUGE_KERNEL_NAME davx512
+#define ROUGE_KERNEL_TARGET __attribute__((target("avx512f,fma")))
+#define ROUGE_KERNEL_MR 4
+#define ROUGE_KERNEL_NR 16
+#define ROUGE_KERNEL_ELEM double
+#define ROUGE_KERNEL_CALL GemmCall64
+#define ROUGE_KERNEL_PACK_A pack_a64
+#define ROUGE_KERNEL_PACK_B pack_b64
+#include "gemm_kernel.inc"
+#undef ROUGE_KERNEL_TARGET
+#undef ROUGE_KERNEL_MR
+#undef ROUGE_KERNEL_NR
+#undef ROUGE_KERNEL_NAME
+#undef ROUGE_KERNEL_ELEM
+#undef ROUGE_KERNEL_CALL
+#undef ROUGE_KERNEL_PACK_A
+#undef ROUGE_KERNEL_PACK_B
+#endif
+
 namespace {
 
 using rouge_numerics_detail::AlignedBuffer;
 using rouge_numerics_detail::GemmCall;
+using rouge_numerics_detail::GemmCall64;
 
 /* Верхняя граница плитки: ограничивает рабочие буферы (2*(tm*tk + tk*tn)
  * float'ов на поток) и не даёт конфигу из внешнего кода съесть память. */
@@ -161,6 +226,24 @@ void run_kernel(const GemmCall &call) {
 #endif
   default:
     run_base(call);
+    return;
+  }
+}
+
+void run_kernel64(const GemmCall64 &call) {
+  switch (isa_variant()) {
+#if ROUGE_HAVE_AVX512
+  case kIsaAvx512:
+    run_davx512(call);
+    return;
+#endif
+#if ROUGE_HAVE_AVX2
+  case kIsaAvx2:
+    run_davx2(call);
+    return;
+#endif
+  default:
+    run_dbase(call);
     return;
   }
 }
@@ -308,6 +391,94 @@ const char *rouge_gemm_isa_variant(void) {
   default:
     return "base+sse2";
   }
+}
+
+/* FP64 GEMM (Wave 2): C[M][N] = A[M][K] * B[K][N] в double, тем же блочным
+ * алгоритмом (упаковка, двойная буферизация, split_k). Конфиг общий с f32. */
+void rouge_gemm_f64(int M, int N, int K, const double *A, const double *B, double *C,
+                    const RougeGemmConfig *cfg_in) {
+  if (M <= 0 || N <= 0 || K <= 0 || !A || !B || !C)
+    return;
+
+  const RougeGemmConfig cfg = normalize(cfg_in ? *cfg_in : rouge_gemm_default_config());
+  const std::size_t out = static_cast<std::size_t>(M) * static_cast<std::size_t>(N);
+  const int chunks = std::max(1, std::min(cfg.split_k, K));
+
+  std::vector<int> edges(static_cast<std::size_t>(chunks) + 1);
+  for (int i = 0; i <= chunks; ++i) {
+    edges[static_cast<std::size_t>(i)] = static_cast<int>(static_cast<long long>(K) * i / chunks);
+  }
+
+  if (chunks == 1) {
+    AlignedBuffer<double> pa(2 * static_cast<std::size_t>(cfg.tile_m) * cfg.tile_k);
+    AlignedBuffer<double> pb(2 * static_cast<std::size_t>(cfg.tile_k) * cfg.tile_n);
+    GemmCall64 call;
+    call.m = M;
+    call.n = N;
+    call.k = K;
+    call.a = A;
+    call.b = B;
+    call.c = C;
+    call.tile_m = cfg.tile_m;
+    call.tile_n = cfg.tile_n;
+    call.tile_k = cfg.tile_k;
+    call.unroll = cfg.unroll;
+    call.k_begin = 0;
+    call.k_end = K;
+    call.acc = C;
+    call.pack_a[0] = pa.data();
+    call.pack_a[1] = pa.data() + static_cast<std::size_t>(cfg.tile_m) * cfg.tile_k;
+    call.pack_b[0] = pb.data();
+    call.pack_b[1] = pb.data() + static_cast<std::size_t>(cfg.tile_k) * cfg.tile_n;
+    rouge_numerics_detail::zero64(C, out);
+    run_kernel64(call);
+    return;
+  }
+
+  AlignedBuffer<double> parts(static_cast<std::size_t>(chunks) * out);
+  const std::size_t pa_doubles = 2 * static_cast<std::size_t>(cfg.tile_m) * cfg.tile_k;
+  const std::size_t pb_doubles = 2 * static_cast<std::size_t>(cfg.tile_k) * cfg.tile_n;
+  AlignedBuffer<double> packs(static_cast<std::size_t>(chunks) * (pa_doubles + pb_doubles));
+
+  auto worker = [&](int chunk) {
+    double *acc = parts.data() + static_cast<std::size_t>(chunk) * out;
+    rouge_numerics_detail::zero64(acc, out);
+    GemmCall64 call;
+    call.m = M;
+    call.n = N;
+    call.k = K;
+    call.a = A;
+    call.b = B;
+    call.c = C;
+    call.tile_m = cfg.tile_m;
+    call.tile_n = cfg.tile_n;
+    call.tile_k = cfg.tile_k;
+    call.unroll = cfg.unroll;
+    call.k_begin = edges[static_cast<std::size_t>(chunk)];
+    call.k_end = edges[static_cast<std::size_t>(chunk) + 1];
+    call.acc = acc;
+    double *base = packs.data() + static_cast<std::size_t>(chunk) * (pa_doubles + pb_doubles);
+    call.pack_a[0] = base;
+    call.pack_a[1] = base + static_cast<std::size_t>(cfg.tile_m) * cfg.tile_k;
+    call.pack_b[0] = base + pa_doubles;
+    call.pack_b[1] = base + pa_doubles + static_cast<std::size_t>(cfg.tile_k) * cfg.tile_n;
+    run_kernel64(call);
+  };
+
+  std::vector<std::thread> pool;
+  pool.reserve(static_cast<std::size_t>(chunks - 1));
+  for (int i = 1; i < chunks; ++i)
+    pool.emplace_back(worker, i);
+  worker(0);
+  for (std::thread &t : pool)
+    t.join();
+
+  double *sum = parts.data();
+  for (int i = 1; i < chunks; ++i) {
+    rouge_numerics_detail::add_into64(sum, sum, parts.data() + static_cast<std::size_t>(i) * out,
+                                      out);
+  }
+  std::copy(sum, sum + out, C);
 }
 
 } // extern "C"

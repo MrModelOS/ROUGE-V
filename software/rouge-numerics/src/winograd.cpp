@@ -153,9 +153,9 @@ int rouge_conv_winograd3x3_f32(int N, int Cin, int H, int W, int Cout,
   return 0;
 }
 
-// Автотюнер свёртки: im2col против Winograd (когда применим). Замер на
+// Автотюнер свёртки: im2col / Winograd (когда применим) / implicit. Замер на
 // настоящих данных, кэша нет, в Y — результат победителя. Возвращает профиль:
-// method 0=im2col, 1=winograd, иначе -1 при некорректных размерах.
+// method 0=im2col, 1=winograd, 2=implicit, иначе -1 при некорректных размерах.
 RougeConvProfile rouge_conv_tuned(int N, int Cin, int H, int W, int Cout,
                                   int KH, int KW, int stride, int pad,
                                   const float *X, const float *Wt,
@@ -175,35 +175,46 @@ RougeConvProfile rouge_conv_tuned(int N, int Cin, int H, int W, int Cout,
   const bool can_wino =
       (KH == 3 && KW == 3 && stride == 1 && pad == 1 && N >= 1);
 
-  auto timed = [&](int method) {
-    auto t0 = std::chrono::steady_clock::now();
+  auto run = [&](int method, float *dst) {
     if (method == 1)
-      rouge_conv_winograd3x3_f32(N, Cin, H, W, Cout, X, Wt, bias,
-                                 method == 1 ? alt.data() : Y);
+      rouge_conv_winograd3x3_f32(N, Cin, H, W, Cout, X, Wt, bias, dst);
+    else if (method == 2)
+      rouge_conv_implicit_f32(N, Cin, H, W, Cout, KH, KW, stride, pad, X, Wt,
+                              bias, dst, nullptr);
     else
       rouge_conv2d_f32(N, Cin, H, W, Cout, KH, KW, stride, pad, X, Wt, bias,
-                       method == 0 ? Y : alt.data(), nullptr);
-    auto t1 = std::chrono::steady_clock::now();
-    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+                       dst, nullptr);
   };
-  // Разогрев вне замера.
-  rouge_conv2d_f32(N, Cin, H, W, Cout, KH, KW, stride, pad, X, Wt, bias, Y,
-                   nullptr);
-  double t_im2col = timed(0);
-  // Второй прогон im2col — минимум из двух (шум планировщика).
-  double t2 = timed(0);
-  if (t2 < t_im2col) t_im2col = t2;
+  auto timed = [&](int method, float *dst) {
+    run(method, dst);  // разогрев этого метода вне замера
+    double best = 1e300;
+    for (int i = 0; i < 2; ++i) {
+      auto t0 = std::chrono::steady_clock::now();
+      run(method, dst);
+      auto t1 = std::chrono::steady_clock::now();
+      best = std::min(best, std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    return best;
+  };
+  double t_im2col = timed(0, Y);
   p.method = 0;
   p.millis = t_im2col;
+  double best = t_im2col;
   if (can_wino) {
-    rouge_conv_winograd3x3_f32(N, Cin, H, W, Cout, X, Wt, bias, alt.data());
-    double t_w = timed(1);
-    double t_w2 = timed(1);
-    if (t_w2 < t_w) t_w = t_w2;
-    if (t_w < t_im2col) {
+    const double t_w = timed(1, alt.data());
+    if (t_w < best) {
       std::memcpy(Y, alt.data(), out_n * sizeof(float));
       p.method = 1;
       p.millis = t_w;
+      best = t_w;
+    }
+  }
+  {
+    const double t_i = timed(2, alt.data());
+    if (t_i < best) {
+      std::memcpy(Y, alt.data(), out_n * sizeof(float));
+      p.method = 2;
+      p.millis = t_i;
     }
   }
   return p;

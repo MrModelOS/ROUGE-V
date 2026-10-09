@@ -54,6 +54,12 @@ typedef struct RougeGemmProfile {
 void rouge_gemm_f32(int M, int N, int K, const float *A, const float *B, float *C,
                     const RougeGemmConfig *cfg);
 
+/* FP64 GEMM (Wave 2): C[M][N] = A[M][K] * B[K][N] в double — тем же блочным
+ * алгоритмом (упаковка, двойная буферизация, split_k, те же ISA-варианты).
+ * Конфиг общий с f32. M/N/K <= 0 или NULL -> ничего не делать. */
+void rouge_gemm_f64(int M, int N, int K, const double *A, const double *B,
+                    double *C, const RougeGemmConfig *cfg);
+
 /* FP8 GEMM (Wave 2): C[M][N] f32 = A[M][K] e4m3 * B[K][N] e4m3, накопление
  * в f32. Формат входов — OCP OFP8 E4M3 (bias 7, max 448): те же таблицы,
  * что в PTX-интерпретаторе и в mma.lowering (e4m3-входы mma). Реализация:
@@ -79,19 +85,28 @@ int rouge_conv_winograd3x3_f32(int N, int Cin, int H, int W, int Cout,
                                const float *X, const float *Wt,
                                const float *bias, float *Y);
 
-/* Профиль автотюнера свёртки: method 0=im2col, 1=winograd, -1=ошибка;
- * millis — wall-clock победителя на этих данных (в Y его результат). */
+/* Профиль автотюнера свёртки: method 0=im2col, 1=winograd, 2=implicit,
+ * -1=ошибка; millis — wall-clock победителя на этих данных (в Y его результат). */
 typedef struct RougeConvProfile {
   int method;
   double millis;
 } RougeConvProfile;
 
-/* Автотюнер свёртки: замер im2col против Winograd (когда применим 3x3 s1p1),
- * без кэша; в Y — результат победителя. */
+/* Автотюнер свёртки: замер im2col / Winograd (когда применим 3x3 s1p1) /
+ * implicit, без кэша; в Y — результат победителя. */
 RougeConvProfile rouge_conv_tuned(int N, int Cin, int H, int W, int Cout,
                                   int KH, int KW, int stride, int pad,
                                   const float *X, const float *Wt,
                                   const float *bias, float *Y);
+
+/* Implicit-GEMM свёртка (Wave 2): тот же счёт, что im2col+GEMM, но col-буфер
+ * не материализуется — тайл выхода накапливается прямо из X. tile_m/tile_n
+ * из cfg задают тайлы по Cout/пространству (clamp 1..64/256, иначе 8/128).
+ * Некорректные размеры или NULL -> ничего не делать. */
+void rouge_conv_implicit_f32(int N, int Cin, int H, int W, int Cout, int KH,
+                             int KW, int stride, int pad, const float *X,
+                             const float *Wt, const float *bias, float *Y,
+                             const RougeGemmConfig *cfg);
 
 /* Attention (Wave 2): O[S][D] = softmax(Q[s]·K/scale)·V, блочный проход по
  * K/V (Bt=64) с онлайн-пересчётом max/sum — полная S×Skv не материализуется.
@@ -107,9 +122,26 @@ typedef struct RougeComplex {
   float im;
 } RougeComplex;
 
-/* FFT (Wave 2): свой radix-2 Cooley-Tukey. inverse=0 — forward без нормировки,
- * inverse!=0 — inverse с делением на N. Только степени двойки.
- * Успех -> 0; иначе -1 без записи. */
+/* Комплексное double: re/im подряд (layout-совместимо с cuDoubleComplex). */
+typedef struct RougeComplexD {
+  double re;
+  double im;
+} RougeComplexD;
+
+/* Комплексный GEMM (Wave 2): C = A*B поэлементно-комплексно, через 4 вещественных
+ * GEMM своего ядра (Cre = Are*Bre - Aim*Bim, Cim = Are*Bim + Aim*Bre).
+ * M/N/K <= 0 или NULL -> ничего не делать. */
+void rouge_gemm_c32(int M, int N, int K, const RougeComplex *A,
+                    const RougeComplex *B, RougeComplex *C,
+                    const RougeGemmConfig *cfg);
+void rouge_gemm_z64(int M, int N, int K, const RougeComplexD *A,
+                    const RougeComplexD *B, RougeComplexD *C,
+                    const RougeGemmConfig *cfg);
+
+/* FFT (Wave 2): свой radix-2 Cooley-Tukey для степеней двойки; остальные
+ * n >= 1 — прямым O(N^2) DFT тем же определением (медленно, но корректно).
+ * inverse=0 — forward без нормировки, inverse!=0 — inverse с делением на N.
+ * Успех -> 0; n <= 0 или NULL -> -1 без записи. */
 int rouge_fft_f32(int n, const RougeComplex *in, RougeComplex *out,
                   int inverse);
 

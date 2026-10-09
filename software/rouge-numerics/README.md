@@ -1,9 +1,10 @@
 # rouge-numerics — своя открытая математика вместо cuBLAS
 
-**Что это.** Своя открытая математика ROUGE-V (Волна 2 роадмапа): блочный
-FP32 CPU-GEMM с автотюнером, GEMM на половинных/FP8 входах, свёртка
-(im2col+GEMM, Winograd F(2x2,3x3), автотюнер метода), блочный attention с
-онлайн-softmax, свой radix-2 FFT, CSR SpMV, детерминированный RNG и шимы
+**Что это.** Своя открытая математика ROUGE-V (Волна 2 роадмапа): блочные
+FP32/FP64 CPU-GEMM с автотюнером, GEMM на половинных/FP8/комплексных входах,
+свёртка (im2col+GEMM, implicit без col-буфера, Winograd F(2x2,3x3), автотюнер
+метода), блочный attention с онлайн-softmax, свой FFT (быстрый radix-2 +
+прямой путь для произвольных n), CSR SpMV, детерминированный RNG и шимы
 cuBLAS/cuDNN поверх своего кода. Реализация целиком своя: ни cuBLAS, ни BLAS,
 ни Eigen, ни FFTW внутри — только стандартная библиотека C++17 и
 target-атрибуты компилятора. Задача — снять зависимость от проприетарной
@@ -17,11 +18,11 @@ target-атрибуты компилятора. Задача — снять за
   только к ней.
 - Это **не трансцендентная функция**: GEMM, свёртка, attention, FFT, sparse,
   RNG — и всё.
-- Это **не fp64**: только float32 накопление (входы — f32/f16/bf16/e4m3).
-- Шимы покрывают **только f32-подмножество** (`cublasSgemm`, conv-forward
-  NCHW); остальное отсутствует намеренно — громкая ошибка линковки вместо
-  тихого вранья.
-- FFT — только степени двойки, иначе громкий `-1`.
+- Шимы покрывают **BLAS L3 (S/D/C/Z, strided-batched) и базу cuDNN
+  (conv-forward, активации, AddTensor, Softmax, BatchNorm-inference)**;
+  остального (LT, Xt, RNN, CT C, обучение) нет намеренно — громкая ошибка
+  линковки вместо тихого вранья.
+- FFT не-степеней двойки — прямым O(N²) путём (медленно, корректно).
 
 ## Сборка и тесты
 
@@ -42,11 +43,14 @@ ROUGE-V, в дереве лежит свой проект.
 | `gemm_isa_base` / `gemm_isa_avx2` / `gemm_isa_avx512` | Те же конфиги, но для **каждого** собранного варианта ISA — процессор умеет не всё, без этого проверялся бы ровно один путь |
 | `gemm_fp8` | Квантование e4m3 (точечные векторы + roundtrip всех 256 значений), точный GEMM на целых 1..8 бит-в-бит, дробные данные 2% против шкалы |
 | `gemm_f16` | Точечные значения f16/bf16 (1.0, −0, Inf, NaN), roundtrip целых 1..32, GEMM обоих форматов против f32-эталона (допуск 1e-2 — ошибка квантования входов) |
+| `gemm_f64` (+ `gemm_f64_isa_*`) | FP64: каждый кандидат на размерах с краями против наивного эталона в long double (допуск 1e-12), split_k, ISA-матрица как для f32 |
+| `complex` | c32/z64 против эталона в long double (допуски 1e-6/1e-14) |
 | `conv` | Свёртка NCHW: ручной случай 3x3 (−6) плюс 6 случайных конфигураций (stride/pad/bias, неквадратные ядра) против независимого прямого эталона |
+| `implicit` | Implicit-свёртка (без col-буфера) на 6 конфигурациях против im2col (допуск 1e-5) + тюнер трёх методов везде возвращает 0/1/2 с верным результатом |
 | `winograd` | Winograd F(2x2,3x3): ручной случай (единичное ядро — выход равен входу) + 5 случайных конфигураций (чёт/нечет, bias) против im2col, допуск 1e-4; плюс автотюнер метода |
 | `attention` | Блочный attention против наивного двухпроходного эталона в double: обычный, causal, causal+сдвиг, Skv=130 (пересчёт m/l через границу блока), допуск 1e-5 |
-| `fft_sparse_rng` | FFT n=1..256 против наивного DFT + roundtrip + отказ на n=3; SpMV на случайной разреженности против плотного эталона бит-в-бит + проверки границ; RNG: детерминизм, uniform в [0,1), normal mean/var на 100k |
-| `shims` | `cublasSgemm` все 4 комбинации N/T против эталона в double (column-major, alpha/beta) + отказы; `cudnnConvolutionForward` оба алгоритма против `rouge_conv2d_f32` + отказы (HALF, dilation) |
+| `fft_sparse_rng` | FFT n=1..256 против наивного DFT + roundtrip; произвольные n=3..127 против long double-эталона + roundtrip; SpMV на случайной разреженности против плотного эталона бит-в-бит + проверки границ; RNG: детерминизм, uniform в [0,1), normal mean/var на 100k |
+| `shims` | `cublasSgemm` все 4 комбинации N/T против эталона в double; `Dgemm` N/N+T/T; `Cgemm` с сопряжением и `Zgemm` против long double; strided-batched S/D; `cudnnConvolutionForward` оба алгоритма; AddTensor/активации/Softmax/BatchNorm против прямых формул + отказы |
 | `bench_blas` | Замер нашего GEMM против системного BLAS и наивной петли (корректность обязательна, скорость — отчёт); см. «Замеры» ниже |
 
 Проверенные размеры, в том числе не кратные плитке: `1x1x1`, `3x5x7`, `17x33x65`,
@@ -69,6 +73,18 @@ typedef struct RougeGemmProfile { RougeGemmConfig cfg; double gflops; long long 
 /* Обычный блочный GEMM: C[M][N] = A[M][K] * B[K][N] (row-major), с FMA. */
 void rouge_gemm_f32(int M, int N, int K, const float* A, const float* B, float* C,
                     const RougeGemmConfig* cfg);   /* cfg == NULL -> по умолчанию */
+
+/* FP64 GEMM тем же блочным алгоритмом (те же ISA-варианты, NR вдвое уже). */
+void rouge_gemm_f64(int M, int N, int K, const double* A, const double* B,
+                    double* C, const RougeGemmConfig* cfg);
+
+/* Комплексный GEMM через 4 вещественных (Cre = Are*Bre − Aim*Bim, ...). */
+void rouge_gemm_c32(int M, int N, int K, const RougeComplex* A,
+                    const RougeComplex* B, RougeComplex* C,
+                    const RougeGemmConfig* cfg);
+void rouge_gemm_z64(int M, int N, int K, const RougeComplexD* A,
+                    const RougeComplexD* B, RougeComplexD* C,
+                    const RougeGemmConfig* cfg);
 
 RougeGemmConfig rouge_gemm_default_config(void);
 int      rouge_gemm_candidate_count(void);
@@ -96,14 +112,21 @@ void rouge_conv2d_f32(int N, int Cin, int H, int W, int Cout, int KH, int KW,
                       const float* bias, float* Y,
                       const RougeGemmConfig* cfg);
 
+/* Implicit-свёртка: тот же счёт без col-буфера (память O(tc*ts)).
+ * tile_m/tile_n из cfg — тайлы по Cout/пространству, иначе 8/128. */
+void rouge_conv_implicit_f32(int N, int Cin, int H, int W, int Cout, int KH,
+                             int KW, int stride, int pad, const float* X,
+                             const float* Wt, const float* bias, float* Y,
+                             const RougeGemmConfig* cfg);
+
 /* Winograd F(2x2,3x3) для 3x3 stride 1 pad 1. Успех -> 0, иначе -1. */
 int rouge_conv_winograd3x3_f32(int N, int Cin, int H, int W, int Cout,
                                const float* X, const float* Wt,
                                const float* bias, float* Y);
 
 typedef struct RougeConvProfile { int method; double millis; } RougeConvProfile;
-/* Автотюнер свёртки: замер im2col против Winograd; в Y результат победителя.
- * method: 0=im2col, 1=winograd, -1=ошибка. */
+/* Автотюнер свёртки: замер im2col/Winograd/implicit; в Y результат победителя.
+ * method: 0=im2col, 1=winograd, 2=implicit, -1=ошибка. */
 RougeConvProfile rouge_conv_tuned(int N, int Cin, int H, int W, int Cout,
                                   int KH, int KW, int stride, int pad,
                                   const float* X, const float* Wt,
@@ -139,10 +162,11 @@ float rouge_rng_normal_f32(RougeRng* rng);    /* N(0,1), Box-Muller */
 #include <rouge/cublas_shim.h>
 cublasCreate_v2(&h);
 cublasSgemm_v2(h, CUBLAS_OP_N, CUBLAS_OP_T, m, n, k, &alpha, A, lda,
-               B, ldb, &beta, C, ldc);   /* column-major, только f32 */
+               B, ldb, &beta, C, ldc);   /* column-major; S/D/C/Z + batched S/D */
 
 #include <rouge/cudnn_shim.h>
-cudnnCreate(&h); /* + дескрипторы NCHW/FLOAT + cudnnConvolutionForward */
+cudnnCreate(&h); /* дескрипторы NCHW/FLOAT: conv-forward, активации, AddTensor,
+                    Softmax, BatchNorm-inference */
 ```
 
 ## Замеры (i5-1135G7, путь `avx512+fma`, минимум из 5 прогонов wall-clock)
@@ -150,21 +174,32 @@ cudnnCreate(&h); /* + дескрипторы NCHW/FLOAT + cudnnConvolutionForwar
 `bench_blas`, кэш-резидентные размеры (это важно: матрицы влезают в кэш,
 поэтому цифры — не пик железа и не заявление про большие панели):
 
-| Размер | rouge_gemm_f32 | системный cblas_sgemm | наивная петля |
+| Размер | rouge | системный cblas | наивная петля |
 | --- | --- | --- | --- |
-| 64×64×64 | ~85 GFLOP/s | ~3.5 GFLOP/s | ~2.3 GFLOP/s |
-| 128×128×128 | ~88 GFLOP/s | ~4.3 GFLOP/s | ~2.2 GFLOP/s |
-| 256×192×128 | ~93 GFLOP/s | ~4.7 GFLOP/s | ~2.3 GFLOP/s |
+| f32 64×64×64 | ~84 GFLOP/s | ~3.5 GFLOP/s | ~2.3 GFLOP/s |
+| f32 128×128×128 | ~87 GFLOP/s | ~3.8 GFLOP/s | ~2.0 GFLOP/s |
+| f32 256×192×128 | ~56–93 GFLOP/s | ~4.3 GFLOP/s | ~1.9 GFLOP/s |
+| f64 128×128×128 | ~47 GFLOP/s | ~4.3 GFLOP/s | ~3.2 GFLOP/s |
 
 Честные оговорки: системный BLAS здесь — эталонный reference BLAS
 (`libcblas`, не OpenBLAS; его никто не настраивал), поэтому разрыв в 20× —
 это «мы против ненастроенного эталона», а не «мы против OpenBLAS».
 Сравнение с OpenBLAS/oneDNN/FFTW не проводилось (зависимостей нет, цифры без
-замера не пишем). Свёртка 2×16×32×32→32ch 3×3 s1p1: im2col 0.47 мс против
-Winograd 0.66 мс — Winograd корректен (отн. погрешность 2e-7), но на этом CPU
-проигрывает нашему же AVX512-GEMM: поточечный цикл скалярный, а микроядро
-GEMM векторизовано. Автотюнер `rouge_conv_tuned` для того и нужен — он
-выбирает победителя замером, а не верой.
+замера не пишем).
+
+Свёртка 3×3 s1p1 (N=2, 32×32; два размера каналов):
+
+| Случай | im2col | Winograd | implicit | выбор тюнера |
+| --- | --- | --- | --- | --- |
+| 16→16 | 0.33 мс | 0.36 мс (отн. 2e-7) | 3.47 мс (отн. 4e-7) | im2col |
+| 32→32 | 0.91 мс | 1.21 мс (отн. 3e-7) | 13.68 мс (отн. 7e-7) | im2col |
+
+Всё корректно (<1e-6 друг к другу), но на этом CPU побеждает im2col+AVX512-GEMM:
+поточечные циклы Winograd/implicit скалярные, а микроядро GEMM векторизовано.
+Implicit при этом не держит col-буфер (память O(tc·ts) против O(K·Ncol) —
+на больших картах это разница между «влезло» и «нет»), так что это размен
+«память против скорости», а не проигрыш. Автотюнер `rouge_conv_tuned` для
+того и нужен — он выбирает победителя замером, а не верой.
 
 Значения полей конфига <= 0 берутся из конфига по умолчанию, поэтому
 `{0,0,0,0,0}` — корректный запрос «по умолчанию». Плитки ограничены сверху
@@ -196,6 +231,13 @@ GEMM векторизовано. Автотюнер `rouge_conv_tuned` для т
    границы известны только в рантайме, полосы в регистрах не удержать.
 5. **`split_k`.** K делится на части, каждая считается своим `std::thread` в
    свой накопитель `[M][N]`, в конце части складываются в `C`.
+
+**FP64 тем же файлом.** `gemm_kernel.inc` параметризован макросами
+`ROUGE_KERNEL_ELEM/CALL/PACK_A/PACK_B` (по умолчанию float): `gemm.cpp`
+включает его ещё три раза для double (`dbase`/`davx2`/`davx512`, NR вдвое
+уже — регистры те же, элементы шире). Диспетчер ISA и нормализация конфига
+общие с f32. Комплексные GEMM (`src/complex_gemm.cpp`) отдельного микроядра
+не имеют — четыре вещественных GEMM своего ядра.
 
 **Варианты ISA.** Один и тот же `.inc` включается три раза — как `base+sse2`
 (без целевых флагов, работает везде), `avx2+fma` и `avx512+fma` (через

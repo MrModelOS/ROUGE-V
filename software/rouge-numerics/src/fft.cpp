@@ -1,23 +1,52 @@
 /*
  * FFT Wave 2: свой radix-2 Cooley-Tukey, complex interleaved (re,im подряд
  * в RougeComplex). Написан с нуля по общеизвестному алгоритму:
- * бит-реверсная перестановка + итеративные бабочки с таблицей корней.
+ * бит-реверсная перестановка + итеративные бабочки.
  *
  * Соглашения: forward (inverse=0) — exp(-2πi/N), без нормировки;
- * inverse (!=0) — exp(+2πi/N) с делением на N. n<=0 или не степень двойки
- * или NULL -> возврат -1 без записи; успех -> 0.
+ * inverse (!=0) — exp(+2πi/N) с делением на N.
+ * n — любой >= 1: степени двойки идут быстрым путём O(N log N), остальные —
+ * прямым O(N²) DFT тем же определением (медленно, но корректно; для
+ * простых/неудобных размеров честный медленный путь вместо отказа).
+ * n <= 0 или NULL -> возврат -1 без записи; успех -> 0.
  */
 
 #include "rouge/numerics.h"
 
 #include <cmath>
 
+namespace {
+
+int is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }
+
+// Прямой DFT тем же определением (медленный путь для не-степеней двойки).
+void direct_dft(int n, const RougeComplex *in, RougeComplex *out, int inverse) {
+  const double sgn = inverse ? 1.0 : -1.0;
+  const double norm = inverse ? 1.0 / n : 1.0;
+  for (int k = 0; k < n; ++k) {
+    double re = 0.0, im = 0.0;
+    for (int j = 0; j < n; ++j) {
+      const double a = sgn * 2.0 * 3.14159265358979323846 * k * j / n;
+      const double c = std::cos(a), s = std::sin(a);
+      re += in[j].re * c - in[j].im * s;
+      im += in[j].re * s + in[j].im * c;
+    }
+    out[k].re = (float)(re * norm);
+    out[k].im = (float)(im * norm);
+  }
+}
+
+}  // namespace
+
 extern "C" {
 
 int rouge_fft_f32(int n, const RougeComplex *in, RougeComplex *out,
                   int inverse) {
   if (!in || !out || n <= 0) return -1;
-  if ((n & (n - 1)) != 0) return -1;  // только степени двойки, честно
+  if (!is_pow2(n)) {
+    direct_dft(n, in, out, inverse);
+    return 0;
+  }
   for (int i = 0; i < n; ++i) out[i] = in[i];
   // Бит-реверс.
   for (int i = 1, j = 0; i < n; ++i) {

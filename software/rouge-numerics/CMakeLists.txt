@@ -28,10 +28,12 @@ add_library(rouge-numerics STATIC
   src/fp8.cpp
   src/fp16.cpp
   src/conv.cpp
+  src/conv_implicit.cpp
   src/winograd.cpp
   src/attention.cpp
   src/fft.cpp
   src/sparse_random.cpp
+  src/complex_gemm.cpp
 )
 target_include_directories(rouge-numerics PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include

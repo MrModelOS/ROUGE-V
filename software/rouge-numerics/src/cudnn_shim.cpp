@@ -9,7 +9,9 @@
 
 #include "rouge/cudnn_shim.h"
 
+#include <cmath>
 #include <cstring>
+#include <new>
 #include <vector>
 
 #include "rouge/numerics.h"
@@ -30,6 +32,26 @@ struct rouge_cudnn_filter {
 struct rouge_cudnn_conv {
   int pad_h, pad_w, stride_h, stride_w;
 };
+struct rouge_cudnn_act {
+  cudnnActivationMode_t mode;
+  double coef;
+};
+
+namespace {
+
+// Проверка: FLOAT + NCHW + одинаковые dims. Возвращает число элементов.
+bool check_tensor2(const rouge_cudnn_tensor *a, const rouge_cudnn_tensor *b,
+                   size_t &elems) {
+  if (!a || !b) return false;
+  if (a->type != CUDNN_DATA_FLOAT || b->type != CUDNN_DATA_FLOAT) return false;
+  if (a->format != CUDNN_TENSOR_NCHW || b->format != CUDNN_TENSOR_NCHW)
+    return false;
+  if (a->n != b->n || a->c != b->c || a->h != b->h || a->w != b->w) return false;
+  elems = (size_t)a->n * a->c * a->h * a->w;
+  return true;
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -76,7 +98,7 @@ cudnnStatus_t cudnnDestroy(cudnnHandle_t h) {
   return CUDNN_STATUS_SUCCESS;
 }
 
-size_t cudnnGetVersion(void) { return 200; }  // своя версия шима 0.2.0
+  size_t cudnnGetVersion(void) { return 300; }  // своя версия шима 0.3.0
 
 cudnnStatus_t cudnnCreateTensorDescriptor(cudnnTensorDescriptor_t *d) {
   if (!d) return CUDNN_STATUS_BAD_PARAM;
@@ -226,6 +248,181 @@ cudnnStatus_t cudnnConvolutionForward(
   }
   float *Y = (float *)y;
   for (size_t i = 0, n = tmp.size(); i < n; ++i) Y[i] = al * tmp[i] + be * Y[i];
+  return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnCreateActivationDescriptor(cudnnActivationDescriptor_t *d) {
+  if (!d) return CUDNN_STATUS_BAD_PARAM;
+  auto *a = new (std::nothrow)
+      rouge_cudnn_act{CUDNN_ACTIVATION_RELU, 0.0};
+  if (!a) return CUDNN_STATUS_ALLOC_FAILED;
+  *d = a;
+  return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnSetActivationDescriptor(cudnnActivationDescriptor_t d,
+                                           cudnnActivationMode_t mode,
+                                           cudnnNanPropagation_t, double coef) {
+  if (!d) return CUDNN_STATUS_BAD_PARAM;
+  if (mode != CUDNN_ACTIVATION_SIGMOID && mode != CUDNN_ACTIVATION_RELU &&
+      mode != CUDNN_ACTIVATION_TANH && mode != CUDNN_ACTIVATION_CLIPPED_RELU)
+    return CUDNN_STATUS_NOT_SUPPORTED;
+  d->mode = mode;
+  d->coef = coef;
+  return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnDestroyActivationDescriptor(cudnnActivationDescriptor_t d) {
+  if (!d) return CUDNN_STATUS_BAD_PARAM;
+  delete d;
+  return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnActivationForward(cudnnHandle_t handle,
+                                     cudnnActivationDescriptor_t act,
+                                     const void *alpha,
+                                     const cudnnTensorDescriptor_t xD,
+                                     const void *x, const void *beta,
+                                     const cudnnTensorDescriptor_t yD,
+                                     void *y) {
+  if (!handle) return CUDNN_STATUS_NOT_INITIALIZED;
+  if (!act || !alpha || !xD || !x || !beta || !yD || !y)
+    return CUDNN_STATUS_BAD_PARAM;
+  size_t n = 0;
+  if (!check_tensor2(xD, yD, n)) return CUDNN_STATUS_NOT_SUPPORTED;
+  const float al = *(const float *)alpha, be = *(const float *)beta;
+  const float *X = (const float *)x;
+  float *Y = (float *)y;
+  for (size_t i = 0; i < n; ++i) {
+    const float v = X[i];
+    float a = 0.0f;
+    switch (act->mode) {
+      case CUDNN_ACTIVATION_RELU:
+        a = v > 0.0f ? v : 0.0f;
+        break;
+      case CUDNN_ACTIVATION_CLIPPED_RELU: {
+        const float c = (float)act->coef;
+        a = v < 0.0f ? 0.0f : (act->coef > 0.0 && v > c ? c : v);
+        break;
+      }
+      case CUDNN_ACTIVATION_SIGMOID:
+        a = 1.0f / (1.0f + std::exp(-v));
+        break;
+      case CUDNN_ACTIVATION_TANH:
+        a = std::tanh(v);
+        break;
+    }
+    Y[i] = al * a + be * Y[i];
+  }
+  return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnAddTensor(cudnnHandle_t handle, const void *alpha1,
+                             const cudnnTensorDescriptor_t aD, const void *A,
+                             const void *alpha2,
+                             const cudnnTensorDescriptor_t bD, void *B) {
+  if (!handle) return CUDNN_STATUS_NOT_INITIALIZED;
+  if (!alpha1 || !aD || !A || !alpha2 || !bD || !B)
+    return CUDNN_STATUS_BAD_PARAM;
+  size_t n = 0;
+  if (!check_tensor2(aD, bD, n)) return CUDNN_STATUS_NOT_SUPPORTED;
+  const float a1 = *(const float *)alpha1, a2 = *(const float *)alpha2;
+  const float *X = (const float *)A;
+  float *Y = (float *)B;
+  for (size_t i = 0; i < n; ++i) Y[i] = a1 * X[i] + a2 * Y[i];
+  return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnSoftmaxForward(
+    cudnnHandle_t handle, cudnnSoftmaxAlgorithm_t algo,
+    cudnnSoftmaxMode_t mode, const void *alpha,
+    const cudnnTensorDescriptor_t xD, const void *x, const void *beta,
+    const cudnnTensorDescriptor_t yD, void *y) {
+  if (!handle) return CUDNN_STATUS_NOT_INITIALIZED;
+  if (!alpha || !xD || !x || !beta || !yD || !y)
+    return CUDNN_STATUS_BAD_PARAM;
+  if (algo != CUDNN_SOFTMAX_FAST && algo != CUDNN_SOFTMAX_ACCURATE &&
+      algo != CUDNN_SOFTMAX_LOG)
+    return CUDNN_STATUS_NOT_SUPPORTED;
+  if (mode != CUDNN_SOFTMAX_MODE_INSTANCE &&
+      mode != CUDNN_SOFTMAX_MODE_CHANNEL)
+    return CUDNN_STATUS_NOT_SUPPORTED;
+  size_t n = 0;
+  if (!check_tensor2(xD, yD, n)) return CUDNN_STATUS_NOT_SUPPORTED;
+  const float al = *(const float *)alpha, be = *(const float *)beta;
+  const float *X = (const float *)x;
+  float *Y = (float *)y;
+  const int N = xD->n, C = xD->c, HW = xD->h * xD->w;
+  const bool is_log = (algo == CUDNN_SOFTMAX_LOG);
+  // Численно устойчивый двухпроходной softmax в double-накопителе.
+  auto run_row = [&](const float *xr, float *yr, int len) {
+    double mx = xr[0];
+    for (int i = 1; i < len; ++i) mx = std::max(mx, (double)xr[i]);
+    double sum = 0.0;
+    for (int i = 0; i < len; ++i) sum += std::exp((double)xr[i] - mx);
+    const double lsum = std::log(sum);
+    for (int i = 0; i < len; ++i) {
+      const double v =
+          is_log ? ((double)xr[i] - mx - lsum) : (std::exp((double)xr[i] - mx) / sum);
+      yr[i] = (float)(al * v + be * yr[i]);
+    }
+  };
+  if (mode == CUDNN_SOFTMAX_MODE_INSTANCE) {
+    const int len = C * HW;
+    for (int e = 0; e < N; ++e)
+      run_row(X + (size_t)e * len, Y + (size_t)e * len, len);
+  } else {
+    std::vector<float> row(C), out(C);
+    for (int e = 0; e < N; ++e)
+      for (int hw = 0; hw < HW; ++hw) {
+        for (int c = 0; c < C; ++c)
+          row[c] = X[((size_t)e * C + c) * HW + hw];
+        // собрать текущие Y для beta (не подряд в памяти)
+        for (int c = 0; c < C; ++c)
+          out[c] = Y[((size_t)e * C + c) * HW + hw];
+        run_row(row.data(), out.data(), C);
+        for (int c = 0; c < C; ++c)
+          Y[((size_t)e * C + c) * HW + hw] = out[c];
+      }
+  }
+  return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t cudnnBatchNormalizationForwardInference(
+    cudnnHandle_t handle, cudnnBatchNormMode_t mode, const void *alpha,
+    const void *beta, const cudnnTensorDescriptor_t xD, const void *x,
+    const cudnnTensorDescriptor_t yD, void *y,
+    const cudnnTensorDescriptor_t bnD, const void *scale, const void *bias,
+    const void *estMean, const void *estVar, double epsilon) {
+  if (!handle) return CUDNN_STATUS_NOT_INITIALIZED;
+  if (!alpha || !beta || !xD || !x || !yD || !y || !bnD || !scale || !bias ||
+      !estMean || !estVar)
+    return CUDNN_STATUS_BAD_PARAM;
+  if (mode != CUDNN_BATCHNORM_SPATIAL &&
+      mode != CUDNN_BATCHNORM_PER_ACTIVATION)
+    return CUDNN_STATUS_NOT_SUPPORTED;
+  size_t n = 0;
+  if (!check_tensor2(xD, yD, n)) return CUDNN_STATUS_NOT_SUPPORTED;
+  // bn-дескриптор: 1×C×1×1 FLOAT.
+  if (bnD->type != CUDNN_DATA_FLOAT || bnD->n != 1 || bnD->c != xD->c ||
+      bnD->h != 1 || bnD->w != 1)
+    return CUDNN_STATUS_BAD_PARAM;
+  if (!(epsilon >= 0.0)) return CUDNN_STATUS_BAD_PARAM;
+  const float al = *(const float *)alpha, be = *(const float *)beta;
+  const float *X = (const float *)x;
+  float *Y = (float *)y;
+  const float *S = (const float *)scale, *B = (const float *)bias;
+  const float *M = (const float *)estMean, *V = (const float *)estVar;
+  const int N = xD->n, C = xD->c, HW = xD->h * xD->w;
+  for (int e = 0; e < N; ++e)
+    for (int c = 0; c < C; ++c) {
+      const double inv = 1.0 / std::sqrt((double)V[c] + epsilon);
+      const double s = S[c] * inv, b = B[c] - S[c] * M[c] * inv;
+      for (int hw = 0; hw < HW; ++hw) {
+        const size_t i = ((size_t)e * C + c) * HW + hw;
+        Y[i] = (float)(al * (s * X[i] + b) + be * Y[i]);
+      }
+    }
   return CUDNN_STATUS_SUCCESS;
 }
 

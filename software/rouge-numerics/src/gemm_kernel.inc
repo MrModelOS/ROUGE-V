@@ -40,14 +40,30 @@
 /* Точка входа варианта: разводит конфиг по шаблонам времени компиляции. */
 #define ROUGE_RUN ROUGE_CAT(run_, ROUGE_KERNEL_NAME)
 
+/* Тип элемента и окружение вызова. По умолчанию float/GemmCall (gemm.cpp ничего
+ * не меняет); gemm_f64-варианты включают файл с ROUGE_KERNEL_ELEM=double,
+ * ROUGE_KERNEL_CALL=GemmCall64 и своими упаковщиками. */
+#ifndef ROUGE_KERNEL_ELEM
+#define ROUGE_KERNEL_ELEM float
+#endif
+#ifndef ROUGE_KERNEL_CALL
+#define ROUGE_KERNEL_CALL GemmCall
+#endif
+#ifndef ROUGE_KERNEL_PACK_A
+#define ROUGE_KERNEL_PACK_A pack_a
+#endif
+#ifndef ROUGE_KERNEL_PACK_B
+#define ROUGE_KERNEL_PACK_B pack_b
+#endif
+
 namespace rouge_numerics_detail {
 
 /* Микроядро полного блока MR x NR: все индексы известны на этапе компиляции,
  * поэтому полосы C живут в регистрах. */
 template <int MR, int NR, int UNROLL>
-ROUGE_KERNEL_TARGET static void ROUGE_MICRO(const float *a, int lda, const float *b, int ldb,
-                                            float *c, int ldc, int kc) {
-  float acc[MR][NR];
+ROUGE_KERNEL_TARGET static void ROUGE_MICRO(const ROUGE_KERNEL_ELEM *a, int lda, const ROUGE_KERNEL_ELEM *b, int ldb,
+                                            ROUGE_KERNEL_ELEM *c, int ldc, int kc) {
+  ROUGE_KERNEL_ELEM acc[MR][NR];
   for (int r = 0; r < MR; ++r)
     for (int j = 0; j < NR; ++j)
       acc[r][j] = 0.0f;
@@ -57,9 +73,9 @@ ROUGE_KERNEL_TARGET static void ROUGE_MICRO(const float *a, int lda, const float
   for (int k = 0; k < kc;) {
     const int kend = (UNROLL <= kc - k) ? k + UNROLL : kc;
     for (int kk = k; kk < kend; ++kk) {
-      const float *b_row = b + static_cast<std::size_t>(kk) * ldb;
+      const ROUGE_KERNEL_ELEM *b_row = b + static_cast<std::size_t>(kk) * ldb;
       for (int r = 0; r < MR; ++r) {
-        const float av = a[static_cast<std::size_t>(r) * lda + kk];
+        const ROUGE_KERNEL_ELEM av = a[static_cast<std::size_t>(r) * lda + kk];
         for (int j = 0; j < NR; ++j)
           acc[r][j] += av * b_row[j];
       }
@@ -68,7 +84,7 @@ ROUGE_KERNEL_TARGET static void ROUGE_MICRO(const float *a, int lda, const float
   }
 
   for (int r = 0; r < MR; ++r) {
-    float *c_row = c + static_cast<std::size_t>(r) * ldc;
+    ROUGE_KERNEL_ELEM *c_row = c + static_cast<std::size_t>(r) * ldc;
     for (int j = 0; j < NR; ++j)
       c_row[j] += acc[r][j];
   }
@@ -78,24 +94,24 @@ ROUGE_KERNEL_TARGET static void ROUGE_MICRO(const float *a, int lda, const float
  * держим в небольшом локальном буфере, а не в регистрах. Вызывающий гарантирует
  * mr <= MR и nr <= NR (край — это то, что не поместилось в полный блок). */
 template <int UNROLL>
-ROUGE_KERNEL_TARGET static void ROUGE_EDGE(const float *a, int lda, const float *b, int ldb,
-                                           float *c, int ldc, int mr, int nr, int kc) {
-  float tmp[ROUGE_KERNEL_NR];
+ROUGE_KERNEL_TARGET static void ROUGE_EDGE(const ROUGE_KERNEL_ELEM *a, int lda, const ROUGE_KERNEL_ELEM *b, int ldb,
+                                           ROUGE_KERNEL_ELEM *c, int ldc, int mr, int nr, int kc) {
+  ROUGE_KERNEL_ELEM tmp[ROUGE_KERNEL_NR];
   for (int r = 0; r < mr; ++r) {
     for (int j = 0; j < nr; ++j)
       tmp[j] = 0.0f;
-    const float *a_row = a + static_cast<std::size_t>(r) * lda;
+    const ROUGE_KERNEL_ELEM *a_row = a + static_cast<std::size_t>(r) * lda;
     for (int k = 0; k < kc;) {
       const int kend = (UNROLL <= kc - k) ? k + UNROLL : kc;
       for (int kk = k; kk < kend; ++kk) {
-        const float av = a_row[kk];
-        const float *b_row = b + static_cast<std::size_t>(kk) * ldb;
+        const ROUGE_KERNEL_ELEM av = a_row[kk];
+        const ROUGE_KERNEL_ELEM *b_row = b + static_cast<std::size_t>(kk) * ldb;
         for (int j = 0; j < nr; ++j)
           tmp[j] += av * b_row[j];
       }
       k = kend;
     }
-    float *c_row = c + static_cast<std::size_t>(r) * ldc;
+    ROUGE_KERNEL_ELEM *c_row = c + static_cast<std::size_t>(r) * ldc;
     for (int j = 0; j < nr; ++j)
       c_row[j] += tmp[j];
   }
@@ -104,15 +120,15 @@ ROUGE_KERNEL_TARGET static void ROUGE_EDGE(const float *a, int lda, const float 
 /* Плитка (mrows x ncols) одной k-панели: идём микро-панельками по N шириной NR
  * (крайняя может быть уже), внутри — блоки по M высотой MR. */
 template <int MR, int NR, int UNROLL>
-ROUGE_KERNEL_TARGET static void ROUGE_PANEL(const float *ap, int klen, int mrows, int ncols,
-                                            const float *bp, float *c, int ldc) {
+ROUGE_KERNEL_TARGET static void ROUGE_PANEL(const ROUGE_KERNEL_ELEM *ap, int klen, int mrows, int ncols,
+                                            const ROUGE_KERNEL_ELEM *bp, ROUGE_KERNEL_ELEM *c, int ldc) {
   for (int j = 0; j < ncols; j += NR) {
     const int nr = (ncols - j < NR) ? (ncols - j) : NR;
-    const float *b_ptr = bp + j;
+    const ROUGE_KERNEL_ELEM *b_ptr = bp + j;
     int i = 0;
     for (; i + MR <= mrows; i += MR) {
-      const float *a_ptr = ap + static_cast<std::size_t>(i) * klen;
-      float *c_ptr = c + static_cast<std::size_t>(i) * ldc + j;
+      const ROUGE_KERNEL_ELEM *a_ptr = ap + static_cast<std::size_t>(i) * klen;
+      ROUGE_KERNEL_ELEM *c_ptr = c + static_cast<std::size_t>(i) * ldc + j;
       if (nr == NR) {
         ROUGE_MICRO<MR, NR, UNROLL>(a_ptr, klen, b_ptr, ncols, c_ptr, ldc, klen);
       } else {
@@ -121,8 +137,8 @@ ROUGE_KERNEL_TARGET static void ROUGE_PANEL(const float *ap, int klen, int mrows
     }
     if (i < mrows) {
       // Хвост по M: строк меньше MR, поэтому полосы в регистрах не удержать.
-      const float *a_ptr = ap + static_cast<std::size_t>(i) * klen;
-      float *c_ptr = c + static_cast<std::size_t>(i) * ldc + j;
+      const ROUGE_KERNEL_ELEM *a_ptr = ap + static_cast<std::size_t>(i) * klen;
+      ROUGE_KERNEL_ELEM *c_ptr = c + static_cast<std::size_t>(i) * ldc + j;
       ROUGE_EDGE<UNROLL>(a_ptr, klen, b_ptr, ncols, c_ptr, ldc, mrows - i, nr, klen);
     }
   }
@@ -130,32 +146,32 @@ ROUGE_KERNEL_TARGET static void ROUGE_PANEL(const float *ap, int klen, int mrows
 
 /* Упаковка панелей A и B для строк [m0, m0+mrows), столбцов [n0, n0+ncols)
  * и k-панели [k0, k0+klen). Шаги в источниках: A — K, B — N. */
-ROUGE_KERNEL_TARGET static void ROUGE_PACK_PANEL(const GemmCall &call, int m0, int mrows, int n0,
-                                                 int ncols, int k0, int klen, float *ap,
-                                                 float *bp) {
-  pack_a(call.a + static_cast<std::size_t>(m0) * call.k + k0, call.k, mrows, klen, ap);
-  pack_b(call.b + static_cast<std::size_t>(k0) * call.n + n0, call.n, klen, ncols, bp);
+ROUGE_KERNEL_TARGET static void ROUGE_PACK_PANEL(const ROUGE_KERNEL_CALL &call, int m0, int mrows, int n0,
+                                                 int ncols, int k0, int klen, ROUGE_KERNEL_ELEM *ap,
+                                                 ROUGE_KERNEL_ELEM *bp) {
+  ROUGE_KERNEL_PACK_A(call.a + static_cast<std::size_t>(m0) * call.k + k0, call.k, mrows, klen, ap);
+  ROUGE_KERNEL_PACK_B(call.b + static_cast<std::size_t>(k0) * call.n + n0, call.n, klen, ncols, bp);
 }
 
 #if defined(__GNUC__) || defined(__clang__)
 /* Подсказка загрузке для начала следующей упакованной панели.
  * __builtin_prefetch не требует ни intrinsics, ни target-атрибута. */
-ROUGE_KERNEL_TARGET static void ROUGE_PREFETCH(const float *p, int lines, int stride) {
+ROUGE_KERNEL_TARGET static void ROUGE_PREFETCH(const ROUGE_KERNEL_ELEM *p, int lines, int stride) {
   for (int i = 0; i < lines; ++i) {
     __builtin_prefetch(p + static_cast<std::size_t>(i) * stride, 0, 1);
   }
 }
 #else
-ROUGE_KERNEL_TARGET static void ROUGE_PREFETCH(const float * /*p*/, int /*lines*/, int /*stride*/) {
+ROUGE_KERNEL_TARGET static void ROUGE_PREFETCH(const ROUGE_KERNEL_ELEM * /*p*/, int /*lines*/, int /*stride*/) {
 }
 #endif
 
 /* Драйвер варианта: тайлинг по M/N плюс двойная буферизация по K.
  * Складывает A*B в накопитель call.acc, который обнулил вызывающий. */
 template <int MR, int NR, int UNROLL>
-ROUGE_KERNEL_TARGET static void ROUGE_BLOCKED(const GemmCall &call) {
+ROUGE_KERNEL_TARGET static void ROUGE_BLOCKED(const ROUGE_KERNEL_CALL &call) {
   const int tm = call.tile_m, tn = call.tile_n, tk = call.tile_k;
-  float *const acc = call.acc;
+  ROUGE_KERNEL_ELEM *const acc = call.acc;
   if (call.k_begin >= call.k_end)
     return;
 
@@ -163,10 +179,10 @@ ROUGE_KERNEL_TARGET static void ROUGE_BLOCKED(const GemmCall &call) {
     const int mrows = (call.m - m0 < tm) ? (call.m - m0) : tm;
     for (int n0 = 0; n0 < call.n; n0 += tn) {
       const int ncols = (call.n - n0 < tn) ? (call.n - n0) : tn;
-      float *c_ptr = acc + static_cast<std::size_t>(m0) * call.n + n0;
+      ROUGE_KERNEL_ELEM *c_ptr = acc + static_cast<std::size_t>(m0) * call.n + n0;
 
-      float *ap[2] = {call.pack_a[0], call.pack_a[1]};
-      float *bp[2] = {call.pack_b[0], call.pack_b[1]};
+      ROUGE_KERNEL_ELEM *ap[2] = {call.pack_a[0], call.pack_a[1]};
+      ROUGE_KERNEL_ELEM *bp[2] = {call.pack_b[0], call.pack_b[1]};
       int cur = 0;
       int k0 = call.k_begin;
       int klen = (call.k_end - k0 < tk) ? (call.k_end - k0) : tk;
@@ -198,7 +214,7 @@ ROUGE_KERNEL_TARGET static void ROUGE_BLOCKED(const GemmCall &call) {
 
 /* Точка входа варианта: разводит поле unroll по шаблонам времени компиляции,
  * чтобы разворот цикла по K был настоящим, а не «как получится». */
-ROUGE_KERNEL_TARGET static void ROUGE_RUN(const rouge_numerics_detail::GemmCall &call) {
+ROUGE_KERNEL_TARGET static void ROUGE_RUN(const rouge_numerics_detail::ROUGE_KERNEL_CALL &call) {
   switch (call.unroll) {
   case 1:
     rouge_numerics_detail::ROUGE_BLOCKED<ROUGE_KERNEL_MR, ROUGE_KERNEL_NR, 1>(call);
@@ -219,3 +235,7 @@ ROUGE_KERNEL_TARGET static void ROUGE_RUN(const rouge_numerics_detail::GemmCall 
 #undef ROUGE_BLOCKED
 #undef ROUGE_PREFETCH
 #undef ROUGE_RUN
+#undef ROUGE_KERNEL_ELEM
+#undef ROUGE_KERNEL_CALL
+#undef ROUGE_KERNEL_PACK_A
+#undef ROUGE_KERNEL_PACK_B

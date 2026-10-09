@@ -33,16 +33,48 @@ typedef enum {
 
 typedef struct rouge_cublas_ctx *cublasHandle_t;
 
+typedef struct { float x, y; } cuComplex;          /* layout == RougeComplex */
+typedef struct { double x, y; } cuDoubleComplex;   /* layout == RougeComplexD */
+
 const char *cublasGetStatusString(cublasStatus_t status);
 cublasStatus_t cublasCreate_v2(cublasHandle_t *handle);
 cublasStatus_t cublasDestroy_v2(cublasHandle_t handle);
 cublasStatus_t cublasGetVersion_v2(cublasHandle_t handle, int *version);
-/* Column-major C = alpha*op(A)*op(B) + beta, только f32. */
+/* Column-major C = alpha*op(A)*op(B) + beta. Суффиксы: S=f32, D=f64,
+ * C=complex32, Z=complex64. Для C/Z транспонирование C = сопряжённое. */
 cublasStatus_t cublasSgemm_v2(cublasHandle_t handle, cublasOperation_t transa,
                               cublasOperation_t transb, int m, int n, int k,
                               const float *alpha, const float *A, int lda,
                               const float *B, int ldb, const float *beta,
                               float *C, int ldc);
+cublasStatus_t cublasDgemm_v2(cublasHandle_t handle, cublasOperation_t transa,
+                              cublasOperation_t transb, int m, int n, int k,
+                              const double *alpha, const double *A, int lda,
+                              const double *B, int ldb, const double *beta,
+                              double *C, int ldc);
+cublasStatus_t cublasCgemm_v2(cublasHandle_t handle, cublasOperation_t transa,
+                              cublasOperation_t transb, int m, int n, int k,
+                              const cuComplex *alpha, const cuComplex *A,
+                              int lda, const cuComplex *B, int ldb,
+                              const cuComplex *beta, cuComplex *C, int ldc);
+cublasStatus_t cublasZgemm_v2(cublasHandle_t handle, cublasOperation_t transa,
+                              cublasOperation_t transb, int m, int n, int k,
+                              const cuDoubleComplex *alpha,
+                              const cuDoubleComplex *A, int lda,
+                              const cuDoubleComplex *B, int ldb,
+                              const cuDoubleComplex *beta, cuDoubleComplex *C,
+                              int ldc);
+/* Strided-batched: batchCount независимых GEMM с шагом strideA/B/C. */
+cublasStatus_t cublasSgemmStridedBatched(
+    cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k, const float *alpha, const float *A, int lda,
+    long long strideA, const float *B, int ldb, long long strideB,
+    const float *beta, float *C, int ldc, long long strideC, int batchCount);
+cublasStatus_t cublasDgemmStridedBatched(
+    cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
+    int m, int n, int k, const double *alpha, const double *A, int lda,
+    long long strideA, const double *B, int ldb, long long strideB,
+    const double *beta, double *C, int ldc, long long strideC, int batchCount);
 
 #ifdef __cplusplus
 } /* extern "C" */
