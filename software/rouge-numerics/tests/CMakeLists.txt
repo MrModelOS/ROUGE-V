@@ -18,3 +18,8 @@ add_executable(test_gemm_fp8 test_gemm_fp8.cpp)
 target_link_libraries(test_gemm_fp8 PRIVATE rouge-numerics)
 target_compile_options(test_gemm_fp8 PRIVATE -Wall -Wextra)
 add_test(NAME gemm_fp8 COMMAND test_gemm_fp8)
+
+add_executable(test_conv test_conv.cpp)
+target_link_libraries(test_conv PRIVATE rouge-numerics)
+target_compile_options(test_conv PRIVATE -Wall -Wextra)
+add_test(NAME conv COMMAND test_conv)

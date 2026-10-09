@@ -62,6 +62,16 @@ void rouge_gemm_f32(int M, int N, int K, const float *A, const float *B, float *
 void rouge_gemm_e4m3(int M, int N, int K, const uint8_t *A, const uint8_t *B,
                      float *C, const RougeGemmConfig *cfg);
 
+/* Свёртка 2D (Wave 2): Y[N][Cout][OH][OW] = conv(X[N][Cin][H][W],
+ * Wt[Cout][Cin][KH][KW]) + bias[Cout], всё NCHW f32. Реализация — im2col +
+ * свой блочный rouge_gemm_f32 (автотюнер shared, cfg пробрасывается).
+ * OH = (H + 2*pad - KH)/stride + 1 (целочисленно). bias может быть NULL.
+ * Некорректные размеры или NULL X/Wt/Y -> ничего не делать. */
+void rouge_conv2d_f32(int N, int Cin, int H, int W, int Cout, int KH, int KW,
+                      int stride, int pad, const float *X, const float *Wt,
+                      const float *bias, float *Y,
+                      const RougeGemmConfig *cfg);
+
 /* Квантование f32 <-> OCP E4M3 (RNE, satfinite в знаковый MAX_NORM;
  * NaN -> знаковый NaN 0x7F, Inf -> знаковый MAX 0x7E, signed zero хранится).
  * Дословная транскрипция f32_to_narrow/narrow_to_f32 интерпретатора. */

@@ -32,6 +32,8 @@ ROUGE-V, в дереве лежит свой проект.
 | --- | --- |
 | `gemm` | Каждый конфиг-кандидат на восьми размерах против наивного эталона (naive triple loop), плюс автотюнер; печатает GFLOP/s по размерам |
 | `gemm_isa_base` / `gemm_isa_avx2` / `gemm_isa_avx512` | Те же конфиги, но для **каждого** собранного варианта ISA — процессор умеет не всё, без этого проверялся бы ровно один путь |
+| `gemm_fp8` | Квантование e4m3 (точечные векторы + roundtrip всех 256 значений), точный GEMM на целых 1..8 бит-в-бит, дробные данные 2% против шкалы |
+| `conv` | Свёртка NCHW: ручной случай 3x3 (−6) плюс 6 случайных конфигураций (stride/pad/bias, неквадратные ядра) против независимого прямого эталона |
 
 Проверенные размеры, в том числе не кратные плитке: `1x1x1`, `3x5x7`, `17x33x65`,
 `128x128x128`, `200x100x50`, `64x64x128`, `129x131x127`, `256x192x128`.
@@ -66,6 +68,19 @@ double rouge_gemm_flops_per_sec(int M, int N, int K, const float* A, const float
 RougeGemmProfile rouge_gemm_tuned(int M, int N, int K, const float* A, const float* B, float* C);
 
 const char* rouge_gemm_isa_variant(void);  /* "base+sse2" | "avx2+fma" | "avx512+fma" */
+
+/* FP8 GEMM: C[M][N] f32 = A[M][K] e4m3 * B[K][N] e4m3, накопление f32.
+ * OCP OFP8 E4M3; decode в f32 + тот же блочный GEMM (автотюнер shared). */
+void rouge_gemm_e4m3(int M, int N, int K, const uint8_t* A, const uint8_t* B,
+                     float* C, const RougeGemmConfig* cfg);
+uint8_t rouge_quantize_e4m3(float f);   /* RNE, satfinite в знаковый MAX */
+float rouge_dequantize_e4m3(uint8_t u);
+
+/* Свёртка 2D NCHW f32: im2col + свой блочный GEMM. bias может быть NULL. */
+void rouge_conv2d_f32(int N, int Cin, int H, int W, int Cout, int KH, int KW,
+                      int stride, int pad, const float* X, const float* Wt,
+                      const float* bias, float* Y,
+                      const RougeGemmConfig* cfg);
 ```
 
 Значения полей конфига <= 0 берутся из конфига по умолчанию, поэтому
