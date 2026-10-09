@@ -18,10 +18,10 @@ target-атрибуты компилятора. Задача — снять за
   только к ней.
 - Это **не трансцендентная функция**: GEMM, свёртка, attention, FFT, sparse,
   RNG — и всё.
-- Шимы покрывают **BLAS L3 (S/D/C/Z, strided-batched) и базу cuDNN
-  (conv-forward, активации, AddTensor, Softmax, BatchNorm-inference)**;
-  остального (LT, Xt, RNN, CT C, обучение) нет намеренно — громкая ошибка
-  линковки вместо тихого вранья.
+- Шимы покрывают **BLAS L1/L2/L3 (S/D/C/Z, strided-batched) и рабочую базу
+  cuDNN (conv-forward/backward, активации, AddTensor, Softmax,
+  BatchNorm-inference)**; остального (LT, Xt, RNN, обучение вне conv)
+  нет намеренно — громкая ошибка линковки вместо тихого вранья.
 - FFT не-степеней двойки — прямым O(N²) путём (медленно, корректно).
 
 ## Сборка и тесты
@@ -50,8 +50,11 @@ ROUGE-V, в дереве лежит свой проект.
 | `winograd` | Winograd F(2x2,3x3): ручной случай (единичное ядро — выход равен входу) + 5 случайных конфигураций (чёт/нечет, bias) против im2col, допуск 1e-4; плюс автотюнер метода |
 | `attention` | Блочный attention против наивного двухпроходного эталона в double: обычный, causal, causal+сдвиг, Skv=130 (пересчёт m/l через границу блока), допуск 1e-5 |
 | `fft_sparse_rng` | FFT n=1..256 против наивного DFT + roundtrip; произвольные n=3..127 против long double-эталона + roundtrip; SpMV на случайной разреженности против плотного эталона бит-в-бит + проверки границ; RNG: детерминизм, uniform в [0,1), normal mean/var на 100k |
-| `shims` | `cublasSgemm` все 4 комбинации N/T против эталона в double; `Dgemm` N/N+T/T; `Cgemm` с сопряжением и `Zgemm` против long double; strided-batched S/D; `cudnnConvolutionForward` оба алгоритма; AddTensor/активации/Softmax/BatchNorm против прямых формул + отказы |
+| `bench_fftw` | Наш FFT против FFTW (single, ESTIMATE): корректность 1e-4 на n=64..4096 и 100/1000 + таблица времён; см. «Замеры» |
+| `shims` | `cublasSgemm` все 4 комбинации N/T против эталона в double; `Dgemm` N/N+T/T; `Cgemm` с сопряжением и `Zgemm` против long double; strided-batched S/D; L1/L2 (axpy/copy/swap/scal/dot(u/c)/nrm2/gemv, pointer mode); `cudnnConvolutionForward` оба алгоритма; AddTensor/активации/Softmax/BatchNorm/conv-backward против прямых формул + отказы |
 | `bench_blas` | Замер нашего GEMM против системного BLAS и наивной петли (корректность обязательна, скорость — отчёт); см. «Замеры» ниже |
+| `blas1` | L1/L2 против прямых петель + против системного cblas (axpy/dot/scal/nrm2/gemv, inc≠1, отказ на мусорном trans) |
+| `bwd` | Backward свёртки против численного градиента (центральные разности): dx и dw на 1x1x4x4/3x3, dx на stride-2+pad |
 
 Проверенные размеры, в том числе не кратные плитке: `1x1x1`, `3x5x7`, `17x33x65`,
 `128x128x128`, `200x100x50`, `64x64x128`, `129x131x127`, `256x192x128`.
@@ -132,6 +135,28 @@ RougeConvProfile rouge_conv_tuned(int N, int Cin, int H, int W, int Cout,
                                   const float* X, const float* Wt,
                                   const float* bias, float* Y);
 
+/* Backward свёртки (обучение): dx по входу, dW по весам. */
+void rouge_conv_bwd_data(int N, int Cin, int H, int W, int Cout, int KH, int KW,
+                         int stride, int pad, const float* dy, const float* Wt,
+                         float* dx);
+void rouge_conv_bwd_filter(int N, int Cin, int H, int W, int Cout, int KH,
+                           int KW, int stride, int pad, const float* X,
+                           const float* dy, float* dW);
+
+/* BLAS L1/L2, row-major. inc<=0/n<=0/NULL -> no-op (dot/nrm2 дают 0). */
+void rouge_saxpy(int n, float alpha, const float* x, int incx, float* y, int incy);
+void rouge_daxpy(int n, double alpha, const double* x, int incx, double* y, int incy);
+float rouge_sdot(int n, const float* x, int incx, const float* y, int incy);
+double rouge_ddot(int n, const double* x, int incx, const double* y, int incy);
+void rouge_sscal(int n, float alpha, float* x, int incx);
+void rouge_dscal(int n, double alpha, double* x, int incx);
+float rouge_snrm2(int n, const float* x, int incx);
+double rouge_dnrm2(int n, const double* x, int incx);
+void rouge_sgemv(char trans, int m, int n, float alpha, const float* A, int lda,
+                 const float* x, int incx, float beta, float* y, int incy);
+void rouge_dgemv(char trans, int m, int n, double alpha, const double* A, int lda,
+                 const double* x, int incx, double beta, double* y, int incy);
+
 /* Attention: O[S][D] = softmax(Q·K/scale)·V, блочный проход Bt=64.
  * causal маскирует t > s+kv_off; scale<=0 -> 1/sqrt(D). */
 void rouge_attention_f32(int S, int Skv, int D, const float* Q, const float* K,
@@ -139,7 +164,8 @@ void rouge_attention_f32(int S, int Skv, int D, const float* Q, const float* K,
                          int kv_off);
 
 typedef struct RougeComplex { float re, im; } RougeComplex;
-/* FFT radix-2: inverse=0 forward, иначе inverse с /N. Успех -> 0. */
+/* FFT: степени двойки — radix-2, остальные n — прямой O(N²) тем же
+ * определением. inverse=0 forward, иначе inverse с /N. Успех -> 0. */
 int rouge_fft_f32(int n, const RougeComplex* in, RougeComplex* out, int inverse);
 
 /* CSR SpMV: y = A*x. Успех -> 0, нарушение границ -> -1. */
@@ -165,11 +191,11 @@ cublasSgemm_v2(h, CUBLAS_OP_N, CUBLAS_OP_T, m, n, k, &alpha, A, lda,
                B, ldb, &beta, C, ldc);   /* column-major; S/D/C/Z + batched S/D */
 
 #include <rouge/cudnn_shim.h>
-cudnnCreate(&h); /* дескрипторы NCHW/FLOAT: conv-forward, активации, AddTensor,
-                    Softmax, BatchNorm-inference */
+cudnnCreate(&h); /* дескрипторы NCHW/FLOAT: conv-forward/backward, активации,
+                    AddTensor, Softmax, BatchNorm-inference */
 ```
 
-## Замеры (i5-1135G7, путь `avx512+fma`, минимум из 5 прогонов wall-clock)
+## Замеры (i5-1135G7, путь `avx512+fma`, минимум из 5–7 прогонов wall-clock)
 
 `bench_blas`, кэш-резидентные размеры (это важно: матрицы влезают в кэш,
 поэтому цифры — не пик железа и не заявление про большие панели):
@@ -200,6 +226,23 @@ Implicit при этом не держит col-буфер (память O(tc·ts
 на больших картах это разница между «влезло» и «нет»), так что это размен
 «память против скорости», а не проигрыш. Автотюнер `rouge_conv_tuned` для
 того и нужен — он выбирает победителя замером, а не верой.
+
+FFT против FFTW 3.7.11 (single, `FFTW_ESTIMATE`, корректность 1e-4 везде):
+
+| n | rouge | FFTW | комментарий |
+| --- | --- | --- | --- |
+| 64 | 0.001 мс | ~0.000 мс | на пределе разрешения таймера |
+| 256 | 0.003 мс | ~0.000 мс | то же |
+| 1024 | 0.016 мс | 0.001 мс | ~16×: у FFTW кодлеты+SIMD+планирование |
+| 4096 | 0.077 мс | 0.006 мс | ~13×, та же причина |
+| 100 | 0.157 мс | ~0.000 мс | наш O(N²)-путь против O(N log N) |
+| 1000 | 14.172 мс | 0.002 мс | ~7000×: медленный путь честно медленный |
+
+Вывод без прикрас: наш FFT корректен, но не конкурент FFTW по скорости —
+скалярный radix-2 против кодлетов с SIMD. Медленный путь для не-степеней
+двойки — для корректности там, где размер неудобный, а не для скорости.
+OpenBLAS/oneDNN на этой машине замерить не на чем (пакетов нет, рута для
+установки нет) — поэтому их в таблице нет и не будет до замера.
 
 Значения полей конфига <= 0 берутся из конфига по умолчанию, поэтому
 `{0,0,0,0,0}` — корректный запрос «по умолчанию». Плитки ограничены сверху

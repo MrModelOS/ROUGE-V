@@ -3,6 +3,13 @@ target_link_libraries(test_gemm PRIVATE rouge-numerics)
 target_compile_options(test_gemm PRIVATE -Wall -Wextra)
 add_test(NAME gemm COMMAND test_gemm)
 
+# Внешние эталоны — только для тестов (библиотека от них не зависит):
+# системный CBLAS (сравнение L1/L2/L3) и FFTW single (сравнение FFT).
+find_path(CBLAS_INCLUDE_DIR cblas.h)
+find_library(CBLAS_LIBRARY NAMES cblas blas)
+find_path(FFTW_INCLUDE_DIR fftw3.h)
+find_library(FFTWF_LIBRARY NAMES fftw3f)
+
 # Тот же набор конфигов, но для КАЖДОГО собранного варианта ISA: на одной
 # машине процессор умеет не всё, и без этого проверялся бы ровно один путь.
 add_executable(test_gemm_isa test_gemm_isa.cpp)
@@ -65,6 +72,31 @@ target_link_libraries(test_fft_sparse_rng PRIVATE rouge-numerics)
 target_compile_options(test_fft_sparse_rng PRIVATE -Wall -Wextra)
 add_test(NAME fft_sparse_rng COMMAND test_fft_sparse_rng)
 
+add_executable(test_blas1 test_blas1.cpp)
+target_link_libraries(test_blas1 PRIVATE rouge-numerics)
+target_compile_options(test_blas1 PRIVATE -Wall -Wextra)
+if(CBLAS_INCLUDE_DIR AND CBLAS_LIBRARY)
+  target_link_libraries(test_blas1 PRIVATE ${CBLAS_LIBRARY})
+  target_include_directories(test_blas1 PRIVATE ${CBLAS_INCLUDE_DIR})
+  target_compile_definitions(test_blas1 PRIVATE ROUGE_HAVE_CBLAS=1)
+endif()
+add_test(NAME blas1 COMMAND test_blas1)
+
+add_executable(test_bwd test_bwd.cpp)
+target_link_libraries(test_bwd PRIVATE rouge-numerics)
+target_compile_options(test_bwd PRIVATE -Wall -Wextra)
+add_test(NAME bwd COMMAND test_bwd)
+
+# FFT против FFTW — только если есть fftw3.h + libfftw3f (test-only
+# зависимость; сама библиотека от FFTW не зависит).
+if(FFTW_INCLUDE_DIR AND FFTWF_LIBRARY)
+  add_executable(bench_fft_fftw bench_fft_fftw.cpp)
+  target_link_libraries(bench_fft_fftw PRIVATE rouge-numerics ${FFTWF_LIBRARY})
+  target_include_directories(bench_fft_fftw PRIVATE ${FFTW_INCLUDE_DIR})
+  target_compile_options(bench_fft_fftw PRIVATE -Wall -Wextra)
+  add_test(NAME bench_fftw COMMAND bench_fft_fftw)
+endif()
+
 add_executable(test_shims test_shims.cpp)
 target_link_libraries(test_shims PRIVATE rouge-cublas rouge-cudnn rouge-numerics)
 target_compile_options(test_shims PRIVATE -Wall -Wextra)
@@ -73,8 +105,6 @@ add_test(NAME shims COMMAND test_shims)
 # Замер против системного BLAS (если есть cblas.h + библиотека — меряем
 # cblas_sgemm, иначе только наивный пол). Скорость — отчёт, падает тест
 # только на неверном результате.
-find_path(CBLAS_INCLUDE_DIR cblas.h)
-find_library(CBLAS_LIBRARY NAMES cblas blas)
 if(CBLAS_INCLUDE_DIR AND CBLAS_LIBRARY)
   add_executable(bench_gemm_blas bench_gemm_blas.cpp)
   target_link_libraries(bench_gemm_blas PRIVATE rouge-numerics ${CBLAS_LIBRARY})

@@ -470,7 +470,190 @@ int main() {
   }
   cudnnDestroyTensorDescriptor(tD);
   cudnnDestroyTensorDescriptor(tD2);
+
+  // --- cudnn conv backward: workspace 0 + dx/dw против прямых формул ---
+  {
+    // Маленькая конфигурация 1x1x4x4, ядро 3x3 s1p0 -> OH=OW=2.
+    cudnnTensorDescriptor_t xDb = nullptr, dyDb = nullptr, dxDb = nullptr;
+    cudnnFilterDescriptor_t wDb = nullptr, dwDb = nullptr;
+    cudnnConvolutionDescriptor_t convDb = nullptr;
+    cudnnCreateTensorDescriptor(&xDb);
+    cudnnCreateTensorDescriptor(&dyDb);
+    cudnnCreateTensorDescriptor(&dxDb);
+    cudnnCreateFilterDescriptor(&wDb);
+    cudnnCreateFilterDescriptor(&dwDb);
+    cudnnCreateConvolutionDescriptor(&convDb);
+    cudnnSetTensor4dDescriptor(xDb, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1,
+                               4, 4);
+    cudnnSetTensor4dDescriptor(dyDb, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1,
+                               2, 2);
+    cudnnSetTensor4dDescriptor(dxDb, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, 1,
+                               4, 4);
+    cudnnSetFilter4dDescriptor(wDb, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 1, 1,
+                               3, 3);
+    cudnnSetFilter4dDescriptor(dwDb, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 1, 1,
+                               3, 3);
+    cudnnSetConvolution2dDescriptor(convDb, 0, 0, 1, 1, 1, 1, 0,
+                                    CUDNN_DATA_FLOAT);
+    std::vector<float> Xb(16), Wb(9), dYb(4), dXb(16, 0.5f), dWb(9, 0.25f);
+    for (auto &v : Xb) v = dist(rng);
+    for (auto &v : Wb) v = dist(rng);
+    for (auto &v : dYb) v = dist(rng);
+    size_t ws = 999;
+    EXPECT_TRUE(cudnnGetConvolutionBackwardDataWorkspaceSize(
+                    dh, wDb, dyDb, convDb, dxDb,
+                    CUDNN_CONVOLUTION_BWD_DATA_ALGO_0, &ws) ==
+                CUDNN_STATUS_SUCCESS);
+    EXPECT_TRUE(ws == 0);
+    EXPECT_TRUE(cudnnGetConvolutionBackwardDataWorkspaceSize(
+                    dh, wDb, dyDb, convDb, dxDb,
+                    CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT, &ws) ==
+                CUDNN_STATUS_NOT_SUPPORTED);
+    const float al = 1.0f, be = 0.0f;
+    std::vector<float> refDx(16, 0), refDw(9, 0);
+    rouge_conv_bwd_data(1, 1, 4, 4, 1, 3, 3, 1, 0, dYb.data(), Wb.data(),
+                        refDx.data());
+    rouge_conv_bwd_filter(1, 1, 4, 4, 1, 3, 3, 1, 0, Xb.data(), dYb.data(),
+                          refDw.data());
+    EXPECT_TRUE(cudnnConvolutionBackwardData(
+                    dh, &al, wDb, Wb.data(), dyDb, dYb.data(), convDb,
+                    CUDNN_CONVOLUTION_BWD_DATA_ALGO_1, nullptr, 0, &be, dxDb,
+                    dXb.data()) == CUDNN_STATUS_SUCCESS);
+    EXPECT_TRUE(dXb == refDx);
+    EXPECT_TRUE(cudnnGetConvolutionBackwardFilterWorkspaceSize(
+                    dh, xDb, dyDb, convDb, dwDb,
+                    CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0, &ws) ==
+                CUDNN_STATUS_SUCCESS);
+    EXPECT_TRUE(ws == 0);
+    EXPECT_TRUE(cudnnConvolutionBackwardFilter(
+                    dh, &al, xDb, Xb.data(), dyDb, dYb.data(), convDb,
+                    CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1, nullptr, 0, &be, dwDb,
+                    dWb.data()) == CUDNN_STATUS_SUCCESS);
+    EXPECT_TRUE(dWb == refDw);
+    cudnnDestroyTensorDescriptor(xDb);
+    cudnnDestroyTensorDescriptor(dyDb);
+    cudnnDestroyTensorDescriptor(dxDb);
+    cudnnDestroyFilterDescriptor(wDb);
+    cudnnDestroyFilterDescriptor(dwDb);
+    cudnnDestroyConvolutionDescriptor(convDb);
+  }
   EXPECT_TRUE(cudnnDestroy(dh) == CUDNN_STATUS_SUCCESS);
+
+  // --- cublas L1/L2 поверх своих ядер ---
+  {
+    cublasHandle_t bh = nullptr;
+    EXPECT_TRUE(cublasCreate_v2(&bh) == CUBLAS_STATUS_SUCCESS);
+    // pointer mode: host ok, device — громкий отказ.
+    {
+      cublasPointerMode_t m = CUBLAS_POINTER_MODE_DEVICE;
+      EXPECT_TRUE(cublasGetPointerMode_v2(bh, &m) == CUBLAS_STATUS_SUCCESS);
+      EXPECT_TRUE(m == CUBLAS_POINTER_MODE_HOST);
+      EXPECT_TRUE(cublasSetPointerMode_v2(bh, CUBLAS_POINTER_MODE_HOST) ==
+                  CUBLAS_STATUS_SUCCESS);
+      EXPECT_TRUE(cublasSetPointerMode_v2(bh, CUBLAS_POINTER_MODE_DEVICE) ==
+                  CUBLAS_STATUS_NOT_SUPPORTED);
+    }
+    const int n = 64;
+    std::vector<float> x(n), y(n), ys(n);
+    std::vector<double> xd(n), yd(n);
+    for (int i = 0; i < n; ++i) {
+      x[i] = dist(rng);
+      y[i] = dist(rng);
+      ys[i] = y[i];
+      xd[i] = dist(rng);
+      yd[i] = dist(rng);
+    }
+    const float one = 1.0f, two = 2.0f, zero = 0.0f;
+    EXPECT_TRUE(cublasSaxpy_v2(bh, n, &two, x.data(), 1, y.data(), 1) ==
+                CUBLAS_STATUS_SUCCESS);
+    for (int i = 0; i < n; ++i) EXPECT_TRUE(y[i] == 2.0f * x[i] + ys[i]);
+    const double done = 1.0;
+    EXPECT_TRUE(cublasDaxpy_v2(bh, n, &done, xd.data(), 1, yd.data(), 1) ==
+                CUBLAS_STATUS_SUCCESS);
+    float dot = 0;
+    EXPECT_TRUE(cublasSdot_v2(bh, n, x.data(), 1, ys.data(), 1, &dot) ==
+                CUBLAS_STATUS_SUCCESS);
+    EXPECT_TRUE(dot == rouge_sdot(n, x.data(), 1, ys.data(), 1));
+    double ddot = 0;
+    EXPECT_TRUE(cublasDdot_v2(bh, n, xd.data(), 1, yd.data(), 1, &ddot) ==
+                CUBLAS_STATUS_SUCCESS);
+    EXPECT_TRUE(ddot == rouge_ddot(n, xd.data(), 1, yd.data(), 1));
+    float nrm = 0;
+    EXPECT_TRUE(cublasSnrm2_v2(bh, n, x.data(), 1, &nrm) ==
+                CUBLAS_STATUS_SUCCESS);
+    EXPECT_TRUE(nrm == rouge_snrm2(n, x.data(), 1));
+    EXPECT_TRUE(cublasSscal_v2(bh, n, &two, y.data(), 1) ==
+                CUBLAS_STATUS_SUCCESS);
+    EXPECT_TRUE(cublasScopy_v2(bh, n, x.data(), 1, ys.data(), 1) ==
+                CUBLAS_STATUS_SUCCESS);
+    EXPECT_TRUE(ys == x);
+    EXPECT_TRUE(cublasSswap_v2(bh, n, x.data(), 1, y.data(), 1) ==
+                CUBLAS_STATUS_SUCCESS);
+    // gemv N col-major 5x4 против прямой петли.
+    {
+      const int m = 5, k = 4;
+      std::vector<float> A(m * k), xx(k), yy(m, 0.0f);
+      for (auto &v : A) v = dist(rng);
+      for (auto &v : xx) v = dist(rng);
+      EXPECT_TRUE(cublasSgemv_v2(bh, CUBLAS_OP_N, m, k, &one, A.data(), m,
+                                 xx.data(), 1, &zero, yy.data(), 1) ==
+                  CUBLAS_STATUS_SUCCESS);
+      for (int i = 0; i < m; ++i) {
+        double s = 0;
+        for (int j = 0; j < k; ++j) s += (double)A[j * m + i] * xx[j];
+        EXPECT_TRUE(std::fabs((double)yy[i] - s) < 1e-6 * (1 + std::fabs(s)));
+      }
+      // T: A хранится k×m... точнее n×m при op m×n: A — 4x5 col-major.
+      std::vector<float> At(k * m), yy2(m, 0.0f);
+      for (auto &v : At) v = dist(rng);
+      EXPECT_TRUE(cublasSgemv_v2(bh, CUBLAS_OP_T, m, k, &one, At.data(), k,
+                                 xx.data(), 1, &zero, yy2.data(), 1) ==
+                  CUBLAS_STATUS_SUCCESS);
+      for (int i = 0; i < m; ++i) {
+        double s = 0;
+        for (int j = 0; j < k; ++j) s += (double)At[i * k + j] * xx[j];
+        // op(A)[i][j] = At_stored[j][i] = At[i*ldb+j] при ldb=k. Да.
+        EXPECT_TRUE(std::fabs((double)yy2[i] - s) < 1e-6 * (1 + std::fabs(s)));
+      }
+      // Комплексные: dotu/dotc + axpy smoke.
+      std::vector<cuComplex> cx(n), cy(n);
+      for (int i = 0; i < n; ++i) {
+        cx[i].x = dist(rng);
+        cx[i].y = dist(rng);
+        cy[i].x = dist(rng);
+        cy[i].y = dist(rng);
+      }
+      cuComplex r{};
+      EXPECT_TRUE(cublasCdotu_v2(bh, n, cx.data(), 1, cy.data(), 1, &r) ==
+                  CUBLAS_STATUS_SUCCESS);
+      {
+        double sr = 0, si = 0;
+        for (int i = 0; i < n; ++i) {
+          sr += (double)cx[i].x * cy[i].x - (double)cx[i].y * cy[i].y;
+          si += (double)cx[i].x * cy[i].y + (double)cx[i].y * cy[i].x;
+        }
+        EXPECT_TRUE(std::fabs((double)r.x - sr) < 1e-5 * (1 + std::fabs(sr)));
+        EXPECT_TRUE(std::fabs((double)r.y - si) < 1e-5 * (1 + std::fabs(si)));
+      }
+      EXPECT_TRUE(cublasCdotc_v2(bh, n, cx.data(), 1, cy.data(), 1, &r) ==
+                  CUBLAS_STATUS_SUCCESS);
+      {
+        double sr = 0, si = 0;
+        for (int i = 0; i < n; ++i) {
+          sr += (double)cx[i].x * cy[i].x + (double)cx[i].y * cy[i].y;
+          si += (double)cx[i].x * cy[i].y - (double)cx[i].y * cy[i].x;
+        }
+        // dotc: sum conj(x)*y = (xr*yr+xi*yi, xr*yi-xi*yr). Да.
+        EXPECT_TRUE(std::fabs((double)r.x - sr) < 1e-5 * (1 + std::fabs(sr)));
+        EXPECT_TRUE(std::fabs((double)r.y - si) < 1e-5 * (1 + std::fabs(si)));
+      }
+      float cn = 0;
+      EXPECT_TRUE(cublasCnrm2_v2(bh, n, cx.data(), 1, &cn) ==
+                  CUBLAS_STATUS_SUCCESS);
+      EXPECT_TRUE(cn > 0);
+    }
+    EXPECT_TRUE(cublasDestroy_v2(bh) == CUBLAS_STATUS_SUCCESS);
+  }
 
   if (failures == 0) std::printf("PASS: cublas + cudnn shims\n");
   return failures ? 1 : 0;

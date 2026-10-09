@@ -29,11 +29,13 @@ add_library(rouge-numerics STATIC
   src/fp16.cpp
   src/conv.cpp
   src/conv_implicit.cpp
+  src/conv_backward.cpp
   src/winograd.cpp
   src/attention.cpp
   src/fft.cpp
   src/sparse_random.cpp
   src/complex_gemm.cpp
+  src/blas1.cpp
 )
 target_include_directories(rouge-numerics PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -64,13 +66,13 @@ target_compile_options(rouge-numerics PRIVATE -Wall -Wextra)
 # Шимы чужих API поверх своего кода (Wave 2, подход Wine: интерфейсы по
 # открытой документации, реализация своя). Отдельные shared-библиотеки, чтобы
 # их можно было подсунуть линковщику вместо проприетарных.
-add_library(rouge-cublas SHARED src/cublas_shim.cpp)
+add_library(rouge-cublas SHARED src/cublas_shim.cpp src/cublas_blas1.cpp)
 target_include_directories(rouge-cublas PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(rouge-cublas PUBLIC rouge-numerics)
 target_compile_options(rouge-cublas PRIVATE -Wall -Wextra)
 
-add_library(rouge-cudnn SHARED src/cudnn_shim.cpp)
+add_library(rouge-cudnn SHARED src/cudnn_shim.cpp src/cudnn_conv_bwd.cpp)
 target_include_directories(rouge-cudnn PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(rouge-cudnn PUBLIC rouge-numerics)

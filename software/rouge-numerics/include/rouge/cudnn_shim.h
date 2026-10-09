@@ -163,6 +163,47 @@ cudnnStatus_t cudnnBatchNormalizationForwardInference(
     const void *bias, const void *estimatedMean, const void *estimatedVariance,
     double epsilon);
 
+/* --- Backward свёртки (Wave 2): обучение через свои градиенты ---
+ * Перечислены только принимаемые алгоритмы + FFT (отклоняется кодом);
+ * отсутствующих в заголовке алгоритмов здесь нет намеренно. */
+typedef enum {
+  CUDNN_CONVOLUTION_BWD_DATA_ALGO_0 = 0,
+  CUDNN_CONVOLUTION_BWD_DATA_ALGO_1 = 1,
+  CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT = 2,
+  CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD = 4
+} cudnnConvolutionBwdDataAlgo_t;
+
+typedef enum {
+  CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0 = 0,
+  CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1 = 1,
+  CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT = 2
+} cudnnConvolutionBwdFilterAlgo_t;
+
+cudnnStatus_t cudnnGetConvolutionBackwardDataWorkspaceSize(
+    cudnnHandle_t handle, const cudnnFilterDescriptor_t wDesc,
+    const cudnnTensorDescriptor_t dyDesc,
+    const cudnnConvolutionDescriptor_t convDesc,
+    const cudnnTensorDescriptor_t dxDesc, cudnnConvolutionBwdDataAlgo_t algo,
+    size_t *sizeInBytes);
+cudnnStatus_t cudnnConvolutionBackwardData(
+    cudnnHandle_t handle, const void *alpha, const cudnnFilterDescriptor_t wD,
+    const void *w, const cudnnTensorDescriptor_t dyD, const void *dy,
+    const cudnnConvolutionDescriptor_t conv, cudnnConvolutionBwdDataAlgo_t algo,
+    void *workSpace, size_t workSpaceSizeInBytes, const void *beta,
+    const cudnnTensorDescriptor_t dxD, void *dx);
+cudnnStatus_t cudnnGetConvolutionBackwardFilterWorkspaceSize(
+    cudnnHandle_t handle, const cudnnTensorDescriptor_t xDesc,
+    const cudnnTensorDescriptor_t dyDesc,
+    const cudnnConvolutionDescriptor_t convDesc,
+    const cudnnFilterDescriptor_t dwDesc, cudnnConvolutionBwdFilterAlgo_t algo,
+    size_t *sizeInBytes);
+cudnnStatus_t cudnnConvolutionBackwardFilter(
+    cudnnHandle_t handle, const void *alpha, const cudnnTensorDescriptor_t xD,
+    const void *x, const cudnnTensorDescriptor_t dyD, const void *dy,
+    const cudnnConvolutionDescriptor_t conv, cudnnConvolutionBwdFilterAlgo_t algo,
+    void *workSpace, size_t workSpaceSizeInBytes, const void *beta,
+    const cudnnFilterDescriptor_t dwD, void *dw);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

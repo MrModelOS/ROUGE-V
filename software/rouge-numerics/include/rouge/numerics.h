@@ -108,6 +108,16 @@ void rouge_conv_implicit_f32(int N, int Cin, int H, int W, int Cout, int KH,
                              const float *Wt, const float *bias, float *Y,
                              const RougeGemmConfig *cfg);
 
+/* Backward свёртки (Wave 2, для обучения): градиенты цепным правилом по
+ * определению forward. dx — по входу (транспонированная), dW — по весам.
+ * Некорректные размеры или NULL -> ничего не делать. */
+void rouge_conv_bwd_data(int N, int Cin, int H, int W, int Cout, int KH, int KW,
+                         int stride, int pad, const float *dy, const float *Wt,
+                         float *dx);
+void rouge_conv_bwd_filter(int N, int Cin, int H, int W, int Cout, int KH,
+                           int KW, int stride, int pad, const float *X,
+                           const float *dy, float *dW);
+
 /* Attention (Wave 2): O[S][D] = softmax(Q[s]·K/scale)·V, блочный проход по
  * K/V (Bt=64) с онлайн-пересчётом max/sum — полная S×Skv не материализуется.
  * causal!=0 маскирует t > s+kv_off; scale<=0 -> 1/sqrt(D).
@@ -115,6 +125,25 @@ void rouge_conv_implicit_f32(int N, int Cin, int H, int W, int Cout, int KH,
 void rouge_attention_f32(int S, int Skv, int D, const float *Q, const float *K,
                          const float *V, float *O, float scale, int causal,
                          int kv_off);
+
+/* BLAS L1/L2 (Wave 2): свои axpy/dot/scal/nrm2/gemv, row-major.
+ * inc <= 0, n <= 0 или NULL -> ничего не делать (dot/nrm2 возвращают 0).
+ * trans для gemv: 'N'/'T' (регистр не важен), иначе ничего не делать. */
+void rouge_saxpy(int n, float alpha, const float *x, int incx, float *y,
+                 int incy);
+void rouge_daxpy(int n, double alpha, const double *x, int incx, double *y,
+                 int incy);
+float rouge_sdot(int n, const float *x, int incx, const float *y, int incy);
+double rouge_ddot(int n, const double *x, int incx, const double *y, int incy);
+void rouge_sscal(int n, float alpha, float *x, int incx);
+void rouge_dscal(int n, double alpha, double *x, int incx);
+float rouge_snrm2(int n, const float *x, int incx);
+double rouge_dnrm2(int n, const double *x, int incx);
+void rouge_sgemv(char trans, int m, int n, float alpha, const float *A, int lda,
+                 const float *x, int incx, float beta, float *y, int incy);
+void rouge_dgemv(char trans, int m, int n, double alpha, const double *A,
+                 int lda, const double *x, int incx, double beta, double *y,
+                 int incy);
 
 /* Комплексное число для FFT: re/im подряд. */
 typedef struct RougeComplex {
