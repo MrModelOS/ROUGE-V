@@ -56,7 +56,7 @@ if(CLANG_EXECUTABLE)
 
   # The ldmatrix kernel has three entries, so ptx2ir runs once per entry (it
   # translates one .entry per module).
-  foreach(entry ldmatrix_tile ldmatrix_trans ldmatrix_x4)
+  foreach(entry ldmatrix_tile ldmatrix_trans ldmatrix_x4 ldmatrix_sm75 stmatrix_sm90)
     add_custom_command(
       OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${entry}.ll
       COMMAND ptx2ir --entry ${entry}
@@ -150,7 +150,9 @@ if(CLANG_EXECUTABLE)
   add_executable(test_aot_ldmatrix_tile test_aot_ldmatrix_tile.cpp
                  ${CMAKE_CURRENT_BINARY_DIR}/ldmatrix_tile.o
                  ${CMAKE_CURRENT_BINARY_DIR}/ldmatrix_trans.o
-                 ${CMAKE_CURRENT_BINARY_DIR}/ldmatrix_x4.o)
+                 ${CMAKE_CURRENT_BINARY_DIR}/ldmatrix_x4.o
+                 ${CMAKE_CURRENT_BINARY_DIR}/ldmatrix_sm75.o
+                 ${CMAKE_CURRENT_BINARY_DIR}/stmatrix_sm90.o)
   target_link_libraries(test_aot_ldmatrix_tile PRIVATE rouge-runtime rouge-ptx)
   target_include_directories(test_aot_ldmatrix_tile PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
@@ -285,12 +287,23 @@ if(CLANG_EXECUTABLE)
       "LLVM triple passed to ptx2ir --target for the NVIDIA GPU matrix test")
   set(ROUGE_NVPTX_FLAGS "-march=sm_75 -O2" CACHE STRING
       "Extra clang flags for the NVIDIA GPU matrix test")
+  # Warp-collective matrix ops need newer architectures than the base matrix:
+  # ldmatrix is sm_75, mma.sync m16n8k8/m16n8k16 is sm_80, stmatrix is sm_90.
+  # These cells pin the arch explicitly; without a ptxas that knows it the
+  # backend probe still passes (it only probes the triple) and clang fails the
+  # cell loudly instead of silently skipping it.
+  set(ROUGE_NVPTX_SM80_FLAGS "-march=sm_80 -O2" CACHE STRING
+      "Extra clang flags for the sm_80 NVIDIA matrix cells (mma.sync)")
+  set(ROUGE_NVPTX_SM90_FLAGS "-march=sm_90 -O2" CACHE STRING
+      "Extra clang flags for the sm_90 NVIDIA matrix cells (stmatrix)")
 
   # These values are handed to the matrix script as single -D arguments, where a
   # ';' or a space would be split by the CTest command line. The script therefore
   # expects ',' between list items and '+' between the clang flags of one spec.
   string(REPLACE " " "+" AMDGPU_FLAGS_SPEC "${ROUGE_AMDGPU_FLAGS}")
   string(REPLACE " " "+" NVPTX_FLAGS_SPEC "${ROUGE_NVPTX_FLAGS}")
+  string(REPLACE " " "+" NVPTX_SM80_FLAGS_SPEC "${ROUGE_NVPTX_SM80_FLAGS}")
+  string(REPLACE " " "+" NVPTX_SM90_FLAGS_SPEC "${ROUGE_NVPTX_SM90_FLAGS}")
   string(REPLACE ";" "," GPU_MATRIX_KERNELS_SPEC "${GPU_MATRIX_KERNELS}")
 
   add_test(NAME compiler_amdgpu_backend
@@ -313,6 +326,42 @@ if(CLANG_EXECUTABLE)
       -DOUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/vadd-nvptx.o
       -DKERNELS=${GPU_MATRIX_KERNELS_SPEC}
       -DPLATFORMS=nvptx|${ROUGE_NVPTX_TRIPLE}|${NVPTX_FLAGS_SPEC}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_targets.cmake)
+
+  # Warp-collective matrix cells per architecture: ldmatrix assembles from
+  # sm_75 (and runs there — see compiler_nvptx_gpu_exec), mma.sync m16n8k8/k16
+  # from sm_80, stmatrix from sm_90. mma/stmatrix cannot execute on tensor-less
+  # silicon, so these cells verify translation + backend + ptxas acceptance
+  # (clang -c shells out to ptxas); execution stays loudly refused/uncovered.
+  add_test(NAME compiler_nvptx_backend_collective_sm75
+    COMMAND ${CMAKE_COMMAND}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DPTX2IR=$<TARGET_FILE:ptx2ir>
+      -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
+      -DIR_FILE=${CMAKE_CURRENT_BINARY_DIR}/vadd.ll
+      -DOUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/vadd-nvptx.o
+      -DKERNELS=ldmatrix_tile@ldmatrix_sm75
+      -DPLATFORMS=nvptx|${ROUGE_NVPTX_TRIPLE}|${NVPTX_FLAGS_SPEC}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_targets.cmake)
+  add_test(NAME compiler_nvptx_backend_collective_sm80
+    COMMAND ${CMAKE_COMMAND}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DPTX2IR=$<TARGET_FILE:ptx2ir>
+      -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
+      -DIR_FILE=${CMAKE_CURRENT_BINARY_DIR}/vadd.ll
+      -DOUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/vadd-nvptx.o
+      -DKERNELS=mma_tile,mma_pipe
+      -DPLATFORMS=nvptx|${ROUGE_NVPTX_TRIPLE}|${NVPTX_SM80_FLAGS_SPEC}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_targets.cmake)
+  add_test(NAME compiler_nvptx_backend_collective_sm90
+    COMMAND ${CMAKE_COMMAND}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DPTX2IR=$<TARGET_FILE:ptx2ir>
+      -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
+      -DIR_FILE=${CMAKE_CURRENT_BINARY_DIR}/vadd.ll
+      -DOUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/vadd-nvptx.o
+      -DKERNELS=ldmatrix_tile@stmatrix_sm90
+      -DPLATFORMS=nvptx|${ROUGE_NVPTX_TRIPLE}|${NVPTX_SM90_FLAGS_SPEC}
       -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_targets.cmake)
 endif()
 
@@ -367,7 +416,7 @@ if(CLANG_EXECUTABLE AND CUDA_DRIVER_INCLUDE_DIR AND CUDA_DRIVER_LIBRARY)
       -DRUNNER=$<TARGET_FILE:gpu_exec_rungpu>
       -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
       -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/gpu-exec
-      "-DCELLS=vadd.vadd,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2,shfl_reduce.shfl_reduce,atom_cas.atom_cas,shfl_pred.shfl_pred,vote_pred.vote_pred,shfl_pred_all.shfl_pred_all"
+      "-DCELLS=vadd.vadd,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2,shfl_reduce.shfl_reduce,atom_cas.atom_cas,shfl_pred.shfl_pred,vote_pred.vote_pred,shfl_pred_all.shfl_pred_all,ldmatrix_tile.ldmatrix_sm75@ldmatrix_sm75"
       -DSM=sm_75
       -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_exec.cmake)
   set_tests_properties(compiler_nvptx_gpu_exec PROPERTIES

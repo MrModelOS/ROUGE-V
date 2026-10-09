@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 static int failures = 0;
@@ -69,8 +70,10 @@ int main(int argc, char** argv) {
   if (!prog) return 0;
   const int fi = fn_index(prog, "ldmatrix_tile");
   const int ft = fn_index(prog, "ldmatrix_trans");
-  EXPECT_TRUE(fi >= 0 && ft >= 0);
-  if (fi < 0 || ft < 0) return 1;
+  const int fs = fn_index(prog, "ldmatrix_sm75");
+  const int fm = fn_index(prog, "stmatrix_sm90");
+  EXPECT_TRUE(fi >= 0 && ft >= 0 && fs >= 0 && fm >= 0);
+  if (fi < 0 || ft < 0 || fs < 0 || fm < 0) return 1;
 
   // Plain roundtrip: out[tid*2+e] == tid-row values row*8+col.
   {
@@ -107,6 +110,28 @@ int main(int argc, char** argv) {
         if (out[tid * 2 + e] != want) {
           if (bad < 5)
             std::printf("trans tid=%d e=%d: got=%g want=%g\n", tid, e,
+                        (double)out[tid * 2 + e], (double)want);
+          ++bad;
+        }
+      }
+    }
+    EXPECT_TRUE(bad == 0);
+  }
+
+  // sm_75/sm_90 halves (ldmatrix-only / stmatrix-only): same x1 take
+  // positions (row tid>>2, cols (tid%4)*2), checked like the roundtrip.
+  for (const auto& ec : {std::make_pair(fs, "ldmatrix_sm75"),
+                         std::make_pair(fm, "stmatrix_sm90")}) {
+    float out[64] = {0};
+    EXPECT_TRUE(run_entry(*prog, ec.first, out));
+    int bad = 0;
+    for (int tid = 0; tid < 32; ++tid) {
+      const int row = tid >> 2, col0 = (tid % 4) * 2;
+      for (int e = 0; e < 2; ++e) {
+        const float want = (float)(row * 8 + col0 + e);
+        if (out[tid * 2 + e] != want) {
+          if (bad < 5)
+            std::printf("%s tid=%d e=%d: got=%g want=%g\n", ec.second, tid, e,
                         (double)out[tid * 2 + e], (double)want);
           ++bad;
         }

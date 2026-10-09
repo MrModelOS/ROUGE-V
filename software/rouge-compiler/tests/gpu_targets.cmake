@@ -66,7 +66,13 @@ string(REPLACE "," ";" MATRIX_PLATFORMS "${PLATFORMS}")
 
 # Every kernel must be present: a missing .ptx is a configuration error, not an
 # environment problem, so it is reported as a failure instead of a silent skip.
-foreach(kern IN LISTS MATRIX_KERNELS)
+foreach(cell IN LISTS MATRIX_KERNELS)
+  # "kernel@entry" cells name the file before "@".
+  set(kern "${cell}")
+  string(FIND "${cell}" "@" at)
+  if(NOT at EQUAL -1)
+    string(SUBSTRING "${cell}" 0 ${at} kern)
+  endif()
   if(NOT EXISTS "${KERNEL_DIR}/${kern}.ptx")
     message(FATAL_ERROR "gpu target matrix: FAILED - missing kernel ${KERNEL_DIR}/${kern}.ptx")
   endif()
@@ -212,20 +218,33 @@ foreach(spec IN LISTS MATRIX_PLATFORMS)
   rouge_kernel_contract("${triple}" KERNEL_CC KERNEL_FORBID)
 
   set(platform_ok 0)
-  foreach(kern IN LISTS MATRIX_KERNELS)
-    set(ir_file  "${OUT_DIR}/${OUT_STEM}-${pname}-${kern}.ll")
-    set(obj_file "${OUT_DIR}/${OUT_STEM}-${pname}-${kern}.o")
+  foreach(cell IN LISTS MATRIX_KERNELS)
+    # Multi-entry modules name their entry after "@": "ldmatrix_tile@stmatrix_sm90"
+    # translates that entry (ptx2ir default is the file's first entry).
+    set(kern "${cell}")
+    set(entry_args "")
+    set(cell_tag "${cell}")
+    string(FIND "${cell}" "@" at)
+    if(NOT at EQUAL -1)
+      string(SUBSTRING "${cell}" 0 ${at} kern)
+      math(EXPR ats "${at} + 1")
+      string(SUBSTRING "${cell}" ${ats} -1 entry)
+      string(REPLACE "@" "_" cell_tag "${cell}")
+      set(entry_args "--entry" "${entry}")
+    endif()
+    set(ir_file  "${OUT_DIR}/${OUT_STEM}-${pname}-${cell_tag}.ll")
+    set(obj_file "${OUT_DIR}/${OUT_STEM}-${pname}-${cell_tag}.o")
     file(REMOVE "${ir_file}" "${obj_file}")
 
     # ---- step 2: our translator must honour --target ----
     execute_process(
-      COMMAND "${PTX2IR}" --target "${triple}" "${KERNEL_DIR}/${kern}.ptx" "${ir_file}"
+      COMMAND "${PTX2IR}" --target "${triple}" ${entry_args} "${KERNEL_DIR}/${kern}.ptx" "${ir_file}"
       RESULT_VARIABLE rc
       OUTPUT_VARIABLE out
       ERROR_VARIABLE err)
     if(NOT rc EQUAL 0)
       rouge_condense("${err}" err)
-      message(FATAL_ERROR "gpu target matrix: FAILED - ${pname}/${kern}: "
+      message(FATAL_ERROR "gpu target matrix: FAILED - ${pname}/${cell}: "
                  "ptx2ir --target ${triple} exited ${rc}: ${err}")
     endif()
     if(NOT EXISTS "${ir_file}")

@@ -710,6 +710,58 @@ static int test_shfl_reduce(CUmodule mod) {
 }
 
 // ---------------------------------------------------------------------------
+// kernel: ldmatrix_sm75 -- one warp loads an 8x8 f16 tile from .shared with
+// ldmatrix.sync.aligned.m8n8.x1 and writes each thread's fragment to global.
+//
+// This is the NVPTX inline-asm lowering running on real silicon (sm_75 needs
+// no tensor cores for a shared-memory matrix move). Take positions are the
+// corrected mapping -- row tid>>2, cols (tid%4)*2, full coverage, every lane
+// distinct -- so out[tid*2+e] must equal in[row][col0+e] = row*8+col0+e bit
+// for bit (all values < 64, exact through f16 and back).
+// ---------------------------------------------------------------------------
+static int test_ldmatrix_sm75(CUmodule mod) {
+  const int threads = 32, blocks = 1;
+  printf("  config: blockDim=(%d,1,1) gridDim=(%d,1,1), out[tid*2+e]=tile values\n",
+         threads, blocks);
+
+  CUfunction fn;
+  CK(cuModuleGetFunction(&fn, mod, "ldmatrix_sm75"));
+
+  float ho[64], he[64];
+  for (int i = 0; i < 64; ++i) {
+    ho[i] = -1.f;
+    const int tid = i / 2, e = i % 2;
+    he[i] = (float)((tid >> 2) * 8 + (tid % 4) * 2 + e);
+  }
+
+  CUdeviceptr dout;
+  CK(cuMemAlloc(&dout, sizeof(ho)));
+  CK(cuMemcpyHtoD(dout, ho, sizeof(ho)));
+
+  void* args[] = {&dout};
+  CK(cuLaunchKernel(fn, blocks, 1, 1, threads, 1, 1, 0, 0, args, 0));
+  CUresult r = cuCtxSynchronize();
+  if (r != CUDA_SUCCESS) {
+    printf("  MISMATCH: launch/sync failed: %s (%s) -- the kernel faulted on the device\n",
+           cuerr(r), cuerrstr(r));
+    return 3;
+  }
+  CK(cuMemcpyDtoH(ho, dout, sizeof(ho)));
+  CK(cuMemFree(dout));
+
+  int bad = 0;
+  for (int i = 0; i < 64; ++i)
+    if (ho[i] != he[i]) {
+      if (bad < 6)
+        printf("  out[%d]: got %g want %g\n", i, ho[i], he[i]);
+      ++bad;
+    }
+  printf(bad ? "  MISMATCH\n"
+             : "  OK: 32 lanes x 2 f16 elements, ldmatrix verified bit-exactly on silicon\n");
+  return bad ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
 // kernel: atom_cas -- per-thread slots for cas/exch/min/max with old-value
 // buffers. Every thread owns its slot (g = ctaid*ntid+tid), so no two threads
 // race and the outcome is fully deterministic: both the returned old values
@@ -1122,7 +1174,7 @@ static int test_matrixmul16(CUmodule mod) {
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
   if (argc < 3) {
-    printf("usage: %s <file.ptx> <vadd|block_reduce|fp16_reduce|gemm_tile|shfl_reduce|atom_cas|shfl_pred|vote_pred|shfl_pred_all|foreign_vadd|matrixmul16|all>\n", argv[0]);
+    printf("usage: %s <file.ptx> <vadd|block_reduce|fp16_reduce|gemm_tile|shfl_reduce|atom_cas|shfl_pred|vote_pred|shfl_pred_all|ldmatrix_sm75|foreign_vadd|matrixmul16|all>\n", argv[0]);
     return 2;
   }
   const char* ptx = argv[1];
@@ -1276,6 +1328,12 @@ int main(int argc, char** argv) {
     printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
     if (rc && g_exit_code == 0) g_exit_code = rc;
   }
+  if (all || strcmp(kname, "ldmatrix_sm75") == 0) {
+    printf("== ldmatrix_sm75 ==\n");
+    rc = test_ldmatrix_sm75(mod);
+    printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
+    if (rc && g_exit_code == 0) g_exit_code = rc;
+  }
   if (!all && strcmp(kname, "fp16_reduceB") == 0) {
     printf("== fp16_reduce (dataset B only) ==\n");
     rc = test_fp16_reduce(mod, 1);
@@ -1303,6 +1361,7 @@ int main(int argc, char** argv) {
       strcmp(kname, "shfl_pred") && strcmp(kname, "vote_pred") &&
       strcmp(kname, "shfl_pred_all") && strcmp(kname, "foreign_vadd") &&
       strcmp(kname, "matrixmul16") &&
+      strcmp(kname, "ldmatrix_sm75") &&
       strcmp(kname, "fp16_reduceB") && strcmp(kname, "gemm_tileB") &&
       strcmp(kname, "gemm_tile2")) {
     printf("unknown kernel '%s'\n", kname);

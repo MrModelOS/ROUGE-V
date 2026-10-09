@@ -30,6 +30,8 @@
 extern "C" void ldmatrix_tile(uint64_t out, const void* launch);
 extern "C" void ldmatrix_trans(uint64_t out, const void* launch);
 extern "C" void ldmatrix_x4(uint64_t out, const void* launch);
+extern "C" void ldmatrix_sm75(uint64_t out, const void* launch);
+extern "C" void stmatrix_sm90(uint64_t out, const void* launch);
 extern "C" int32_t __rouge_ldmatrix_tile_query(RougeKernelInfo* info);
 
 namespace {
@@ -151,6 +153,9 @@ int main(int argc, char** argv) {
   check("ldmatrix_trans", &ldmatrix_trans, "ldmatrix_trans", 64);
   // x4: four matrices, every thread receiving a fragment of each.
   check("ldmatrix_x4", &ldmatrix_x4, "ldmatrix_x4", 256);
+  // sm_75/sm_90 halves (same take positions as x1, split for silicon).
+  check("ldmatrix_sm75", &ldmatrix_sm75, "ldmatrix_sm75", 64);
+  check("stmatrix_sm90", &stmatrix_sm90, "stmatrix_sm90", 64);
 
   rouge_exchange_free(block.exchange);
   rouge_smem_free(block.scratch);
@@ -160,6 +165,6 @@ int main(int argc, char** argv) {
     std::printf("AOT ldmatrix_tile FAILED: %d mismatching values\n", bad);
     return 1;
   }
-  std::printf("AOT ldmatrix_tile OK: x1 + trans + x4, AOT == interpreter\n");
+  std::printf("AOT ldmatrix_tile OK: x1 + trans + x4 + sm75 + sm90, AOT == interpreter\n");
   return 0;
 }

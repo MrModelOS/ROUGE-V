@@ -45,11 +45,28 @@ file(MAKE_DIRECTORY "${WORK_DIR}")
 string(REPLACE "," ";" MATRIX_CELLS "${CELLS}")
 
 function(rouge_exec_cell kernel selector)
-  set(ll "${WORK_DIR}/${kernel}.ll")
-  set(ptx "${WORK_DIR}/${kernel}.ptx")
+  # Multi-entry modules name their entry after "@": "ldmatrix_tile.x4@ldmatrix_x4"
+  # translates entry ldmatrix_x4 and checks it as x4. Without "@" the file's
+  # first entry is translated (ptx2ir default) and the selector names the check.
+  set(entry "")
+  string(FIND "${selector}" "@" at)
+  if(NOT at EQUAL -1)
+    string(SUBSTRING "${selector}" 0 ${at} kname)
+    math(EXPR ats "${at} + 1")
+    string(SUBSTRING "${selector}" ${ats} -1 entry)
+    set(selector "${kname}")
+  endif()
+  set(tag "${kernel}")
+  set(entry_args "")
+  if(NOT "${entry}" STREQUAL "")
+    set(tag "${kernel}_${entry}")
+    set(entry_args "--entry" "${entry}")
+  endif()
+  set(ll "${WORK_DIR}/${tag}.ll")
+  set(ptx "${WORK_DIR}/${tag}.ptx")
 
   execute_process(
-    COMMAND "${PTX2IR}" --target nvptx64-nvidia-cuda
+    COMMAND "${PTX2IR}" --target nvptx64-nvidia-cuda ${entry_args}
             "${KERNEL_DIR}/${kernel}.ptx" "${ll}"
     RESULT_VARIABLE rc
     OUTPUT_VARIABLE out

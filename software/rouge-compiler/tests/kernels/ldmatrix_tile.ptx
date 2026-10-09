@@ -352,3 +352,129 @@
     st.global.f32 [%rd6+4], %f3;
     ret;
 }
+
+// sm_75-runnable load half: fill, ldmatrix.x1, fragment straight to global.
+// No stmatrix (sm_90+), so this entry assembles AND runs on sm_75 silicon
+// (MX450), proving the NVPTX inline-asm lowering on hardware. Take positions
+// are the corrected mapping: row tid>>2, cols (tid%4)*2 — full tile coverage,
+// every thread distinct.
+.visible .entry ldmatrix_sm75(
+    .param .u64 ldmatrix_sm75_param_0
+)
+{
+    .reg .b16 %h<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<4>;
+    .shared .align 2 .b8 tile_in[128];
+
+    ld.param.u64 %rd1, [ldmatrix_sm75_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.shared.u64 %rd2, tile_in;
+
+    mov.u32 %r2, %tid.x;
+    and.b32 %r3, %r2, 7;        // fill row = tid % 8
+    shr.u32 %r4, %r2, 3;        // tid / 8
+    and.b32 %r4, %r4, 3;
+    shl.b32 %r4, %r4, 1;        // fill col0 = ((tid/8)%4)*2 (full coverage)
+
+    // fill input tile: in[row][col0..col0+1] = row*8+col (as f16)
+    shl.b32 %r5, %r3, 3;
+    add.s32 %r5, %r5, %r4;
+    cvt.f32.s32 %f1, %r5;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r6, %h1;
+    add.s32 %r5, %r5, 1;
+    cvt.f32.s32 %f1, %r5;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r7, %h1;
+    shl.b32 %r7, %r7, 16;
+    or.b32 %r6, %r6, %r7;
+    shl.b32 %r7, %r3, 4;
+    shl.b32 %r8, %r4, 1;
+    add.s64 %rd4, %rd2, %r7;
+    add.s64 %rd4, %rd4, %r8;
+    st.shared.b32 [%rd4], %r6;
+
+    bar.sync 0;
+
+    shl.b32 %r7, %r3, 4;
+    add.s64 %rd5, %rd2, %r7;
+    ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r9}, [%rd5];
+
+    // fragment straight out: out[tid*2+e] as f32 (take row tid>>2).
+    and.b32 %r12, %r9, 65535;
+    shr.u32 %r13, %r9, 16;
+    cvt.u16.u32 %h2, %r12;
+    cvt.f32.f16 %f2, %h2;
+    cvt.u16.u32 %h3, %r13;
+    cvt.f32.f16 %f3, %h3;
+    shl.b32 %r11, %r2, 1;
+    shl.b32 %r11, %r11, 2;
+    add.s64 %rd6, %rd1, %r11;
+    st.global.f32 [%rd6], %f2;
+    st.global.f32 [%rd6+4], %f3;
+    ret;
+}
+
+// sm_90 store half: registers -> stmatrix.x1 -> shared -> global.
+// Mirrors ldmatrix_sm75 (take row tid>>2, cols (tid%4)*2) but exercises the
+// store direction. Assembles from sm_90 up (verified with ptxas); executes
+// where stmatrix exists in silicon.
+.visible .entry stmatrix_sm90(
+    .param .u64 stmatrix_sm90_param_0
+)
+{
+    .reg .b16 %h<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<4>;
+    .shared .align 2 .b8 tile_out[128];
+
+    ld.param.u64 %rd1, [stmatrix_sm90_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.shared.u64 %rd3, tile_out;
+
+    mov.u32 %r2, %tid.x;
+    // take values for (row tid>>2, cols (tid%4)*2): val = row*8+col, as f16.
+    shr.u32 %r3, %r2, 2;        // take row
+    and.b32 %r4, %r2, 3;
+    shl.b32 %r4, %r4, 1;        // take col0
+    shl.b32 %r5, %r3, 3;        // row*8
+    add.s32 %r5, %r5, %r4;
+    cvt.f32.s32 %f1, %r5;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r9, %h1;
+    add.s32 %r5, %r5, 1;
+    cvt.f32.s32 %f1, %r5;
+    cvt.f16.f32 %h1, %f1;
+    mov.b32 %r10, %h1;
+    shl.b32 %r10, %r10, 16;
+    or.b32 %r9, %r9, %r10;      // packed fragment
+    // provider address: every thread supplies a valid row start (tid%8).
+    and.b32 %r6, %r2, 7;
+    shl.b32 %r6, %r6, 4;
+    add.s64 %rd6, %rd3, %r6;
+    stmatrix.sync.aligned.m8n8.x1.shared.b16 [%rd6], {%r9};
+
+    bar.sync 0;
+
+    // read back the store positions and copy out as f32.
+    shl.b32 %r7, %r3, 4;
+    shl.b32 %r8, %r4, 1;
+    add.s64 %rd4, %rd3, %r7;
+    add.s64 %rd4, %rd4, %r8;
+    ld.shared.b32 %r10, [%rd4];
+    and.b32 %r12, %r10, 65535;
+    shr.u32 %r13, %r10, 16;
+    cvt.u16.u32 %h2, %r12;
+    cvt.f32.f16 %f2, %h2;
+    cvt.u16.u32 %h3, %r13;
+    cvt.f32.f16 %f3, %h3;
+    shl.b32 %r11, %r2, 1;
+    shl.b32 %r11, %r11, 2;
+    add.s64 %rd5, %rd1, %r11;
+    st.global.f32 [%rd5], %f2;
+    st.global.f32 [%rd5+4], %f3;
+    ret;
+}

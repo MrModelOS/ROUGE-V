@@ -1372,18 +1372,21 @@ class LlvmGen {
            op.rfind("movmatrix.", 0) == 0;
   }
 
-  // Collect what the body needs before the signature is printed: the barrier
-  // declare and the fragment helpers, plus the refusal for GPU targets (there
-  // the exchange region has no place, and a silently wrong tile is worse than
-  // a loud error).
+  // Collect what the body needs before the signature is printed. On the host
+  // the collectives publish into the exchange region, so the block barrier
+  // declare is needed; on a GPU they are hardware instructions reached through
+  // inline asm (probed working against clang: NVVM has no ldmatrix/mma
+  // intrinsics in this form), needing nothing up front. wmma/movmatrix are
+  // refused everywhere: a different matrix API and a warp permutation.
   bool scan_warp_collectives() {
     for (const auto& ins : body_) {
       if (!is_warp_collective_op(ins.op)) continue;
-      if (gpu_kernel())
-        return fail("warp-cooperative '" + ins.op + "' is interpreter-only for"
-                    " now: the AOT lowering uses the per-block exchange region"
-                    " of a host launch descriptor, and a GPU kernel has no such"
-                    " region (NVVM mma / shared-window lowering pending)");
+      if (ins.op.rfind("wmma.", 0) == 0 || ins.op.rfind("movmatrix.", 0) == 0)
+        return fail("warp-cooperative '" + ins.op + "' is not lowered (wmma"
+                    " is a different matrix API; movmatrix is a warp-wide"
+                    " permutation): refused loudly rather than lowered as"
+                    " something else");
+      if (gpu_kernel()) continue;  // hardware instructions need no preamble
       use_sync_ = true;  // publishing and reading are separated by a barrier
       if (ins.op.rfind("mma.", 0) == 0) {
         // Half-precision decode/encode goes through the host runtime, so both
@@ -1755,6 +1758,10 @@ class LlvmGen {
                   "}, {" + std::to_string(F.nA) + "}, {" + std::to_string(F.nB) +
                   "}, {" + std::to_string(F.nD) + "})");
 
+    // On a GPU the whole tile exchange is one hardware instruction: the lane's
+    // own registers go straight into it, no exchange region involved.
+    if (gpu_kernel()) return emit_mma_nvptx(ins, groups);
+
     // Publish A and B, then read the peers. C and D stay in registers.
     // The exchange context (base + warp + own slot) is computed once here;
     // every peer read below addresses by offset from it.
@@ -1863,7 +1870,7 @@ class LlvmGen {
   bool emit_matrix_move(const rouge::PtxInstruction& ins, size_t idx) {
     const bool isLoad = ins.op[0] == 'l';
     std::string shape, num, type;
-    bool trans = false;
+    bool trans = false, hasShared = false;
     {
       std::vector<std::string> q;
       std::stringstream ss(ins.op);
@@ -1875,8 +1882,10 @@ class LlvmGen {
         else if (s == "m8n8") shape = s;
         else if (s == "x1" || s == "x2" || s == "x4") num = s;
         else if (s == "trans") trans = true;
-        else if (s == "shared" || s == "shared::cta") continue;
-        else if (s == "b16") type = s;
+        else if (s == "shared" || s == "shared::cta") {
+          hasShared = true;
+          continue;
+        } else if (s == "b16") type = s;
         else
           return fail("unsupported PTX op '" + ins.op + "' @ " +
                       std::to_string(idx) + " (qualifier '" + s + "' is not"
@@ -1932,6 +1941,11 @@ class LlvmGen {
       line("  " + a + " = add i64 " + rowAddr + ", " + std::to_string(addrOff));
       rowAddr = a;
     }
+    // On a GPU the lane's own row address goes straight into the hardware
+    // instruction: no other lane's data is needed.
+    if (gpu_kernel())
+      return emit_matrix_move_nvptx(ins, idx, isLoad, fragRegs, rowAddr, shape,
+                                    num, trans, hasShared, type);
     const ExchangeCtx x = exchange_ctx();
     publish_row_addr_ctx(x, rowAddr);
     line("  call void @__rouge_syncthreads(ptr %launch)");
@@ -1976,6 +1990,138 @@ class LlvmGen {
     // See emit_mma: the next collective must not overwrite the published
     // addresses before every lane has read them.
     line("  call void @__rouge_syncthreads(ptr %launch)");
+    return true;
+  }
+
+  // ---- mma.sync on NVPTX --------------------------------------------------
+  //
+  // One hardware instruction reached through inline assembly (NVVM exposes no
+  // ldmatrix/mma.sync intrinsics in this form: probed against clang, only
+  // inline asm lowers). The template reuses the validated PTX mnemonic
+  // verbatim; every fragment word is an i32 SSA (f16x2/f32/s32 payloads are
+  // all 32-bit patterns here). sideeffect keeps the warp-scoped ordering
+  // against surrounding memory operations.
+  bool emit_mma_nvptx(
+      const rouge::PtxInstruction& ins,
+      const std::vector<std::vector<std::string>>& groups) {
+    // Input words first: operand() emits its loads before the call.
+    std::vector<std::string> words;
+    for (size_t g = 1; g < groups.size(); ++g)
+      for (const auto& r : groups[g]) words.push_back(operand(r));
+    // "{d0,d1}, {a0,..}, {b0,..}, {c0,..}" with one $i per operand in group
+    // order. PTX requires the four groups spelled separately (a single
+    // 10-wide second group is rejected: "Illegal vector size").
+    std::string frags, cons;
+    size_t k = 0;
+    for (size_t g = 0; g < groups.size(); ++g) {
+      if (g) frags += ", ";
+      frags += "{";
+      for (size_t i = 0; i < groups[g].size(); ++i) {
+        if (i) {
+          frags += ",";
+          cons += ",";
+        } else if (g) {
+          cons += ",";
+        }
+        frags += "$" + std::to_string(k++);
+        cons += (g == 0 ? "=r" : "r");
+      }
+      frags += "}";
+    }
+    frags += ";";
+    // The call returns one i32 per D word as an aggregate.
+    std::string retty = "{ ";
+    for (size_t i = 0; i < groups[0].size(); ++i) {
+      if (i) retty += ", ";
+      retty += "i32";
+    }
+    retty += " }";
+    std::string call = "call " + retty + " asm sideeffect \"" + ins.op + " " +
+                       frags + "\", \"" + cons + "\"(";
+    for (size_t i = 0; i < words.size(); ++i) {
+      if (i) call += ", ";
+      call += "i32 " + words[i];
+    }
+    call += ")";
+    const std::string agg = fresh("%mm");
+    line("  " + agg + " = " + call);
+    for (size_t i = 0; i < groups[0].size(); ++i) {
+      const std::string e = fresh("%md");
+      line("  " + e + " = extractvalue " + retty + " " + agg + ", " +
+           std::to_string(i));
+      store_reg(groups[0][i], e);
+    }
+    return true;
+  }
+
+  // ---- ldmatrix / stmatrix on NVPTX --------------------------------------
+  //
+  // The lane's own row-start address goes straight into the hardware
+  // instruction (other lanes' registers are the hardware's business, not
+  // ours). Template is the canonical mnemonic rebuilt from the validated
+  // qualifiers; the address is the same absolute shared-window i64 the host
+  // path publishes. sideeffect keeps ordering against surrounding accesses.
+  bool emit_matrix_move_nvptx(const rouge::PtxInstruction& ins, size_t idx,
+                              bool isLoad,
+                              const std::vector<std::string>& fragRegs,
+                              const std::string& rowAddr,
+                              const std::string& shape, const std::string& num,
+                              bool trans, bool hasShared,
+                              const std::string& type) {
+    (void)idx;
+    const int nMat = (int)fragRegs.size();
+    std::string tmpl = (isLoad ? std::string("ldmatrix") : std::string("stmatrix")) +
+                       ".sync.aligned." + shape + "." + num +
+                       (trans ? ".trans" : "") + (hasShared ? ".shared" : "") +
+                       "." + type + " ";
+    std::string cons;
+    if (isLoad) {
+      tmpl += "{";
+      for (int i = 0; i < nMat; ++i) {
+        if (i) {
+          tmpl += ",";
+          cons += ",";
+        }
+        tmpl += "$" + std::to_string(i);
+        cons += "=r";
+      }
+      tmpl += "}, [$" + std::to_string(nMat) + "];";
+      cons += ",l";
+      std::string retty = nMat == 1 ? "i32" : "{ ";
+      if (nMat > 1) {
+        for (int i = 0; i < nMat; ++i) {
+          if (i) retty += ", ";
+          retty += "i32";
+        }
+        retty += " }";
+      }
+      const std::string v = fresh("%mx");
+      line("  " + v + " = call " + retty + " asm sideeffect \"" + tmpl +
+           "\", \"" + cons + "\"(i64 " + rowAddr + ")");
+      if (nMat == 1) {
+        store_reg(fragRegs[0], v);
+      } else {
+        for (int i = 0; i < nMat; ++i) {
+          const std::string e = fresh("%me");
+          line("  " + e + " = extractvalue " + retty + " " + v + ", " +
+               std::to_string(i));
+          store_reg(fragRegs[i], e);
+        }
+      }
+      return true;
+    }
+    tmpl += "[$0], {";
+    cons = "l";
+    std::string args = "(i64 " + rowAddr;
+    for (int i = 0; i < nMat; ++i) {
+      tmpl += (i ? "," : "") + std::string("$") + std::to_string(i + 1);
+      cons += ",r";
+      args += ", i32 " + operand(fragRegs[i]);
+    }
+    tmpl += "};";
+    args += ")";
+    line("  call void asm sideeffect \"" + tmpl + "\", \"" + cons + "\"" +
+         args);
     return true;
   }
 

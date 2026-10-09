@@ -130,7 +130,7 @@ global — `addrspace(1)` у обоих GPU-бэкендов, shared — `addrsp
 | Варп-шаффлы и голосования | `shfl.sync.*` + легаси `shfl.*`, включая предикатную форму `d\|p` (NVPTX: NVVM-интринсик + предикат из `%laneid`; хост: скаляр); `vote.sync.{any,all,uni}` (NVPTX: `llvm.nvvm.vote.*.sync`); `activemask.b32` (NVPTX: `llvm.nvvm.activemask`) |
 | Атомики | `atom.add.{u32,s32,u64,s64,f32}` (→ `atomicrmw`, возвращает старое), `red.add.*` (без возврата), `monotonic` |
 
-| Варп-коллективы матричные | `mma.sync.aligned` (хост: обмен фрагментами; NVPTX: отказ), `ldmatrix`/`stmatrix.sync.aligned.m8n8.x{1,2,4}[.trans].b16` (хост: обмен адресами; NVPTX: отказ) |
+| Варп-коллективы матричные | `mma.sync.aligned` (хост: обмен фрагментами; NVPTX: железная инструкция через inline asm) и `ldmatrix`/`stmatrix.sync.aligned.m8n8.x{1,2,4}[.trans].b16` (хост: обмен адресами; NVPTX: железная инструкция). NVVM-интринсиков этих форм в LLVM нет (проверено пробой) — только inline asm. Архитектурные пороги честно: ldmatrix с sm_75 (исполнено на MX450), mma.sync m16n8k8/k16 с sm_80 (только сборка ptxas — тензорных ядер на TU117 нет), stmatrix с sm_90 (только сборка). |
 
 Неподдерживаемое (`wmma.*`, `movmatrix`, split-фазные
 `arrive`/`red`/`mbarrier.*`, `%clock64` на хосте, `mma`/`ldmatrix`/`stmatrix`
