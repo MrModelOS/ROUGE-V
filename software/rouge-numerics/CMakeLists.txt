@@ -26,7 +26,12 @@ add_library(rouge-numerics STATIC
   src/gemm.cpp
   src/autotune.cpp
   src/fp8.cpp
+  src/fp16.cpp
   src/conv.cpp
+  src/winograd.cpp
+  src/attention.cpp
+  src/fft.cpp
+  src/sparse_random.cpp
 )
 target_include_directories(rouge-numerics PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -53,6 +58,21 @@ if(ROUGE_NUMERICS_NATIVE AND HAVE-march=native)
 endif()
 
 target_compile_options(rouge-numerics PRIVATE -Wall -Wextra)
+
+# Шимы чужих API поверх своего кода (Wave 2, подход Wine: интерфейсы по
+# открытой документации, реализация своя). Отдельные shared-библиотеки, чтобы
+# их можно было подсунуть линковщику вместо проприетарных.
+add_library(rouge-cublas SHARED src/cublas_shim.cpp)
+target_include_directories(rouge-cublas PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(rouge-cublas PUBLIC rouge-numerics)
+target_compile_options(rouge-cublas PRIVATE -Wall -Wextra)
+
+add_library(rouge-cudnn SHARED src/cudnn_shim.cpp)
+target_include_directories(rouge-cudnn PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(rouge-cudnn PUBLIC rouge-numerics)
+target_compile_options(rouge-cudnn PRIVATE -Wall -Wextra)
 
 if(ROUGE_BUILD_TESTS)
   enable_testing()

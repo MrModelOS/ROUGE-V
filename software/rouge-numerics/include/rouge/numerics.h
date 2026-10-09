@@ -72,11 +72,87 @@ void rouge_conv2d_f32(int N, int Cin, int H, int W, int Cout, int KH, int KW,
                       const float *bias, float *Y,
                       const RougeGemmConfig *cfg);
 
+/* Winograd F(2x2,3x3) для 3x3 stride 1 pad 1 (выход того же HxW).
+ * Успех -> 0; неверные указатели/размеры -> -1 без записи.
+ * Хвосты нечётных OH/OW досчитываются прямо внутри. */
+int rouge_conv_winograd3x3_f32(int N, int Cin, int H, int W, int Cout,
+                               const float *X, const float *Wt,
+                               const float *bias, float *Y);
+
+/* Профиль автотюнера свёртки: method 0=im2col, 1=winograd, -1=ошибка;
+ * millis — wall-clock победителя на этих данных (в Y его результат). */
+typedef struct RougeConvProfile {
+  int method;
+  double millis;
+} RougeConvProfile;
+
+/* Автотюнер свёртки: замер im2col против Winograd (когда применим 3x3 s1p1),
+ * без кэша; в Y — результат победителя. */
+RougeConvProfile rouge_conv_tuned(int N, int Cin, int H, int W, int Cout,
+                                  int KH, int KW, int stride, int pad,
+                                  const float *X, const float *Wt,
+                                  const float *bias, float *Y);
+
+/* Attention (Wave 2): O[S][D] = softmax(Q[s]·K/scale)·V, блочный проход по
+ * K/V (Bt=64) с онлайн-пересчётом max/sum — полная S×Skv не материализуется.
+ * causal!=0 маскирует t > s+kv_off; scale<=0 -> 1/sqrt(D).
+ * NULL или S/Skv/D<=0 -> ничего не делать. */
+void rouge_attention_f32(int S, int Skv, int D, const float *Q, const float *K,
+                         const float *V, float *O, float scale, int causal,
+                         int kv_off);
+
+/* Комплексное число для FFT: re/im подряд. */
+typedef struct RougeComplex {
+  float re;
+  float im;
+} RougeComplex;
+
+/* FFT (Wave 2): свой radix-2 Cooley-Tukey. inverse=0 — forward без нормировки,
+ * inverse!=0 — inverse с делением на N. Только степени двойки.
+ * Успех -> 0; иначе -1 без записи. */
+int rouge_fft_f32(int n, const RougeComplex *in, RougeComplex *out,
+                  int inverse);
+
+/* CSR SpMV (Wave 2): y = A*x. rowptr[nrows+1], colidx/values[nnz].
+ * Успех -> 0; нарушение границ/NULL -> -1 без записи. */
+int rouge_csr_spmv_f32(int nrows, int ncols, const int *rowptr,
+                       const int *colidx, const float *values, const float *x,
+                       float *y);
+
+/* Детерминированный RNG (Wave 2): splitmix64 + uniform [0,1) + normal
+ * (Box-Muller с кэшем). Один seed -> одна последовательность везде. */
+typedef struct RougeRng {
+  uint64_t state;
+  int have_next;
+  float next_gauss;
+} RougeRng;
+
+void rouge_rng_seed(RougeRng *rng, uint64_t seed);
+uint64_t rouge_rng_next_u64(RougeRng *rng);
+float rouge_rng_uniform_f32(RougeRng *rng);
+float rouge_rng_normal_f32(RougeRng *rng);
+
 /* Квантование f32 <-> OCP E4M3 (RNE, satfinite в знаковый MAX_NORM;
  * NaN -> знаковый NaN 0x7F, Inf -> знаковый MAX 0x7E, signed zero хранится).
  * Дословная транскрипция f32_to_narrow/narrow_to_f32 интерпретатора. */
 uint8_t rouge_quantize_e4m3(float f);
 float rouge_dequantize_e4m3(uint8_t u);
+
+/* FP16/BF16 (Wave 2): квантование RNE; f16 — IEEE 754 half (переполнение в
+ * Inf), bf16 — округление старших 16 бит (переполнение в Inf).
+ * NaN -> канонический NaN, signed zero хранится. */
+uint16_t rouge_quantize_f16(float f);
+float rouge_dequantize_f16(uint16_t u);
+uint16_t rouge_quantize_bf16(float f);
+float rouge_dequantize_bf16(uint16_t u);
+
+/* GEMM на половинных входах: C[M][N] f32 = A[M][K] * B[K][N], накопление f32.
+ * Реализация — decode в f32 + тот же блочный rouge_gemm_f32 (как e4m3).
+ * M/N/K <= 0 или NULL -> ничего не делать. */
+void rouge_gemm_f16(int M, int N, int K, const uint16_t *A, const uint16_t *B,
+                    float *C, const RougeGemmConfig *cfg);
+void rouge_gemm_bf16(int M, int N, int K, const uint16_t *A, const uint16_t *B,
+                     float *C, const RougeGemmConfig *cfg);
 
 /* Конфиг по умолчанию (умеренный: панели 64x64x32, unroll 2, split_k 1). */
 RougeGemmConfig rouge_gemm_default_config(void);
