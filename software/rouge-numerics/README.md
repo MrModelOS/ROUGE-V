@@ -43,6 +43,7 @@ ROUGE-V, в дереве лежит свой проект.
 | `gemm_isa_base` / `gemm_isa_avx2` / `gemm_isa_avx512` | Те же конфиги, но для **каждого** собранного варианта ISA — процессор умеет не всё, без этого проверялся бы ровно один путь |
 | `gemm_fp8` | Квантование e4m3 (точечные векторы + roundtrip всех 256 значений), точный GEMM на целых 1..8 бит-в-бит, дробные данные 2% против шкалы |
 | `gemm_f16` | Точечные значения f16/bf16 (1.0, −0, Inf, NaN), roundtrip целых 1..32, GEMM обоих форматов против f32-эталона (допуск 1e-2 — ошибка квантования входов) |
+| `narrow` | Узкие форматы: исчерпывающий roundtrip e5m2 (256 значений) и e2m1 (16), точечные значения e3m2/e2m3, насыщение в обе стороны; MX-блоки: масштаб — степень двойки, обрезки нет, переквантование идемпотентно, относительная ошибка в пределах шага формата; NVFP4: 16 элементов на блок, масштабл блока — степень двойки в E4M3 |
 | `gemm_f64` (+ `gemm_f64_isa_*`) | FP64: каждый кандидат на размерах с краями против наивного эталона в long double (допуск 1e-12), split_k, ISA-матрица как для f32 |
 | `complex` | c32/z64 против эталона в long double (допуски 1e-6/1e-14) |
 | `conv` | Свёртка NCHW: ручной случай 3x3 (−6) плюс 6 случайных конфигураций (stride/pad/bias, неквадратные ядра) против независимого прямого эталона |
@@ -107,8 +108,34 @@ const char* rouge_gemm_isa_variant(void);  /* "base+sse2" | "avx2+fma" | "avx512
  * OCP OFP8 E4M3; decode в f32 + тот же блочный GEMM (автотюнер shared). */
 void rouge_gemm_e4m3(int M, int N, int K, const uint8_t* A, const uint8_t* B,
                      float* C, const RougeGemmConfig* cfg);
-uint8_t rouge_quantize_e4m3(float f);   /* RNE, satfinite в знаковый MAX */
+
+/* Квантование f32 <-> OCP E4M3 (RNE, satfinite в знаковый MAX);
+ * также e5m2/e3m2/e2m3/e2m1 (OCP OFP8 Table 1-2 и MX v1.0 Table 7) —
+ * все транскрипцией таблиц интерпретатора. */
+uint8_t rouge_quantize_e4m3(float f);
 float rouge_dequantize_e4m3(uint8_t u);
+uint8_t rouge_quantize_e5m2(float f);
+float rouge_dequantize_e5m2(uint8_t u);
+uint8_t rouge_quantize_e3m2(float f);
+float rouge_dequantize_e3m2(uint8_t u);
+uint8_t rouge_quantize_e2m3(float f);
+float rouge_dequantize_e2m3(uint8_t u);
+uint8_t rouge_quantize_e2m1(float f);   /* 4-битное поле */
+float rouge_dequantize_e2m1(uint8_t u);
+
+/* Блочное масштабирование OCP MX: MXFP8 (32 элемента, масштаб E8M0),
+ * MXFP4 (e2m1 в блоке 32) и NVFP4 (16 элементов, масштаб блока E4M3 +
+ * глобальный FP32). Масштаб подбирается без обрезки блока. */
+int rouge_mx_quantize_f32(const float* x, int n, int elem_bytes, uint8_t* out,
+                          uint8_t* scale_out);
+int rouge_mx_quantize_f32_e2m1(const float* x, int n, uint8_t* out,
+                                uint8_t* scale_out);
+int rouge_nvfp4_quantize_f32(const float* x, int n, float global_scale,
+                             uint8_t* out, uint8_t* scale_out);
+void rouge_mx_dequantize_f32(const uint8_t* in, const uint8_t* scales, int n,
+                             int elem_bytes, float* out);
+void rouge_mx_dequantize_f32_e2m1(const uint8_t* in, const uint8_t* scales,
+                                  int n, float* out);
 
 /* Свёртка 2D NCHW f32: im2col + свой блочный GEMM. bias может быть NULL. */
 void rouge_conv2d_f32(int N, int Cin, int H, int W, int Cout, int KH, int KW,
