@@ -18,6 +18,7 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/StringMap.h"
@@ -75,7 +76,10 @@ bool isFunctionLike(StringRef name) {
          name.ends_with(".kernel") || name.ends_with(".kernel_func");
 }
 
-class SimtAccessReport
+// MLIR требует, чтобы явный type-id стоял в ПУБЛИЧНОЙ секции класса
+// (иначе static_assert в TypeID.h). Поэтому класс — struct (по умолчанию
+// public), а не class.
+struct SimtAccessReport
     : public PassWrapper<SimtAccessReport, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SimtAccessReport)
 
@@ -93,13 +97,20 @@ class SimtAccessReport
     }
 
     llvm::StringMap<AccessSummary> summaries;
-    for (Operation& top : module.getBody()->getOperations()) {
-      const StringRef topName = top.getName().getStringRef();
-      const std::string label = isFunctionLike(topName) ? topName.str()
-                                                        : std::string("(module)");
-      AccessSummary& s = summaries[label];
-      top.walk([&](Operation *op) {
-        const StringRef name = op->getName().getStringRef();
+    // Отчёт — по функциям: SIMT-паттерны ядра относятся к конкретной
+    // функции, а не ко всему модулю. (Раньше обход шёл по верхнеуровневым
+    // операциям, из-за чего gpu.func со всем содержимым попадал в
+    // "(module)" — это вылезло при первой реальной сборке контура.)
+    module.walk([&](Operation *op) {
+      if (!isFunctionLike(op->getName().getStringRef())) return;
+      // Имя функции берём из атрибута sym_name напрямую: SymbolTable-обход
+      // падал на операциях без символьного имени.
+      const StringAttr nameAttr = op->getAttrOfType<StringAttr>("sym_name");
+      const std::string label = nameAttr ? nameAttr.getValue().str()
+                                         : op->getName().getStringRef().str();
+      AccessSummary &s = summaries[label];
+      op->walk([&](Operation *inner) {
+        const StringRef name = inner->getName().getStringRef();
         if (isLoad(name)) ++s.loads;
         else if (isStore(name)) ++s.stores;
         else if (isAtomic(name)) ++s.atomics;
@@ -107,12 +118,14 @@ class SimtAccessReport
         else if (isThreadId(name)) ++s.threadIds;
         if (isVector(name)) ++s.vectorOps;
       });
-    }
+    });
 
-    llvm::errs() << "rouge-simt-access-report: module '" << module.getName()
-                 << "'\n";
+    const StringAttr modAttr = module->getAttrOfType<StringAttr>("sym_name");
+    const std::string modName =
+        modAttr ? modAttr.getValue().str() : "(anonymous)";
+    llvm::errs() << "rouge-simt-access-report: module '" << modName << "'\n";
     if (summaries.empty()) {
-      llvm::errs() << "  (no operations to report)\n";
+      llvm::errs() << "  (no functions to report)\n";
       return;
     }
     for (const auto& entry : summaries) {
@@ -142,7 +155,7 @@ std::unique_ptr<Pass> createRougeSimtAccessReportPass() {
   return std::make_unique<SimtAccessReport>();
 }
 
-void registerRougeTransformsPasses() {
+void registerRougeSimtTransformsPasses() {
   PassRegistration<SimtAccessReport>();
 }
 

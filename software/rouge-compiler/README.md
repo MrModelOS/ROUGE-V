@@ -66,7 +66,7 @@ ctest --test-dir build --output-on-failure
 | `compiler_nvcc_gpu_exec` | вендорный PTX (`nvcc real_nvcc.cu`) сквозь ptx2ir исполняется на настоящей NVIDIA GPU (SKIP без nvcc или sm_75+) |
 | AMD-бэкенд — кросс-сборка | тот же IR с `addrspace(1)` (global) и `addrspace(5)` (shared) собирается в нативный объект `amdgcn-amd-amdhsa -mcpu=gfx1100` (5 ядер). Объект получен, но **ни разу не исполнялся** — AMD-видеокарты в проекте нет |
 | NVIDIA-бэкенд — кросс-сборка и исполнение | тот же IR с `addrspace(1)` (global) и `addrspace(3)` (shared) собирается в нативный объект `nvptx64-nvidia-cuda -march=sm_75` (10 ядер) и **исполняется на GeForce MX450** — см. `compiler_nvptx_gpu_exec*` выше |
-| `mlir_simt_access_report` | MLIR-контур: `rouge-opt --rouge-simt-access-report` (только с `-DROUGE_ENABLE_MLIR=ON` + MLIR) |
+| `mlir_simt_access_report` | MLIR-контур: `rouge-opt --rouge-simt-access-report` — отчёт по SIMT-паттернам (только с `-DROUGE_ENABLE_MLIR=ON` + MLIR; проверено на MLIR 23.1.3) |
 
 Цель выбирается флагом `--target` (см. ниже). Строки `*_backend` — это проверка
 **сборки**: бэкенд LLVM принял IR и выдал объект. Строки `*_gpu_exec` — проверка
@@ -149,6 +149,8 @@ launch-дескрипторе и `bar.sync` → рантайм-барьер. С�
 ## План расширения
 
 1. ~~атомики (`atom.*`/`red.*`) и FP16/BF16~~ ✅ (скалярный путь; RVV-векторизация — следующий шаг);
-2. MLIR: GPU-диалект → Vector, SIMT→RVV даунсэмплинг (контур стартовал: `mlir/` + `rouge-simt-access-report`);
+2. MLIR: GPU-диалект → Vector, SIMT→RVV даунсэмплинг (контур **собран и проверен**
+   на MLIR 23.1.3: `mlir/` + `rouge-simt-access-report`; следующий шаг —
+   GPU→Vector lowering);
 3. Hardware-Aware Passes: tiling, memory coalescing, double buffering;
 4. Backend-расширение `rv64gcv_xrouge` (matmul.mma) и рантайм с Command Queue.
