@@ -280,6 +280,28 @@ if(CLANG_EXECUTABLE)
     message(STATUS "compiler_rv_exec: SKIP (qemu-riscv64 not found)")
   endif()
 
+  # ---- Test 3c: a block kernel with bar.sync, with REAL threads, on RISC-V --
+  # Needs a riscv64 sysroot (ROUGE_RISCV64_SYSROOT); without it the test says
+  # SKIP honestly. Recipe for the sysroot is in the script header.
+  find_program(ROUGE_CLANGXX NAMES clang++ g++)
+  if(ROUGE_QEMU_RISCV64 AND ROUGE_CLANGXX AND ROUGE_RISCV64_SYSROOT)
+    add_test(NAME compiler_rv_exec_mt
+      COMMAND ${CMAKE_COMMAND}
+        -DCLANG=${CLANG_EXECUTABLE}
+        -DCLANGXX=${ROUGE_CLANGXX}
+        -DPTX2IR=$<TARGET_FILE:ptx2ir>
+        -DKERNEL=${CMAKE_CURRENT_SOURCE_DIR}/kernels/block_reduce.ptx
+        -DHARNESS=${CMAKE_CURRENT_SOURCE_DIR}/rv_exec_mt.c
+        -DRUNTIME=${CMAKE_CURRENT_SOURCE_DIR}/../runtime/rouge_runtime.cpp
+        -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/rv-exec-mt
+        -DQEMU=${ROUGE_QEMU_RISCV64}
+        -DSYSROOT=${ROUGE_RISCV64_SYSROOT}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/rv_exec_mt.cmake)
+  else()
+    message(STATUS "compiler_rv_exec_mt: SKIP (needs qemu-riscv64 + "
+                   "-DROUGE_RISCV64_SYSROOT=<prefix>)")
+  endif()
+
   # ---- Tests 5 + 6 (informational): GPU target matrix ----
   # ptx2ir --target <triple> must emit IR that carries the requested target
   # triple plus the target-correct GPU address spaces, and that IR must survive

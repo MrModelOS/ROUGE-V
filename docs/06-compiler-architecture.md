@@ -266,6 +266,7 @@ claim-проверки без гонок.
 | Экспорт `.shared`-раскладки в runtime (`__rouge_*_query`) | ✅ | `test_aot_block_reduce` без `kScratch` + `rouge_runtime.h` |
 | RVV-кросс-проверка (`rv64gcv`) — 3 ядра | ✅ | `ctest compiler_rvv_backend_*` |
 | Исполнение PTX-ядра на RISC-V (`rv64gcv`) под qemu-user | ✅ результат верен | `ctest compiler_rv_exec` (SKIP без qemu-riscv64). Ограничение зафиксировано: harness выполняет варп по одному lane (ядро `vadd` без барьеров); ядра с `bar.sync` требуют настоящих потоков и не заявлены |
+| Исполнение блокового ядра с `bar.sync` на RISC-V — настоящие потоки | ✅ результат верен | `ctest compiler_rv_exec_mt`: 4 блока × 32 потока, `bar.sync` через собственный рантайм (`rouge_smem_alloc` + `__rouge_syncthreads`). Требует riscv64-sysroot (`-DROUGE_RISCV64_SYSROOT=<prefix>`), иначе SKIP |
 | Выбор цели в `ptx2ir` (`--target`) + адресные пространства global/shared | ✅ | `ptx2ir --target amdgcn-amd-amdhsa vadd.ptx` — `addrspace(1)`/`addrspace(5)` |
 | Сборка под AMD GPU (`amdgcn-amd-amdhsa -mcpu=gfx1100`) — 5 ядер | ✅ сборка | `ptx2ir --target amdgcn-amd-amdhsa … && clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c` |
 | Сборка под NVIDIA GPU (`nvptx64-nvidia-cuda -march=sm_75`) — 10 ядер | ✅ сборка | `ptx2ir --target nvptx64-nvidia-cuda … && clang --target=nvptx64-nvidia-cuda -march=sm_75 -c` |
