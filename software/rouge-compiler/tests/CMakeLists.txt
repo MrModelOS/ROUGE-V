@@ -262,6 +262,24 @@ if(CLANG_EXECUTABLE)
         -P ${CMAKE_CURRENT_SOURCE_DIR}/check_rvv_backend.cmake)
   endforeach()
 
+  # ---- Test 3b: the same IR is not just compiled but RUN on RISC-V ----
+  # qemu-user executes the freestanding riscv64 binary; the kernel's result
+  # is checked there. Skips honestly when qemu-riscv64 is absent.
+  find_program(ROUGE_QEMU_RISCV64 NAMES qemu-riscv64 qemu-riscv64-static)
+  if(ROUGE_QEMU_RISCV64)
+    add_test(NAME compiler_rv_exec
+      COMMAND ${CMAKE_COMMAND}
+        -DCLANG=${CLANG_EXECUTABLE}
+        -DPTX2IR=$<TARGET_FILE:ptx2ir>
+        -DKERNEL=${CMAKE_CURRENT_SOURCE_DIR}/kernels/vadd.ptx
+        -DHARNESS=${CMAKE_CURRENT_SOURCE_DIR}/rv_exec_harness.c
+        -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/rv-exec
+        -DQEMU=${ROUGE_QEMU_RISCV64}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/rv_exec.cmake)
+  else()
+    message(STATUS "compiler_rv_exec: SKIP (qemu-riscv64 not found)")
+  endif()
+
   # ---- Tests 5 + 6 (informational): GPU target matrix ----
   # ptx2ir --target <triple> must emit IR that carries the requested target
   # triple plus the target-correct GPU address spaces, and that IR must survive

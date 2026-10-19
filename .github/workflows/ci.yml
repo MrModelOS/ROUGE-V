@@ -18,6 +18,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang ninja-build cmake
+          # qemu-user lets the RISC-V target actually RUN (not just compile):
+          # the freestanding riscv64 binary is executed under qemu-riscv64 and
+          # its result is checked. Without it that test reports SKIP.
+          sudo apt-get install -y qemu-user
 
       - name: Configure (rouge-compiler)
         run: cmake -S software/rouge-compiler -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
