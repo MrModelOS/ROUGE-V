@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <dlfcn.h>
 #include <random>
 #include <vector>
 
@@ -96,6 +97,23 @@ static void run_cblas(void *p) {
 }
 #endif
 
+// Число потоков BLAS: OpenBLAS по умолчанию берёт все ядра, а наше ядро
+// однопоточное (параллелизм только по split_k). Поэтому меряем оба режима:
+// 1 поток (честное сравнение «ядро против ядра») и режим по умолчанию.
+// Управление числом потоков есть только у OpenBLAS — ищем символ динамически,
+// чтобы не тянуть зависимость от него.
+static void blas_threads(int n) {
+  using setter_t = void (*)(int);
+  void *sym = dlsym(RTLD_DEFAULT, "openblas_set_num_threads");
+  if (!sym) sym = dlsym(RTLD_DEFAULT, "openblas_set_num_threads64_");
+  if (sym) reinterpret_cast<setter_t>(sym)(n);
+}
+
+static bool blas_has_threads() {
+  return dlsym(RTLD_DEFAULT, "openblas_set_num_threads") != nullptr ||
+         dlsym(RTLD_DEFAULT, "openblas_set_num_threads64_") != nullptr;
+}
+
 int main() {
   std::mt19937 rng(0xBE4Cu);
   std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -103,7 +121,7 @@ int main() {
   int failures = 0;
   std::printf("isa=%s %s\n", rouge_gemm_isa_variant(),
 #if defined(ROUGE_HAVE_CBLAS)
-              "blas=cblas(system)"
+              "blas=" ROUGE_BLAS_NAME
 #else
               "blas=naive-only(no cblas at build)"
 #endif
@@ -130,6 +148,23 @@ int main() {
       ++failures;
     }
 #if defined(ROUGE_HAVE_CBLAS)
+    // Однопоточный BLAS — сравнение «ядро против ядра» с нашим однопоточным
+    // микроядром.
+    if (blas_has_threads()) blas_threads(1);
+    const double t_cblas1 = bench(5, run_cblas, &ctx);
+    std::vector<float> bc1 = C;
+    md = 0;
+    sc = 1;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      md = std::max(md, std::fabs((double)got[i] - bc1[i]));
+      sc = std::max(sc, std::fabs((double)bc1[i]));
+    }
+    if (md / sc > 1e-5) {
+      std::printf("FAIL %dx%dx%d vs cblas(1 thread): %g\n", M, N, K, md / sc);
+      ++failures;
+    }
+    // Режим по умолчанию (сколько ядер решит взять сама BLAS).
+    if (blas_has_threads()) blas_threads(0);
     const double t_cblas = bench(5, run_cblas, &ctx);
     std::vector<float> bc = C;
     md = 0;
@@ -142,9 +177,10 @@ int main() {
       std::printf("FAIL %dx%dx%d vs cblas: %g\n", M, N, K, md / sc);
       ++failures;
     }
-    std::printf("%4dx%4dx%4d  rouge %7.3f GFLOP/s  cblas %7.3f GFLOP/s  naive %7.3f GFLOP/s\n",
-                M, N, K, flops / t_rouge / 1e9, flops / t_cblas / 1e9,
-                flops / t_naive / 1e9);
+    std::printf(
+        "%4dx%4dx%4d  rouge %7.3f GFLOP/s  cblas1 %7.3f  cblas(def) %7.3f  naive %7.3f GFLOP/s\n",
+        M, N, K, flops / t_rouge / 1e9, flops / t_cblas1 / 1e9,
+        flops / t_cblas / 1e9, flops / t_naive / 1e9);
 #else
     std::printf("%4dx%4dx%4d  rouge %7.3f GFLOP/s  naive %7.3f GFLOP/s\n", M,
                 N, K, flops / t_rouge / 1e9, flops / t_naive / 1e9);
@@ -173,6 +209,9 @@ int main() {
       ++failures;
     }
 #if defined(ROUGE_HAVE_CBLAS)
+    if (blas_has_threads()) blas_threads(1);
+    const double t_cblas1 = bench(5, run_cblas_d, &ctx);
+    if (blas_has_threads()) blas_threads(0);
     const double t_cblas = bench(5, run_cblas_d, &ctx);
     std::vector<double> bc = C;
     md = 0;
@@ -185,9 +224,9 @@ int main() {
       std::printf("FAIL f64 vs cblas: %g\n", md / sc);
       ++failures;
     }
-    std::printf("f64 %dx%dx%d  rouge %7.3f GFLOP/s  cblas %7.3f GFLOP/s  naive %7.3f GFLOP/s\n",
-                M, N, K, flops / t_rouge / 1e9, flops / t_cblas / 1e9,
-                flops / t_naive / 1e9);
+    std::printf("f64 %dx%dx%d  rouge %7.3f GFLOP/s  cblas1 %7.3f  cblas(def) %7.3f  naive %7.3f GFLOP/s\n",
+                M, N, K, flops / t_rouge / 1e9, flops / t_cblas1 / 1e9,
+                flops / t_cblas / 1e9, flops / t_naive / 1e9);
 #else
     std::printf("f64 %dx%dx%d  rouge %7.3f GFLOP/s  naive %7.3f GFLOP/s\n", M,
                 N, K, flops / t_rouge / 1e9, flops / t_naive / 1e9);

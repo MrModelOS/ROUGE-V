@@ -4,9 +4,40 @@ target_compile_options(test_gemm PRIVATE -Wall -Wextra)
 add_test(NAME gemm COMMAND test_gemm)
 
 # Внешние эталоны — только для тестов (библиотека от них не зависит):
-# системный CBLAS (сравнение L1/L2/L3) и FFTW single (сравнение FFT).
-find_path(CBLAS_INCLUDE_DIR cblas.h)
-find_library(CBLAS_LIBRARY NAMES cblas blas)
+#   * BLAS: OpenBLAS предпочтительно (ROUGE_OPENBLAS_ROOT — локальный префикс
+#     с openblas/{lib,include/openblas}), иначе системный CBLAS (это обычно
+#     reference BLAS — мы это печатаем, чтобы не выдавать его за OpenBLAS);
+#   * oneDNN (ROUGE_ONEDNN_ROOT) — эталон для свёртки;
+#   * FFTW single — эталон для FFT.
+set(ROUGE_OPENBLAS_ROOT "" CACHE PATH
+    "Local prefix with OpenBLAS: <prefix>/lib/libopenblas.so, <prefix>/include/openblas/cblas.h")
+set(ROUGE_ONEDNN_ROOT "" CACHE PATH
+    "Local prefix with oneDNN: <prefix>/lib/libdnnl.so, <prefix>/include/oneapi/dnnl/dnnl.h")
+if(ROUGE_OPENBLAS_ROOT)
+  find_library(OPENBLAS_LIBRARY NAMES openblas
+    HINTS ${ROUGE_OPENBLAS_ROOT}/lib NO_DEFAULT_PATH)
+  find_path(OPENBLAS_INCLUDE_DIR cblas.h
+    HINTS ${ROUGE_OPENBLAS_ROOT}/include/openblas NO_DEFAULT_PATH)
+endif()
+if(OPENBLAS_LIBRARY AND OPENBLAS_INCLUDE_DIR)
+  set(BLAS_LIB ${OPENBLAS_LIBRARY})
+  set(BLAS_INC ${OPENBLAS_INCLUDE_DIR})
+  set(BLAS_NAME "openblas")
+else()
+  find_path(CBLAS_INCLUDE_DIR cblas.h)
+  find_library(CBLAS_LIBRARY NAMES cblas blas)
+  if(CBLAS_LIBRARY AND CBLAS_INCLUDE_DIR)
+    set(BLAS_LIB ${CBLAS_LIBRARY})
+    set(BLAS_INC ${CBLAS_INCLUDE_DIR})
+    set(BLAS_NAME "system-cblas")
+  endif()
+endif()
+if(ROUGE_ONEDNN_ROOT)
+  find_library(DNNL_LIBRARY NAMES dnnl
+    HINTS ${ROUGE_ONEDNN_ROOT}/lib NO_DEFAULT_PATH)
+  find_path(DNNL_INCLUDE_DIR oneapi/dnnl/dnnl.h
+    HINTS ${ROUGE_ONEDNN_ROOT}/include NO_DEFAULT_PATH)
+endif()
 find_path(FFTW_INCLUDE_DIR fftw3.h)
 find_library(FFTWF_LIBRARY NAMES fftw3f)
 
@@ -75,9 +106,9 @@ add_test(NAME fft_sparse_rng COMMAND test_fft_sparse_rng)
 add_executable(test_blas1 test_blas1.cpp)
 target_link_libraries(test_blas1 PRIVATE rouge-numerics)
 target_compile_options(test_blas1 PRIVATE -Wall -Wextra)
-if(CBLAS_INCLUDE_DIR AND CBLAS_LIBRARY)
-  target_link_libraries(test_blas1 PRIVATE ${CBLAS_LIBRARY})
-  target_include_directories(test_blas1 PRIVATE ${CBLAS_INCLUDE_DIR})
+if(BLAS_LIB AND BLAS_INC)
+  target_link_libraries(test_blas1 PRIVATE ${BLAS_LIB})
+  target_include_directories(test_blas1 PRIVATE ${BLAS_INC})
   target_compile_definitions(test_blas1 PRIVATE ROUGE_HAVE_CBLAS=1)
 endif()
 add_test(NAME blas1 COMMAND test_blas1)
@@ -102,19 +133,26 @@ target_link_libraries(test_shims PRIVATE rouge-cublas rouge-cudnn rouge-numerics
 target_compile_options(test_shims PRIVATE -Wall -Wextra)
 add_test(NAME shims COMMAND test_shims)
 
-# Замер против системного BLAS (если есть cblas.h + библиотека — меряем
-# cblas_sgemm, иначе только наивный пол). Скорость — отчёт, падает тест
-# только на неверном результате.
-if(CBLAS_INCLUDE_DIR AND CBLAS_LIBRARY)
-  add_executable(bench_gemm_blas bench_gemm_blas.cpp)
-  target_link_libraries(bench_gemm_blas PRIVATE rouge-numerics ${CBLAS_LIBRARY})
-  target_include_directories(bench_gemm_blas PRIVATE ${CBLAS_INCLUDE_DIR})
-  target_compile_definitions(bench_gemm_blas PRIVATE ROUGE_HAVE_CBLAS=1)
-  target_compile_options(bench_gemm_blas PRIVATE -Wall -Wextra)
-  add_test(NAME bench_blas COMMAND bench_gemm_blas)
-else()
-  add_executable(bench_gemm_blas bench_gemm_blas.cpp)
-  target_link_libraries(bench_gemm_blas PRIVATE rouge-numerics)
-  target_compile_options(bench_gemm_blas PRIVATE -Wall -Wextra)
-  add_test(NAME bench_blas COMMAND bench_gemm_blas)
+# Замер против BLAS: OpenBLAS, если найден, иначе системный CBLAS (обычно
+# reference BLAS — имя печатается, чтобы не выдать его за OpenBLAS). Если
+# BLAS нет вовсе — только наивный пол. Скорость — отчёт, тест падает только
+# на неверном результате.
+add_executable(bench_gemm_blas bench_gemm_blas.cpp)
+target_link_libraries(bench_gemm_blas PRIVATE rouge-numerics)
+target_compile_options(bench_gemm_blas PRIVATE -Wall -Wextra)
+if(BLAS_LIB AND BLAS_INC)
+  target_link_libraries(bench_gemm_blas PRIVATE ${BLAS_LIB})
+  target_include_directories(bench_gemm_blas PRIVATE ${BLAS_INC})
+  target_compile_definitions(bench_gemm_blas PRIVATE
+    ROUGE_HAVE_CBLAS=1 ROUGE_BLAS_NAME="${BLAS_NAME}")
+endif()
+add_test(NAME bench_blas COMMAND bench_gemm_blas)
+
+# Замер свёртки против oneDNN (тот же im2col+свой GEMM против oneDNN).
+if(DNNL_LIBRARY AND DNNL_INCLUDE_DIR)
+  add_executable(bench_conv_dnnl bench_conv_dnnl.cpp)
+  target_link_libraries(bench_conv_dnnl PRIVATE rouge-numerics ${DNNL_LIBRARY})
+  target_include_directories(bench_conv_dnnl PRIVATE ${DNNL_INCLUDE_DIR})
+  target_compile_options(bench_conv_dnnl PRIVATE -Wall -Wextra)
+  add_test(NAME bench_dnnl COMMAND bench_conv_dnnl)
 endif()
