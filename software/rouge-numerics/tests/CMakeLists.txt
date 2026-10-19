@@ -57,6 +57,11 @@ target_link_libraries(test_gemm_fp8 PRIVATE rouge-numerics)
 target_compile_options(test_gemm_fp8 PRIVATE -Wall -Wextra)
 add_test(NAME gemm_fp8 COMMAND test_gemm_fp8)
 
+add_executable(test_narrow test_narrow.cpp)
+target_link_libraries(test_narrow PRIVATE rouge-numerics)
+target_compile_options(test_narrow PRIVATE -Wall -Wextra)
+add_test(NAME narrow COMMAND test_narrow)
+
 add_executable(test_gemm_f16 test_gemm_f16.cpp)
 target_link_libraries(test_gemm_f16 PRIVATE rouge-numerics)
 target_compile_options(test_gemm_f16 PRIVATE -Wall -Wextra)

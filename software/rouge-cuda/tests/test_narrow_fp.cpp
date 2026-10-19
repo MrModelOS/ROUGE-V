@@ -156,16 +156,27 @@ int main() {
   EXPECT_TRUE((encode2("e5m2x2", 60000.0f) & 0xff) == 0x7B);
   EXPECT_TRUE((encode2("e5m2x2", std::numeric_limits<float>::infinity()) & 0xff) == 0x7B);
   EXPECT_TRUE((encode2("e5m2x2", std::numeric_limits<float>::quiet_NaN()) & 0xff) == 0x7F);
-  EXPECT_TRUE((encode2("e3m2x2", 100.0f) & 0x3f) == 0x3F);
+  // FP6/FP4: насыщение обязано давать ПОЛОЖИТЕЛЬНЫЙ максимум (+28, +7.5,
+  // +6), а не -MAX. Раньше константа maxBits содержала знаковый бит, и
+  // satfinite(100.0) давал 0x3F = -28 (тихая порча знака). Найдено пробой
+  // при переносе этих таблиц в rouge-numerics; исправлено в интерпретаторе
+  // и в AOT-нижнинге, тест ниже — регрессия.
+  EXPECT_TRUE((encode2("e3m2x2", 100.0f) & 0x3f) == 0x1F);
   EXPECT_TRUE(encode2("e3m2x2", -100.0f) == 0x3F3F);  // -28: знак уже внутри поля
-  EXPECT_TRUE((encode2("e3m2x2", std::numeric_limits<float>::quiet_NaN()) & 0x3f) == 0x3F);
-  EXPECT_TRUE((encode2("e2m3x2", 100.0f) & 0x3f) == 0x3F);
+  EXPECT_TRUE((encode2("e3m2x2", std::numeric_limits<float>::quiet_NaN()) & 0x3f) == 0x1F);
+  EXPECT_TRUE((encode2("e2m3x2", 100.0f) & 0x3f) == 0x1F);
   EXPECT_TRUE(encode2("e2m3x2", -100.0f) == 0x3F3F);  // -7.5
-  EXPECT_TRUE((encode2("e2m3x2", std::numeric_limits<float>::quiet_NaN()) & 0x3f) == 0x3F);
-  EXPECT_TRUE(encode2("e2m1x2", 100.0f) == 0x3C3C);  // saturate в max-поле 0xF
+  EXPECT_TRUE((encode2("e2m3x2", std::numeric_limits<float>::quiet_NaN()) & 0x3f) == 0x1F);
+  EXPECT_TRUE(encode2("e2m1x2", 100.0f) == 0x1C1C);  // saturate в max-поле 0x7
   EXPECT_TRUE(encode2("e2m1x2", 6.0f) == 0x1C1C);
   EXPECT_TRUE(encode2("e2m1x2", 4.0f) == 0x1818);
   EXPECT_TRUE(encode2("e2m1x2", -6.0f) == 0x3C3C);
+  // Регрессия: положительное переполнение -> положительный максимум.
+  EXPECT_TRUE((encode2("e3m2x2", 1e30f) & 0x3f) == 0x1F);
+  EXPECT_TRUE((encode2("e2m3x2", 1e30f) & 0x3f) == 0x1F);
+  // e2m1 лежит в битах [5:2] контейнера: +6 -> 0x1C, -6 -> 0x3C.
+  EXPECT_TRUE((encode2("e2m1x2", 1e30f) & 0x3c) == 0x1c);
+  EXPECT_TRUE((encode2("e2m1x2", -1e30f) & 0x3c) == 0x3c);
 
   // --- encode: RNE ties ---
   // e4m3: 432 ровно посередине 384 (0x7C) и 448 (0x7E) -> чётный 0x7E.

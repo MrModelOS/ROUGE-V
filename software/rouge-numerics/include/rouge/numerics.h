@@ -199,6 +199,42 @@ float rouge_rng_normal_f32(RougeRng *rng);
 uint8_t rouge_quantize_e4m3(float f);
 float rouge_dequantize_e4m3(uint8_t u);
 
+/* Остальные узкие форматы — той же транскрипцией (OCP OFP8 Table 1-2 и
+ * OCP MX v1.0 Table 7):
+ *   e5m2: bias 15, max 57344 (0x7B), Inf 0x7C/0xFC, NaN 0x7F;
+ *   e3m2: bias 3, max 28; e2m3: bias 1, max 7.5; e2m1: bias 1, max 6
+ *   (у последних трёх нет ни Inf, ни NaN: NaN -> положительный MAX_NORM,
+ *   как в PTX cvt).
+ * e2m1 отдаётся 4-битным полем (знак + exp2 + 1 мантиссный бит). */
+uint8_t rouge_quantize_e5m2(float f);
+float rouge_dequantize_e5m2(uint8_t u);
+uint8_t rouge_quantize_e3m2(float f);
+float rouge_dequantize_e3m2(uint8_t u);
+uint8_t rouge_quantize_e2m3(float f);
+float rouge_dequantize_e2m3(uint8_t u);
+uint8_t rouge_quantize_e2m1(float f);
+float rouge_dequantize_e2m1(uint8_t u);
+
+/* Блочное масштабирование OCP MX v1.0:
+ *   MXFP8: блок из 32 элементов, общий масштаб E8M0 (степень двойки),
+ *     элементы e4m3 (elem_bytes=1) или e5m2 (elem_bytes=2);
+ *   MXFP4: блок из 32 элементов e2m1, общий масштаб E8M0;
+ *   NVFP4: блок из 16 элементов e2m1, масштаб блока E4M3 + глобальный FP32.
+ * Масштаб подбирается так, чтобы максимум блока влезал в диапазон
+ * элементного формата БЕЗ обрезки. Возвращается число блоков; при
+ * некорректных аргументах — 0. */
+int rouge_mx_quantize_f32(const float *x, int n, int elem_bytes, uint8_t *out,
+                          uint8_t *scale_out);
+int rouge_mx_quantize_f32_e2m1(const float *x, int n, uint8_t *out,
+                                uint8_t *scale_out);
+int rouge_nvfp4_quantize_f32(const float *x, int n, float global_scale,
+                             uint8_t *out, uint8_t *scale_out);
+/* Обратные операции (элементы и масштабы -> f32). */
+void rouge_mx_dequantize_f32(const uint8_t *in, const uint8_t *scales, int n,
+                             int elem_bytes, float *out);
+void rouge_mx_dequantize_f32_e2m1(const uint8_t *in, const uint8_t *scales,
+                                  int n, float *out);
+
 /* FP16/BF16 (Wave 2): квантование RNE; f16 — IEEE 754 half (переполнение в
  * Inf), bf16 — округление старших 16 бит (переполнение в Inf).
  * NaN -> канонический NaN, signed zero хранится. */

@@ -617,11 +617,15 @@ uint32_t narrow_unpack(uint32_t container, const NarrowFpFormat& F) {
   return (container >> F.fieldShift) & mask;
 }
 
+// maxBits — битовый образ MAX_NORM БЕЗ знака (в поле формата): знаковый бит
+// обязан быть нулём, иначе насыщение при положительном переполнении
+// затирает знак результата и даёт -MAX вместо +MAX (поймано пробой
+// satfinite для e3m2/e2m3/e2m1: 1000.0 -> 0x3F = -28 вместо 0x1F = +28).
 const NarrowFpFormat kE4M3 = {4, 3, 7, 0x7Eu, 0x7Fu, 8, 0, 8};
 const NarrowFpFormat kE5M2 = {5, 2, 15, 0x7Bu, 0x7Fu, 8, 0, 8};
-const NarrowFpFormat kE3M2 = {3, 2, 3, 0x3Fu, 0x00u, 8, 0, 6};
-const NarrowFpFormat kE2M3 = {2, 3, 1, 0x3Fu, 0x00u, 8, 0, 6};
-const NarrowFpFormat kE2M1 = {2, 1, 1, 0x0Fu, 0x00u, 8, 2, 4};
+const NarrowFpFormat kE3M2 = {3, 2, 3, 0x1Fu, 0x00u, 8, 0, 6};
+const NarrowFpFormat kE2M3 = {2, 3, 1, 0x1Fu, 0x00u, 8, 0, 6};
+const NarrowFpFormat kE2M1 = {2, 1, 1, 0x07u, 0x00u, 8, 2, 4};
 
 }  // namespace
 

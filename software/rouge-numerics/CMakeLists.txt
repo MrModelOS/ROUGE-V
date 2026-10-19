@@ -32,6 +32,7 @@ add_library(rouge-numerics STATIC
   src/autotune.cpp
   src/fp8.cpp
   src/fp16.cpp
+  src/narrow.cpp
   src/conv.cpp
   src/conv_implicit.cpp
   src/conv_backward.cpp

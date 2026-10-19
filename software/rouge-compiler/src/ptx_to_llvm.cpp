@@ -3007,11 +3007,14 @@ class LlvmGen {
     bool nanToMax;              // NaN -> positive MAX_NORM (FP6/FP4 rule)
   };
   static bool narrow_fmt(const std::string& name, NarrowFmt* out) {
+    // maxBits — MAX_NORM БЕЗ знакового бита (в том же смысле, что в
+    // интерпретаторе): со знаком насыщение при положительном переполнении
+    // давало -MAX вместо +MAX. Константы синхронны с интерпретатором.
     if (name == "e4m3x2") *out = {4, 3, 7, 0x7E, 0x7F, 0, 8, false};
     else if (name == "e5m2x2") *out = {5, 2, 15, 0x7B, 0x7F, 0, 8, false};
-    else if (name == "e3m2x2") *out = {3, 2, 3, 0x3F, 0, 0, 6, true};
-    else if (name == "e2m3x2") *out = {2, 3, 1, 0x3F, 0, 0, 6, true};
-    else if (name == "e2m1x2") *out = {2, 1, 1, 0x0F, 0, 2, 4, true};
+    else if (name == "e3m2x2") *out = {3, 2, 3, 0x1F, 0, 0, 6, true};
+    else if (name == "e2m3x2") *out = {2, 3, 1, 0x1F, 0, 0, 6, true};
+    else if (name == "e2m1x2") *out = {2, 1, 1, 0x07, 0, 2, 4, true};
     else return false;
     return true;
   }
