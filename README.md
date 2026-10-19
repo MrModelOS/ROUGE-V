@@ -109,7 +109,7 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 | `--target` | Platform | Backend flags | What is actually verified |
 |---|---|---|---|
 | *(default)* `x86_64-pc-linux-gnu` | host x86-64 | — | compiles **and executes** — the `aot_native_*` ctest suite |
-| `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | compiles to a native object — `ctest compiler_rvv_backend_*` |
+| `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | compiles to a native object — `ctest compiler_rvv_backend_*`; a barrier-free kernel also **runs** under `qemu-riscv64` — `ctest compiler_rv_exec` (one lane at a time; kernels with `bar.sync` need real threads and are not claimed) |
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | compiles to a native object — never executed |
 | `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | compiles **and executes on a real GPU** — see below |
 
@@ -178,11 +178,30 @@ $ ctest --test-dir build
 | [`rouge-ptx`](software/rouge-ptx/) | Shared PTX front-end: parser + reference interpreter |
 | [`rouge-compiler`](software/rouge-compiler/) | `ptx2ir`, the AOT translator; host runtime; MLIR contour |
 | [`rouge-cuda`](software/rouge-cuda/) | CUDA Driver/Runtime API interposition and fallback execution path |
+| [`rouge-numerics`](software/rouge-numerics/) | Own open math: GEMM (f32/f64/f16/bf16/FP8/complex), convolution, attention, FFT, sparse, RNG — plus cuBLAS/cuDNN compat shims over that code |
 
 Both execution paths are built on the same parser. That is deliberate: one
 grammar, one set of rules for registers, parameters, `.shared` layout and
 labels, so the paths cannot drift apart. The suite is built around the
 requirement that they agree bit-for-bit on every kernel.
+
+### Own math instead of NVIDIA's libraries
+
+`rouge-numerics` is the "replace closed with open" half of the project: our
+own kernels (not wrappers) and, on top of them, cuBLAS/cuDNN-API shims so
+code written against those APIs runs here. Measured against the real open
+libraries on the same machine (i5-1135G7, every number from a run):
+
+| Comparison | Ours | Open reference | Verdict |
+|---|---|---|---|
+| GEMM f32 128³, 1 thread | ~88 GFLOP/s | OpenBLAS 0.3.34: ~104 | we lose by 1.2× |
+| Convolution 3×3, 7 shapes | 0.21–4.55 ms | oneDNN 3.11.3: 3.1–194.8 ms | we are 12–43× faster |
+| FFT 4096 | 0.077 ms | FFTW 3.7.11: 0.006 ms | we lose by 13× |
+
+The losses are stated in the README of that component, not hidden. The
+`foreign_cublas_program` test closes the loop: a program linked against
+**NVIDIA's own libcublas** computes on our shim, on a machine with no
+NVIDIA present, and prints exactly what the real cuBLAS printed on the GPU.
 
 ### Supported PTX
 

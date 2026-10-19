@@ -77,7 +77,7 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 | `--target` | 平台 | 后端参数 | 实际验证到的内容 |
 |---|---|---|---|
 | *(默认)* `x86_64-pc-linux-gnu` | x86-64 主机 | —— | **构建并执行** —— `aot_native_*` ctest 套件 |
-| `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | 构建为原生目标文件 —— `ctest compiler_rvv_backend_*` |
+| `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | 构建为原生目标文件 —— `ctest compiler_rvv_backend_*`；无屏障的内核还会在 `qemu-riscv64` 下**实际运行** —— `ctest compiler_rv_exec`（每次执行一个 lane；带 `bar.sync` 的内核需要真正的线程，未作声明） |
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | 构建为原生目标文件 —— 从未执行 |
 | `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | 构建**并在真实 GPU 上执行** —— 见下文 |
 

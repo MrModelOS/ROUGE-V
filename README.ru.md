@@ -79,7 +79,7 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 | `--target` | Платформа | Флаги бэкенда | Что на самом деле проверено |
 |---|---|---|---|
 | *(по умолчанию)* `x86_64-pc-linux-gnu` | хост x86-64 | — | собирается **и исполняется** — тесты `aot_native_*` |
-| `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | собирается в нативный объект — `ctest compiler_rvv_backend_*` |
+| `riscv64-unknown-elf` | RISC-V + Vector | `-march=rv64gcv` | собирается в нативный объект — `ctest compiler_rvv_backend_*`; ядро без барьеров ещё и **выполняется** под `qemu-riscv64` — `ctest compiler_rv_exec` (по одному lane; ядра с `bar.sync` требуют настоящих потоков и не заявлены) |
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | собирается в нативный объект — не исполнялось |
 | `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | собирается **и исполняется на настоящей видеокарте** — см. ниже |
 
