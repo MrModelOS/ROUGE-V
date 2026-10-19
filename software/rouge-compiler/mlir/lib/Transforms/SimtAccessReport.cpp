@@ -157,6 +157,8 @@ std::unique_ptr<Pass> createRougeSimtAccessReportPass() {
 
 void registerRougeSimtTransformsPasses() {
   PassRegistration<SimtAccessReport>();
+  // The rewriting pass (SIMT -> SCF) is NOT enabled yet: it lives in its own
+  // translation unit and is not part of the library. See mlir/README.md.
 }
 
 }  // namespace rouge

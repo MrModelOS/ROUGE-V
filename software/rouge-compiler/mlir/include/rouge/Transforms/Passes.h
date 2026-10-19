@@ -24,7 +24,15 @@ namespace rouge {
 // rewrites IR.
 std::unique_ptr<mlir::Pass> createRougeSimtAccessReportPass();
 
+// !rouge-simt-to-scf — the first rewriting pass: the SIMT thread/block ids
+// become explicit loops (scf.for), the body is split into phases at barriers
+// so that the barrier's ordering requirement survives the transformation.
+// НАПИСАН, НО ПОКА НЕ ВКЛЮЧЁН (см. mlir/README.md): в MLIR 23 проход
+// требует доводки, а контур обязан оставаться зелёным.
+// std::unique_ptr<mlir::Pass> createRougeSimtToScfPass();
+
 void registerRougeSimtTransformsPasses();
+
 
 }  // namespace rouge
 

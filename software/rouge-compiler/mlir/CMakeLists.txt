@@ -27,6 +27,10 @@ endif()
 message(STATUS "rouge MLIR contour: building against MLIR ${MLIR_VERSION}")
 
 # ---- pass library ------------------------------------------------------
+# SimtToScf.cpp (проход SIMT->SCF) НЕ включён: он написан, но в MLIR 23
+# требует доводки (см. mlir/README.md, раздел «SIMT -> SCF: что нашли»).
+# Включать его в сборку с падающим верификатором нельзя: контур должен
+# оставаться зелёным.
 add_library(rouge-mlir-passes STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtAccessReport.cpp)
 target_include_directories(rouge-mlir-passes PUBLIC
@@ -36,7 +40,12 @@ target_include_directories(rouge-mlir-passes PUBLIC
 target_link_libraries(rouge-mlir-passes PUBLIC
   MLIRIR
   MLIRPass
-  MLIRSupport)
+  MLIRSupport
+  MLIRArithDialect
+  MLIRControlFlowDialect
+  MLIRFuncDialect
+  MLIRMemRefDialect
+  MLIRSCFDialect)
 target_compile_options(rouge-mlir-passes PRIVATE ${LLVM_COMPILE_OPTIONS})
 if(NOT LLVM_ENABLE_RTTI)
   target_compile_options(rouge-mlir-passes PUBLIC -fno-rtti)
@@ -52,7 +61,9 @@ target_link_libraries(rouge-opt PRIVATE
   MLIRSupport
   MLIRFuncDialect
   MLIRArithDialect
+  MLIRControlFlowDialect
   MLIRMemRefDialect
+  MLIRSCFDialect
   MLIRGPUDialect
   MLIRVectorDialect)
 
