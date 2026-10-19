@@ -34,6 +34,13 @@ foreach(req CLANG PTX2IR RUNNER KERNEL_DIR WORK_DIR CELLS SM)
   endif()
 endforeach()
 
+# SUBDIR: where the kernel .ptx files live inside KERNEL_DIR (default: the
+# canonical hand-written kernels in kernels/; "cuda" holds our own CUDA C
+# kernels compiled by the user's nvcc).
+if(NOT DEFINED SUBDIR OR "${SUBDIR}" STREQUAL "")
+  set(SUBDIR "")
+endif()
+
 foreach(req CLANG PTX2IR RUNNER)
   if(NOT EXISTS "${${req}}")
     message(STATUS "gpu exec: SKIP (${req} not found: ${${req}})")
@@ -67,7 +74,7 @@ function(rouge_exec_cell kernel selector)
 
   execute_process(
     COMMAND "${PTX2IR}" --target nvptx64-nvidia-cuda ${entry_args}
-            "${KERNEL_DIR}/${kernel}.ptx" "${ll}"
+            "${KERNEL_DIR}/${SUBDIR}/${kernel}.ptx" "${ll}"
     RESULT_VARIABLE rc
     OUTPUT_VARIABLE out
     ERROR_VARIABLE err)
@@ -124,8 +131,8 @@ foreach(cell IN LISTS MATRIX_CELLS)
   endif()
   list(GET parts 0 kernel)
   list(GET parts 1 selector)
-  if(NOT EXISTS "${KERNEL_DIR}/${kernel}.ptx")
-    message(FATAL_ERROR "gpu exec: FAILED - missing kernel ${KERNEL_DIR}/${kernel}.ptx")
+  if(NOT EXISTS "${KERNEL_DIR}/${SUBDIR}/${kernel}.ptx")
+    message(FATAL_ERROR "gpu exec: FAILED - missing kernel ${KERNEL_DIR}/${SUBDIR}/${kernel}.ptx")
   endif()
   rouge_exec_cell("${kernel}" "${selector}")
 endforeach()

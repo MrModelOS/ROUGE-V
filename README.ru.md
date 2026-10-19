@@ -180,7 +180,8 @@ $ ctest --test-dir build
 | Параметры | `ld.param.{u32,u64}` и знаковые/битовые варианты |
 | Пересылки | `mov.*`, `cvta.to.global.*`, `cvta.to.shared.*` |
 | Арифметика | `add` `sub` `mul` `div` `rem`, `mad.lo` `mad.hi`, `mul.wide.*` |
-| Побитовые / сдвиги | `and` `or` `xor` `not`, `shl`, `shr.{u,s}`, `bfi` `bfe` |
+| Побитовые / сдвиги | `and` `or` `xor` `not`, `shl`, `shr.{u,s}`, `bfi` `bfe`, `prmt.b32` |
+| Байтовые скалярные произведения | `dp4a.{s,u}32.{s,u}32`, `dp2a.{lo,hi}.{s,u}32.{s,u}32` |
 | Сравнения | `setp.{ge,gt,lt,le,eq,ne}.{u32,s32,f32}` |
 | Выбор | `selp.*`, `slct.*`, предикаты `and` `or` `not` |
 | Минимум / максимум / унарные | `min` `max.*`, `neg`, `abs`, `popc`, `clz`, `bfind.shiftamt` |

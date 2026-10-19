@@ -239,7 +239,8 @@ Two pieces of the stack that exist so that nothing has to be closed:
 | Parameters | `ld.param.{u32,u64}` and signed/bit variants |
 | Moves | `mov.*`, `cvta.to.global.*`, `cvta.to.shared.*` |
 | Arithmetic | `add` `sub` `mul` `div` `rem`, `mad.lo` `mad.hi`, `mul.wide.*` |
-| Bitwise / shift | `and` `or` `xor` `not`, `shl`, `shr.{u,s}`, `bfi` `bfe` |
+| Bitwise / shift | `and` `or` `xor` `not`, `shl`, `shr.{u,s}`, `bfi` `bfe`, `prmt.b32` |
+| Byte dot products | `dp4a.{s,u}32.{s,u}32`, `dp2a.{lo,hi}.{s,u}32.{s,u}32` |
 | Compare | `setp.{ge,gt,lt,le,eq,ne}.{u32,s32,f32}` |
 | Select | `selp.*`, `slct.*`, predicate `and` `or` `not` |
 | Min / max / unary | `min` `max.*`, `neg`, `abs`, `popc`, `clz`, `bfind.shiftamt` |

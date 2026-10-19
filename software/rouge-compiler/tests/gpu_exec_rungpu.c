@@ -356,6 +356,142 @@ static int test_vadd(CUmodule mod) {
 }
 
 // ---------------------------------------------------------------------------
+// kernel: prmt_dp4a -- byte permute and byte dot products.
+//
+// The expected values are the PTX ISA semantics (9.7.10.7 for prmt,
+// 9.7.1.24/9.7.1.25 for dp4a/dp2a), read out of the canonical kernel's
+// header. The same kernel is checked AOT-vs-interpreter on the host, so the
+// card, the AOT and the interpreter must all agree.
+// ---------------------------------------------------------------------------
+static int test_prmt_dp4a(CUmodule mod) {
+  printf("  config: one thread, seven modes (prmt x3, dp4a x3, dp2a x1)\n");
+  CUfunction fn;
+  CK(cuModuleGetFunction(&fn, mod, "prmt_dp4a"));
+
+  typedef struct { unsigned a, b, mode, want; } Case;
+  // prmt: source bytes are the 64-bit value {b, a} counted from the low end
+  // (index 0..3 are a's bytes, 4..7 are b's); field i of the selector picks
+  // the byte for d.bi.
+  const Case cases[] = {
+      // sel 0x7604: d.b0<-src[4]=b0, d.b1<-src[0]=a0, d.b2<-src[6]=b2, d.b3<-src[7]=b3
+      {0x01020304u, 0x0A0B0C0Du, 0u, 0x0A0B040Du},
+      // sel 0x0123: the bytes of a in reverse order
+      {0x01020304u, 0x0A0B0C0Du, 1u, 0x04030201u},
+      // sel 0x3210: the bytes of a in order
+      {0x01020304u, 0x0A0B0C0Du, 2u, 0x01020304u},
+      // dp4a.s32.s32 over bytes with the high bit set
+      {0x81828384u, 0x8A8B8C8Du, 3u, 58488u},
+      // dp4a.u32.u32: the same bytes read as unsigned
+      {0x81828384u, 0x8A8B8C8Du, 4u, 72824u},
+      // dp4a.s32.s32 with a non-zero accumulator
+      {0x81828384u, 0x8A8B8C8Du, 5u, 70833u},
+      // dp2a.lo.s32.s32: the 16-bit halves of a times the low byte pair of b
+      {0x00008384u, 0x00008C8Du, 6u, 3664827u},
+  };
+
+  CUdeviceptr d;
+  CK(cuMemAlloc(&d, 4));
+  int bad = 0;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    unsigned a = cases[i].a, b = cases[i].b, mode = cases[i].mode, got = 0;
+    void* args[] = {&d, &a, &b, &mode};
+    CK(cuLaunchKernel(fn, 1, 1, 1, 1, 1, 1, 0, 0, args, 0));
+    CUresult r = cuCtxSynchronize();
+    if (r != CUDA_SUCCESS) {
+      printf("  MISMATCH: launch/sync failed: %s (%s)\n", cuerr(r), cuerrstr(r));
+      return 3;
+    }
+    CK(cuMemcpyDtoH(&got, d, 4));
+    if (got != cases[i].want) {
+      printf("  MISMATCH mode %u: got 0x%08x want 0x%08x\n", mode, got, cases[i].want);
+      ++bad;
+    }
+  }
+  cuMemFree(d);
+  if (!bad) {
+    printf("  OK: prmt/dp4a/dp2a verified against the PTX ISA semantics\n");
+    return 0;
+  }
+  printf("  MISMATCH: %d of %zu modes wrong\n", bad, sizeof(cases) / sizeof(cases[0]));
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// kernel: int8_gemm -- tiled INT8 GEMM with int32 accumulation.
+//
+// Our own CUDA C kernel (kernels/cuda/int8_gemm.cu), compiled by the user's
+// nvcc into PTX and then translated by OUR ptx2ir. The arithmetic is
+// INTEGER, so the card's answer must equal the host's answer bit for bit --
+// no tolerance, no float involved. The host reference is the same int32
+// accumulation our numerics library does in rouge_gemm_i8.
+// ---------------------------------------------------------------------------
+static int test_int8_gemm(CUmodule mod) {
+  const int M = 61, N = 37, K = 83;  // deliberately not multiples of the tile
+  const int TILE = 16;
+  const int gx = (N + TILE - 1) / TILE, gy = (M + TILE - 1) / TILE;
+  printf("  config: M=%d N=%d K=%d blockDim=(%d,%d,1) gridDim=(%d,%d,1), int32 accumulate\n",
+         M, N, K, TILE, TILE, gx, gy);
+
+  CUfunction fn;
+  CK(cuModuleGetFunction(&fn, mod, "int8_gemm_kernel"));
+
+  signed char* ha = (signed char*)malloc((size_t)M * K);
+  signed char* hb = (signed char*)malloc((size_t)K * N);
+  int* hc = (int*)malloc((size_t)M * N * sizeof(int));
+  int* he = (int*)malloc((size_t)M * N * sizeof(int));
+  // Pseudo-random bytes over the whole signed range, including the extremes
+  // (-128, 127) so the sign handling of dp4a is exercised.
+  uint32_t st = 0x1234567u;
+  for (size_t i = 0; i < (size_t)M * K; ++i) {
+    st = st * 1664525u + 1013904223u;
+    ha[i] = (signed char)(st >> 13);
+  }
+  for (size_t i = 0; i < (size_t)K * N; ++i) {
+    st = st * 1664525u + 1013904223u;
+    hb[i] = (signed char)(st >> 13);
+  }
+  // Host reference: exact int32 accumulation, same order-independent sum.
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      int acc = 0;
+      for (int k = 0; k < K; ++k) acc += (int)ha[(size_t)m * K + k] * (int)hb[(size_t)k * N + n];
+      he[(size_t)m * N + n] = acc;
+    }
+
+  CUdeviceptr da, db, dc;
+  CK(cuMemAlloc(&da, (size_t)M * K));
+  CK(cuMemAlloc(&db, (size_t)K * N));
+  CK(cuMemAlloc(&dc, (size_t)M * N * sizeof(int)));
+  CK(cuMemcpyHtoD(da, ha, (size_t)M * K));
+  CK(cuMemcpyHtoD(db, hb, (size_t)K * N));
+  CK(cuMemcpyDtoH(hc, dc, 0));
+
+  int mm = M, nn = N, kk = K;
+  void* args[] = {&da, &db, &dc, &mm, &nn, &kk};
+  CK(cuLaunchKernel(fn, gx, gy, 1, TILE, TILE, 1, 0, 0, args, 0));
+  CUresult r = cuCtxSynchronize();
+  if (r != CUDA_SUCCESS) {
+    printf("  MISMATCH: launch/sync failed: %s (%s)\n", cuerr(r), cuerrstr(r));
+    return 3;
+  }
+  CK(cuMemcpyDtoH(hc, dc, (size_t)M * N * sizeof(int)));
+
+  int bad = 0, first = -1;
+  for (size_t i = 0; i < (size_t)M * N; ++i)
+    if (hc[i] != he[i]) {
+      if (first < 0) first = (int)i;
+      bad++;
+    }
+  if (!bad) {
+    printf("  OK: int8 GEMM %dx%dx%d verified bit-exactly (int32)\n", M, N, K);
+    return 0;
+  }
+  printf("  MISMATCH: %d of %d elements wrong, first at (m=%d,n=%d): got %d want %d\n", bad, M * N,
+         first / N, first % N, hc[first], he[first]);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
 // kernel: block_reduce -- out[ctaid.x] = sum(data[ctaid.x*ntid.x .. +ntid.x))
 // ---------------------------------------------------------------------------
 static int test_block_reduce(CUmodule mod) {
@@ -1254,6 +1390,18 @@ int main(int argc, char** argv) {
     printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
     if (rc && g_exit_code == 0) g_exit_code = rc;
   }
+  if (all || strcmp(kname, "prmt_dp4a") == 0) {
+    printf("== prmt_dp4a ==\n");
+    rc = test_prmt_dp4a(mod);
+    printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
+    if (rc && g_exit_code == 0) g_exit_code = rc;
+  }
+  if (all || strcmp(kname, "int8_gemm") == 0) {
+    printf("== int8_gemm ==\n");
+    rc = test_int8_gemm(mod);
+    printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
+    if (rc && g_exit_code == 0) g_exit_code = rc;
+  }
   if (all || strcmp(kname, "block_reduce") == 0) {
     printf("== block_reduce ==\n");
     rc = test_block_reduce(mod);
@@ -1360,7 +1508,8 @@ int main(int argc, char** argv) {
       strcmp(kname, "shfl_reduce") && strcmp(kname, "atom_cas") &&
       strcmp(kname, "shfl_pred") && strcmp(kname, "vote_pred") &&
       strcmp(kname, "shfl_pred_all") && strcmp(kname, "foreign_vadd") &&
-      strcmp(kname, "matrixmul16") &&
+      strcmp(kname, "matrixmul16") && strcmp(kname, "int8_gemm") &&
+      strcmp(kname, "prmt_dp4a") &&
       strcmp(kname, "ldmatrix_sm75") &&
       strcmp(kname, "fp16_reduceB") && strcmp(kname, "gemm_tileB") &&
       strcmp(kname, "gemm_tile2")) {

@@ -1523,6 +1523,103 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
       return 1;
     }
 
+    // ---- dp4a / dp2a: dot product of byte pairs ---------------------------
+    // nvcc emits dp4a for int8 dot products (the whole point of int8 GEMM),
+    // so real PTX needs it. Semantics (PTX ISA 9.7.1.24/9.7.1.25):
+    //   dp4a.atype.btype d, a, b, c:
+    //     Va = the four bytes of a (sign/zero extended per .atype),
+    //     Vb = the four bytes of b (per .btype),
+    //     d = c + sum_i Va[i] * Vb[i].
+    //   dp2a.mode.atype.btype d, a, b, c:
+    //     Va = the two 16-bit halves of a (per .atype),
+    //     Vb = the four bytes of b (per .btype),
+    //     b_select = (mode == .lo) ? 0 : 2,
+    //     d = c + Va[0]*Vb[b_select] + Va[1]*Vb[b_select+1].
+    if (op.rfind("dp4a.", 0) == 0 || op.rfind("dp2a.", 0) == 0) {
+      if (A.size() < 4) { if (error) *error = "bad " + op + " in " + fn.name; return 0; }
+      const uint64_t a = operand_u64(st, A[1]);
+      const uint64_t b = operand_u64(st, A[2]);
+      const uint64_t c = operand_u64(st, A[3]);
+      const bool wide = op.rfind("dp4a.", 0) == 0;
+      // .mode applies to dp2a only: .lo uses the low byte pair of b.
+      const bool use_low = wide || (op.find(".lo.") != std::string::npos);
+      // .atype applies to a, .btype to b. Token layout:
+      //   dp4a.atype.btype  |  dp2a.mode.atype.btype
+      std::vector<std::string> tok;
+      {
+        std::string cur;
+        for (char ch : op) {
+          if (ch == '.') { tok.push_back(cur); cur.clear(); }
+          else cur.push_back(ch);
+        }
+        tok.push_back(cur);
+      }
+      const size_t at_idx = wide ? 1u : 2u;   // индекс .atype в tok
+      const std::string atype = tok.size() > at_idx ? tok[at_idx] : std::string("u32");
+      const std::string btype = tok.size() > at_idx + 1u ? tok[at_idx + 1u] : std::string("u32");
+      const bool a_signed = atype == "s32";
+      const bool b_signed = btype == "s32";
+      int64_t sum = 0;
+      if (wide) {
+        for (int i = 0; i < 4; ++i) {
+          const uint64_t am = (a >> (8 * i)) & 0xffull;
+          const uint64_t bm = (b >> (8 * i)) & 0xffull;
+          const int64_t av = a_signed ? (int64_t)(int8_t)am : (int64_t)am;
+          const int64_t bv = b_signed ? (int64_t)(int8_t)bm : (int64_t)bm;
+          sum += av * bv;
+        }
+      } else {
+        for (int i = 0; i < 2; ++i) {
+          const uint64_t am = (a >> (16 * i)) & 0xffffull;
+          const int64_t av = a_signed ? (int64_t)(int16_t)am : (int64_t)am;
+          const int bi = (use_low ? 0 : 2) + i;
+          const uint64_t bm = (b >> (8 * bi)) & 0xffull;
+          const int64_t bv = b_signed ? (int64_t)(int8_t)bm : (int64_t)bm;
+          sum += av * bv;
+        }
+      }
+      const uint64_t r = static_cast<uint64_t>(c) + static_cast<uint64_t>(sum);
+      st.setreg(A[0], width_mask(r, 32));
+      st.pc = next_pc;
+      return 1;
+    }
+
+    // ---- prmt.b32: byte permute -------------------------------------------
+    // nvcc uses prmt to pack bytes (four byte loads into one 32-bit store is
+    // the typical case), so real PTX needs it — otherwise even a trivial
+    // int8 kernel cannot be translated.
+    // Semantics (PTX ISA 9.7.10.7): the eight source bytes are the 64-bit
+    // value {b, a} counted from the low end, i.e. index 0..3 are a's bytes
+    // and 4..7 are b's. Each 4-bit field of c selects the source byte for
+    // d.b0..d.b3 (field 0 -> d.b0); the field's msb asks for the byte's SIGN
+    // to be replicated over the whole 8-bit target position instead of the
+    // literal byte.
+    if (op.rfind("prmt.", 0) == 0) {
+      if (A.size() < 4) { if (error) *error = "bad " + op + " in " + fn.name; return 0; }
+      const uint32_t a = static_cast<uint32_t>(operand_u64(st, A[1]));
+      const uint32_t b = static_cast<uint32_t>(operand_u64(st, A[2]));
+      const uint32_t c = static_cast<uint32_t>(operand_u64(st, A[3]));
+      // The mode field (c bits 19:16) must be zero; the other modes have
+      // different semantics and are refused loudly rather than guessed.
+      if (((c >> 16) & 0xfu) != 0u) {
+        if (error) *error = "unsupported prmt mode in " + fn.name;
+        return 0;
+      }
+      const uint64_t src = (uint64_t)a | ((uint64_t)b << 32);
+      uint32_t d = 0;
+      for (int i = 0; i < 4; ++i) {
+        const unsigned field = (c >> (4 * i)) & 0xfu;
+        const unsigned sel = field & 0x7u;
+        const uint32_t byte = (uint32_t)((src >> (sel * 8)) & 0xffu);
+        // msb of the field: replicate the sign of the selected byte.
+        const uint32_t val = (field & 0x8u) ? ((byte & 0x80u) ? 0xffu : 0x00u) : byte;
+        d |= val << (8 * i);
+      }
+      st.setreg(A[0], width_mask(d, 32));
+      st.pc = next_pc;
+      return 1;
+    }
+
     // ---- neg / abs / popc / clz / bfind.shiftamt --------------------------
     if (op.rfind("neg.", 0) == 0 || op.rfind("abs.", 0) == 0 ||
         op.rfind("popc.", 0) == 0 || op.rfind("clz.", 0) == 0 ||

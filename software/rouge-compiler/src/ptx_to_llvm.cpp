@@ -298,6 +298,14 @@ class LlvmGen {
     line("  " + v + " = load " + ty + ", " + pt("%" + reg) + " %" + reg + ", align " + align_of(ty));
     return v;
   }
+  // Widen a value to i64 (zext). Literals and i64 values pass through; this
+  // keeps the prmt lowering readable.
+  std::string zext_to_i64(const std::string& v, const std::string& ty) {
+    if (ty == "i64") return v;
+    const std::string w = fresh("%zx");
+    line("  " + w + " = zext " + ty + " " + v + " to i64");
+    return w;
+  }
   void store_reg(const std::string& reg, const std::string& ssa) {
     const std::string ty = reg_type(reg);
     line("  store " + ty + " " + ssa + ", " + pt("%" + reg) + " %" + reg + ", align " + align_of(ty));
@@ -409,7 +417,9 @@ class LlvmGen {
     if (op.rfind("neg.", 0) == 0 || op.rfind("abs.", 0) == 0 ||
         op.rfind("popc.", 0) == 0 || op.rfind("clz.", 0) == 0 ||
         op.rfind("bfind.shiftamt.", 0) == 0 ||
-        op.rfind("bfi.", 0) == 0 || op.rfind("bfe.", 0) == 0)
+        op.rfind("bfi.", 0) == 0 || op.rfind("bfe.", 0) == 0 ||
+        op.rfind("prmt.", 0) == 0 || op.rfind("dp4a.", 0) == 0 ||
+        op.rfind("dp2a.", 0) == 0)
       return "unary";
     return "";
   }
@@ -2432,12 +2442,168 @@ class LlvmGen {
     return true;
   }
 
+  // prmt.b32 — byte permute. nvcc uses it to pack bytes (four byte loads
+  // into one 32-bit store is the typical case), so real PTX needs it.
+  // Semantics (PTX ISA 9.7.10.7): the eight source bytes are the 64-bit
+  // value {b, a} counted from the low end (index 0..3 are a's bytes, 4..7
+  // are b's). Each 4-bit field of c selects the source byte for d.b0..d.b3
+  // (field 0 -> d.b0); the field's msb asks for the byte's SIGN to be
+  // replicated over the whole 8-bit target position.
+  //
+  // Lowered without the llvm.ptx.prmt intrinsic on purpose: that intrinsic
+  // exists only for the NVPTX target, while the same .ll must also build and
+  // run on the host. The explicit form is portable and matches the
+  // interpreter bit for bit.
+  bool emit_prmt(const rouge::PtxInstruction& ins, size_t idx) {
+    (void)idx;
+    const auto& A = ins.args;
+    // src64 = a | (b << 32): byte 0..3 are a's bytes, 4..7 are b's.
+    const std::string a32 = zext_to_i64(operand(A[1]), reg_type(A[1]));
+    const std::string b32 = zext_to_i64(operand(A[2]), reg_type(A[2]));
+    const std::string bsh = fresh("%pb");
+    line("  " + bsh + " = shl i64 " + b32 + ", 32");
+    const std::string src = fresh("%ps");
+    line("  " + src + " = or i64 " + a32 + ", " + bsh);
+    const std::string sel = zext_to_i64(operand(A[3]), reg_type(A[3]));
+    std::string acc;
+    for (int i = 0; i < 4; ++i) {
+      // field i of c: (c >> 4i) & 0xF
+      const std::string sh = fresh("%ph");
+      line("  " + sh + " = lshr i64 " + sel + ", " + std::to_string(4 * i));
+      const std::string m = fresh("%pm");
+      line("  " + m + " = and i64 " + sh + ", 15");
+      // index = field & 7; sign bit = field & 8.
+      const std::string idx = fresh("%pi");
+      line("  " + idx + " = and i64 " + m + ", 7");
+      const std::string bs = fresh("%pb2");
+      line("  " + bs + " = shl i64 " + idx + ", 3");
+      const std::string v = fresh("%pv");
+      line("  " + v + " = lshr i64 " + src + ", " + bs);
+      const std::string v8 = fresh("%pv8");
+      line("  " + v8 + " = and i64 " + v + ", 255");
+      // msb of the field: replicate the sign of the selected byte.
+      const std::string sbit = fresh("%psb");
+      line("  " + sbit + " = and i64 " + m + ", 8");
+      const std::string isneg = fresh("%pn");
+      line("  " + isneg + " = icmp ne i64 " + sbit + ", 0");
+      const std::string top = fresh("%pt");
+      line("  " + top + " = and i64 " + v8 + ", 128");
+      const std::string topne = fresh("%ptn");
+      line("  " + topne + " = icmp ne i64 " + top + ", 0");
+      const std::string rep = fresh("%pr");
+      line("  " + rep + " = select i1 " + topne + ", i64 255, i64 0");
+      const std::string lit = fresh("%pl");
+      line("  " + lit + " = select i1 " + isneg + ", i64 " + rep + ", i64 " + v8);
+      if (i == 0) {
+        acc = lit;
+      } else {
+        const std::string sh2 = fresh("%pq");
+        line("  " + sh2 + " = shl i64 " + lit + ", " + std::to_string(8 * i));
+        const std::string o = fresh("%po");
+        line("  " + o + " = or i64 " + acc + ", " + sh2);
+        acc = o;
+      }
+    }
+    const std::string res = fresh("%r");
+    line("  " + res + " = trunc i64 " + acc + " to i32");
+    store_reg(A[0], res);
+    return true;
+  }
+
+  // dp4a / dp2a — dot product of byte pairs. nvcc emits dp4a for int8 dot
+  // products, i.e. exactly the inner loop of an int8 GEMM.
+  //   dp4a.atype.btype d, a, b, c : Va = the four bytes of a (per .atype),
+  //     Vb = the four bytes of b (per .btype), d = c + sum Va[i]*Vb[i].
+  //   dp2a.mode.atype.btype d, a, b, c : Va = the two 16-bit halves of a,
+  //     Vb = the four bytes of b, b_select = (.lo ? 0 : 2),
+  //     d = c + Va[0]*Vb[b_select] + Va[1]*Vb[b_select+1].
+  // Lowered with explicit byte extraction so the same .ll builds for the
+  // host as well (llvm.ptx.dp4a exists only for NVPTX).
+  bool emit_dot4a(const rouge::PtxInstruction& ins, size_t idx) {
+    (void)idx;
+    const auto& A = ins.args;
+    const std::string op = ins.op;
+    const bool wide = op.rfind("dp4a.", 0) == 0;
+    const bool use_low = wide || (op.find(".lo.") != std::string::npos);
+    // Tokens: dp4a.atype.btype | dp2a.mode.atype.btype
+    std::vector<std::string> tok;
+    {
+      std::string cur;
+      for (char ch : op) {
+        if (ch == '.') { tok.push_back(cur); cur.clear(); }
+        else cur.push_back(ch);
+      }
+      tok.push_back(cur);
+    }
+    const size_t at_idx = wide ? 1u : 2u;
+    const std::string atype = tok.size() > at_idx ? tok[at_idx] : std::string("u32");
+    const std::string btype = tok.size() > at_idx + 1u ? tok[at_idx + 1u] : std::string("u32");
+    const bool a_signed = atype == "s32";
+    const bool b_signed = btype == "s32";
+    const std::string a = zext_to_i64(operand(A[1]), reg_type(A[1]));
+    const std::string b = zext_to_i64(operand(A[2]), reg_type(A[2]));
+    const std::string c = zext_to_i64(operand(A[3]), reg_type(A[3]));
+    std::string sum;
+    if (wide) {
+      for (int i = 0; i < 4; ++i) {
+        const std::string av = extract_lane(a, 8 * i, 8, a_signed);
+        const std::string bv = extract_lane(b, 8 * i, 8, b_signed);
+        sum = accumulate_product(sum, av, bv);
+      }
+    } else {
+      for (int i = 0; i < 2; ++i) {
+        const std::string av = extract_lane(a, 16 * i, 16, a_signed);
+        const std::string bv = extract_lane(b, 8 * (i + (use_low ? 0 : 2)), 8, b_signed);
+        sum = accumulate_product(sum, av, bv);
+      }
+    }
+    const std::string tot = fresh("%dt");
+    line("  " + tot + " = add i64 " + c + ", " + sum);
+    const std::string res = fresh("%r");
+    line("  " + res + " = trunc i64 " + tot + " to i32");
+    store_reg(A[0], res);
+    return true;
+  }
+
+  // Extract a `bits`-wide lane from a 64-bit value at the given bit offset and
+  // sign/zero extend it to 64 bits.
+  std::string extract_lane(const std::string& v, int off, int bits, bool is_signed) {
+    const std::string sh = fresh("%dl");
+    line("  " + sh + " = lshr i64 " + v + ", " + std::to_string(off));
+    const std::string m = fresh("%dm");
+    line("  " + m + " = and i64 " + sh + ", " + std::to_string((1LL << bits) - 1));
+    const std::string out = fresh("%dv");
+    if (is_signed) {
+      const std::string t = fresh("%dt2");
+      line("  " + t + " = shl i64 " + m + ", " + std::to_string(64 - bits));
+      line("  " + out + " = ashr i64 " + t + ", " + std::to_string(64 - bits));
+    } else {
+      line("  " + out + " = or i64 " + m + ", 0");
+    }
+    return out;
+  }
+
+  // sum = sum + x*y (sum empty -> the first product).
+  std::string accumulate_product(const std::string& sum, const std::string& x,
+                                 const std::string& y) {
+    const std::string p = fresh("%dp");
+    line("  " + p + " = mul i64 " + x + ", " + y);
+    if (sum.empty()) return p;
+    const std::string o = fresh("%do");
+    line("  " + o + " = add i64 " + sum + ", " + p);
+    return o;
+  }
+
   bool emit_alu_unary(const rouge::PtxInstruction& ins, size_t idx) {
     const auto& A = ins.args;
     const std::string op = ins.op;
     if ((A.size() == 4 || A.size() == 5) &&
         (op.rfind("bfi.", 0) == 0 || op.rfind("bfe.", 0) == 0))
       return emit_bitfield(ins, idx);
+    if (A.size() == 4 && op.rfind("prmt.", 0) == 0)
+      return emit_prmt(ins, idx);
+    if (A.size() == 4 && (op.rfind("dp4a.", 0) == 0 || op.rfind("dp2a.", 0) == 0))
+      return emit_dot4a(ins, idx);
     if (A.size() != 2) return fail("bad " + op + " operands @ " + std::to_string(idx));
     const std::string ty = reg_type(A[0]);
     const std::string a = operand(A[1]);

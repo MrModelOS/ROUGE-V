@@ -1,0 +1,90 @@
+// ROUGE-V canonical kernel: byte permute (prmt) and byte dot products
+// (dp4a / dp2a).
+//
+// These two instructions are what nvcc emits for int8 work: dp4a is the
+// inner loop of an int8 GEMM, prmt packs four byte loads into one 32-bit
+// store. A compiler that cannot translate them cannot run real int8 CUDA
+// code at all, so they get a canonical kernel of their own.
+//
+// One thread does everything (no grid), so the result is a pure function of
+// the two input words and the mode:
+//   mode 0: prmt.b32 d, a, b, 0x7654
+//   mode 1: prmt.b32 d, a, b, 0x0123
+//   mode 2: prmt.b32 d, a, b, 0xF0E1   (reverse the byte order)
+//   mode 3: dp4a.s32.s32 d, a, b, 0
+//   mode 4: dp4a.u32.u32 d, a, b, 0
+//   mode 5: dp4a.s32.s32 d, a, b, c   (with a non-zero accumulator)
+//   mode 6: dp2a.s32.s32 d, a, b, 0
+// Output: one 32-bit word per mode, written to out[mode].
+//
+// prmt semantics (PTX ISA): the eight source bytes are {a.b0..a.b3, b.b0..b.b3}
+// (a first); the four 4-bit fields of the selector pick which byte lands in
+// d.b0..d.b3, field 0 -> d.b0.
+.version 9.4
+.target sm_75
+.address_size 64
+
+.visible .entry prmt_dp4a(
+    .param .u64 prmt_dp4a_param_0,
+    .param .u32 prmt_dp4a_param_1,
+    .param .u32 prmt_dp4a_param_2,
+    .param .u32 prmt_dp4a_param_3
+)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<2>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [prmt_dp4a_param_0];
+    ld.param.u32 %r1, [prmt_dp4a_param_1];
+    ld.param.u32 %r2, [prmt_dp4a_param_2];
+    ld.param.u32 %r3, [prmt_dp4a_param_3];
+    cvta.to.global.u64 %rd1, %rd1;
+
+    setp.eq.u32 %p1, %r3, 0;
+    @%p1 bra $L_m0;
+    setp.eq.u32 %p1, %r3, 1;
+    @%p1 bra $L_m1;
+    setp.eq.u32 %p1, %r3, 2;
+    @%p1 bra $L_m2;
+    setp.eq.u32 %p1, %r3, 3;
+    @%p1 bra $L_m3;
+    setp.eq.u32 %p1, %r3, 4;
+    @%p1 bra $L_m4;
+    setp.eq.u32 %p1, %r3, 5;
+    @%p1 bra $L_m5;
+    setp.eq.u32 %p1, %r3, 6;
+    @%p1 bra $L_m6;
+    bra $L_end;
+
+$L_m0:
+    prmt.b32 %r4, %r1, %r2, 30212;      // 0x7654
+    st.global.u32 [%rd1], %r4;
+    bra $L_end;
+$L_m1:
+    prmt.b32 %r4, %r1, %r2, 291;         // 0x0123
+    st.global.u32 [%rd1], %r4;
+    bra $L_end;
+$L_m2:
+    prmt.b32 %r4, %r1, %r2, 12816;       // 0x3210 -> байты a в прямом порядке
+    st.global.u32 [%rd1], %r4;
+    bra $L_end;
+$L_m3:
+    dp4a.s32.s32 %r4, %r1, %r2, 0;
+    st.global.u32 [%rd1], %r4;
+    bra $L_end;
+$L_m4:
+    dp4a.u32.u32 %r4, %r1, %r2, 0;
+    st.global.u32 [%rd1], %r4;
+    bra $L_end;
+$L_m5:
+    dp4a.s32.s32 %r4, %r1, %r2, 12345;
+    st.global.u32 [%rd1], %r4;
+    bra $L_end;
+$L_m6:
+    dp2a.lo.s32.s32 %r4, %r1, %r2, 7;
+    st.global.u32 [%rd1], %r4;
+    bra $L_end;
+$L_end:
+    ret;
+}

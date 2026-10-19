@@ -32,7 +32,7 @@ target_link_libraries(test_ptx_to_llvm_warp PRIVATE rouge-compiler-lib rouge-ptx
 add_test(NAME compiler_ptx_to_llvm_warp COMMAND test_ptx_to_llvm_warp)
 
 # Stage 1 always runs: PTX -> LLVM IR via our translator CLI.
-foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt mma_tile mma_pipe)
+foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt prmt_dp4a mma_tile mma_pipe)
   add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
     COMMAND ptx2ir ${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kern}.ptx
@@ -45,7 +45,7 @@ endforeach()
 find_program(CLANG_EXECUTABLE clang)
 if(CLANG_EXECUTABLE)
   # Compile one IR module per canonical kernel: ptx2ir -> clang -O2 -> .o
-  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt mma_tile mma_pipe)
+  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt prmt_dp4a mma_tile mma_pipe)
     add_custom_command(
       OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.o
       COMMAND ${CLANG_EXECUTABLE} -O2 -c ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
@@ -135,6 +135,39 @@ if(CLANG_EXECUTABLE)
     ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
   add_test(NAME aot_native_fp8_cvt COMMAND test_aot_fp8_cvt
            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/fp8_cvt.ptx)
+
+  # Test 2k-a: byte permute and byte dot products (prmt/dp4a/dp2a), AOT vs
+  # interpreter. The semantics follow the PTX ISA; the same kernel is checked
+  # on a real card by compiler_nvptx_gpu_exec.
+  add_executable(test_aot_prmt_dp4a test_aot_prmt_dp4a.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/prmt_dp4a.o)
+  target_link_libraries(test_aot_prmt_dp4a PRIVATE rouge-runtime rouge-ptx)
+  target_include_directories(test_aot_prmt_dp4a PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
+  add_test(NAME aot_native_prmt_dp4a COMMAND test_aot_prmt_dp4a
+           ${CMAKE_CURRENT_SOURCE_DIR}/kernels/prmt_dp4a.ptx)
+
+  # Test 2k-bis: INT8 GEMM (nvcc-compiled kernel, the prmt + dp4a path),
+  # AOT vs interpreter. Integer arithmetic, so the check is bit-exact.
+  add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/int8_gemm.ll
+    COMMAND ptx2ir ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/int8_gemm.ptx
+            ${CMAKE_CURRENT_BINARY_DIR}/int8_gemm.ll
+    DEPENDS ptx2ir ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/int8_gemm.ptx
+    COMMENT "[rouge-compiler] ptx2ir: cuda/int8_gemm.ptx -> int8_gemm.ll")
+  add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/int8_gemm.o
+    COMMAND ${CLANG_EXECUTABLE} -O2 -c ${CMAKE_CURRENT_BINARY_DIR}/int8_gemm.ll
+            -o ${CMAKE_CURRENT_BINARY_DIR}/int8_gemm.o
+    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/int8_gemm.ll
+    COMMENT "[rouge-compiler] clang: int8_gemm.ll -> native object (AOT)")
+  add_executable(test_aot_int8_gemm test_aot_int8_gemm.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/int8_gemm.o)
+  target_link_libraries(test_aot_int8_gemm PRIVATE rouge-runtime rouge-ptx)
+  target_include_directories(test_aot_int8_gemm PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
+  add_test(NAME aot_native_int8_gemm COMMAND test_aot_int8_gemm
+           ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda/int8_gemm.ptx)
 
   # Test 2m: mma.sync through the per-block exchange region, AOT vs
   # interpreter vs the PTX ISA lane formulas.
@@ -456,10 +489,30 @@ if(CLANG_EXECUTABLE AND CUDA_DRIVER_INCLUDE_DIR AND CUDA_DRIVER_LIBRARY)
       -DRUNNER=$<TARGET_FILE:gpu_exec_rungpu>
       -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
       -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/gpu-exec
-      "-DCELLS=vadd.vadd,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2,shfl_reduce.shfl_reduce,atom_cas.atom_cas,shfl_pred.shfl_pred,vote_pred.vote_pred,shfl_pred_all.shfl_pred_all,ldmatrix_tile.ldmatrix_sm75@ldmatrix_sm75"
+      "-DCELLS=vadd.vadd,prmt_dp4a.prmt_dp4a,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2,shfl_reduce.shfl_reduce,atom_cas.atom_cas,shfl_pred.shfl_pred,vote_pred.vote_pred,shfl_pred_all.shfl_pred_all,ldmatrix_tile.ldmatrix_sm75@ldmatrix_sm75"
       -DSM=sm_75
       -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_exec.cmake)
   set_tests_properties(compiler_nvptx_gpu_exec PROPERTIES
+    SKIP_REGULAR_EXPRESSION "NO-DEVICE|SKIP-OLD-ARCH")
+
+  # Our own CUDA C kernel (kernels/cuda/int8_gemm.cu) compiled by the user's
+  # nvcc into PTX, then translated by OUR ptx2ir and run on the card by OUR
+  # runtime. The arithmetic is integer, so the check is bit-exact: the GPU
+  # answer must equal the host's int32 accumulation of the same product.
+  # Its .ptx is committed (like the vendor kernels); regenerate with
+  #   nvcc -ptx -arch=sm_75 -O2 kernels/cuda/int8_gemm.cu -o kernels/cuda/int8_gemm.ptx
+  add_test(NAME compiler_nvptx_cuda_gpu_exec
+    COMMAND ${CMAKE_COMMAND}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DPTX2IR=$<TARGET_FILE:ptx2ir>
+      -DRUNNER=$<TARGET_FILE:gpu_exec_rungpu>
+      -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
+      -DSUBDIR=cuda
+      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/cuda-gpu-exec
+      "-DCELLS=int8_gemm.int8_gemm"
+      -DSM=sm_75
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_exec.cmake)
+  set_tests_properties(compiler_nvptx_cuda_gpu_exec PROPERTIES
     SKIP_REGULAR_EXPRESSION "NO-DEVICE|SKIP-OLD-ARCH")
 
   add_test(NAME compiler_nvptx_gpu_exec_atomic
