@@ -126,6 +126,58 @@ void rouge_attention_f32(int S, int Skv, int D, const float *Q, const float *K,
                          const float *V, float *O, float scale, int causal,
                          int kv_off);
 
+/* Внимание для инференса: GQA/MQA, скользящее окно, FP8-KV.
+ * Q: [Hq][S][Dh], K/V: [Hkv][Skv][Dh], O: [Hq][S][Dh]. Hq % Hkv == 0.
+ * window<=0 — окно не ограничено; kv_off — сдвиг позиций K/V. */
+void rouge_attention_gqa(int S, int Skv, int Dh, int Hq, int Hkv, const float *Q,
+                         const float *K, const float *V, float *O, float scale,
+                         int causal, int window, int kv_off);
+void rouge_attention_gqa_fp8kv(int S, int Skv, int Dh, int Hq, int Hkv,
+                               const float *Q, const uint8_t *Kq,
+                               const uint8_t *Vq, const float *scales_k,
+                               const float *scales_v, float *O, float scale,
+                               int causal, int window, int kv_off);
+
+/* INT8-квантование (Wave 2, AI): симметричное per-tensor и per-channel,
+ * асимметричное per-group (0..255). Округление RNE, насыщение по границам.
+ * Граница ошибки: симметричные — половина шага, per-group — шаг. */
+int rouge_quantize_i8_tensor(const float *x, int n, float *scale_out,
+                              int8_t *out);
+int rouge_quantize_i8_channel(const float *x, int rows, int cols, float *scales,
+                               int8_t *out);
+int rouge_quantize_i8_group(const float *x, int rows, int cols, int groups,
+                            float *scales, uint8_t *zeros, uint8_t *out);
+void rouge_dequantize_i8_tensor(const int8_t *q, int n, float scale,
+                                float *out);
+void rouge_dequantize_i8_channel(const int8_t *q, int rows, int cols,
+                                 const float *scales, float *out);
+void rouge_dequantize_i8_group(const uint8_t *q, int rows, int cols, int groups,
+                               const float *scales, const uint8_t *zeros,
+                               float *out);
+/* Целочисленный GEMM с накоплением в int32 (результат ТОЧНЫЙ): C = (A_s8 x B_s8) *
+ * scale_a * scale_b. a_rows=0 — один масштаб на A, 1 — на строку;
+ * b_cols=0 — один на B, 1 — на столбец. */
+void rouge_gemm_i8(int M, int N, int K, const int8_t *A, const int8_t *B,
+                   const float *scales_a, int a_rows, const float *scales_b,
+                   int b_cols, float *C);
+
+/* Трансформерный блок (Wave 2, AI): RMSNorm -> RoPE -> GQA-внимание ->
+ * выходная проекция -> SwiGLU-MLP, pre-norm. Раскладка: x [S][D];
+ * wrms1/wrms2 [D]; wq [D][Hq*Dq], wk/wv [D][Hkv*Dq]; wo [Hq*Dq][D];
+ * wgate/wup [D][Dff]; wdown [Dff][D] (раскладка весов как у nn.Linear:
+ * [вход][выход]). Проекции считаются нашим блочным GEMM. */
+void rouge_rmsnorm(const float *x, int n, const float *w, float eps,
+                   float *out);
+void rouge_rope(float *x, int heads, int head_dim, int pos, float theta);
+void rouge_swiglu(const float *gate, const float *up, int n, float *out);
+void rouge_transformer_block(int S, int D, int Hq, int Hkv, int Dq, int Dk,
+                              const float *x, const float *wrms1,
+                              const float *wq, const float *wk, const float *wv,
+                              const float *wo, const float *wrms2,
+                              const float *wgate, const float *wup,
+                              const float *wdown, int Dff, float rope_theta,
+                              float rms_eps, float *out);
+
 /* BLAS L1/L2 (Wave 2): свои axpy/dot/scal/nrm2/gemv, row-major.
  * inc <= 0, n <= 0 или NULL -> ничего не делать (dot/nrm2 возвращают 0).
  * trans для gemv: 'N'/'T' (регистр не важен), иначе ничего не делать. */

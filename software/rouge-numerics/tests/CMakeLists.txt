@@ -108,6 +108,17 @@ target_link_libraries(test_fft_sparse_rng PRIVATE rouge-numerics)
 target_compile_options(test_fft_sparse_rng PRIVATE -Wall -Wextra)
 add_test(NAME fft_sparse_rng COMMAND test_fft_sparse_rng)
 
+add_executable(test_ai test_ai.cpp)
+target_link_libraries(test_ai PRIVATE rouge-numerics)
+target_compile_options(test_ai PRIVATE -Wall -Wextra)
+add_test(NAME ai COMMAND test_ai)
+
+# Замеры AI-части: int8 GEMM, GQA-внимание, трансформерный блок.
+add_executable(bench_ai bench_ai.cpp)
+target_link_libraries(bench_ai PRIVATE rouge-numerics)
+target_compile_options(bench_ai PRIVATE -Wall -Wextra)
+add_test(NAME bench_ai COMMAND bench_ai)
+
 add_executable(test_blas1 test_blas1.cpp)
 target_link_libraries(test_blas1 PRIVATE rouge-numerics)
 target_compile_options(test_blas1 PRIVATE -Wall -Wextra)

@@ -33,6 +33,9 @@ add_library(rouge-numerics STATIC
   src/fp8.cpp
   src/fp16.cpp
   src/narrow.cpp
+  src/quant_int8.cpp
+  src/attention_gqa.cpp
+  src/transformer.cpp
   src/conv.cpp
   src/conv_implicit.cpp
   src/conv_backward.cpp

@@ -191,6 +191,53 @@ void rouge_attention_f32(int S, int Skv, int D, const float* Q, const float* K,
                          const float* V, float* O, float scale, int causal,
                          int kv_off);
 
+/* Внимание для инференса: GQA/MQA, скользящее окно, FP8-KV.
+ * Q: [Hq][S][Dh], K/V: [Hkv][Skv][Dh], O: [Hq][S][Dh]. Hq % Hkv == 0. */
+void rouge_attention_gqa(int S, int Skv, int Dh, int Hq, int Hkv, const float* Q,
+                         const float* K, const float* V, float* O, float scale,
+                         int causal, int window, int kv_off);
+void rouge_attention_gqa_fp8kv(int S, int Skv, int Dh, int Hq, int Hkv,
+                               const float* Q, const uint8_t* Kq,
+                               const uint8_t* Vq, const float* scales_k,
+                               const float* scales_v, float* O, float scale,
+                               int causal, int window, int kv_off);
+
+/* INT8-квантование: симметричное per-tensor и per-channel, асимметричное
+ * per-group (0..255). Граница ошибки: симметричные — половина шага,
+ * per-group — шаг (нулевая точка целочисленная). */
+int rouge_quantize_i8_tensor(const float* x, int n, float* scale_out, int8_t* out);
+int rouge_quantize_i8_channel(const float* x, int rows, int cols, float* scales,
+                               int8_t* out);
+int rouge_quantize_i8_group(const float* x, int rows, int cols, int groups,
+                            float* scales, uint8_t* zeros, uint8_t* out);
+void rouge_dequantize_i8_tensor(const int8_t* q, int n, float scale, float* out);
+void rouge_dequantize_i8_channel(const int8_t* q, int rows, int cols,
+                                 const float* scales, float* out);
+void rouge_dequantize_i8_group(const uint8_t* q, int rows, int cols, int groups,
+                               const float* scales, const uint8_t* zeros,
+                               float* out);
+/* Целочисленный GEMM с накоплением в int32 (результат ТОЧНЫЙ):
+ * C = (A_s8 x B_s8) * scale_a * scale_b. a_rows=0 — один масштаб на A,
+ * 1 — на строку; b_cols=0 — один на B, 1 — на столбец. */
+void rouge_gemm_i8(int M, int N, int K, const int8_t* A, const int8_t* B,
+                   const float* scales_a, int a_rows, const float* scales_b,
+                   int b_cols, float* C);
+
+/* Трансформерный блок (pre-norm): RMSNorm -> RoPE -> GQA-внимание ->
+ * выходная проекция -> SwiGLU-MLP. Раскладка весов как у nn.Linear:
+ * wq [D][Hq*Dq], wk/wv [D][Hkv*Dq], wo [Hq*Dq][D], wgate/wup [D][Dff],
+ * wdown [Dff][D]. Проекции считаются нашим блочным GEMM. */
+void rouge_rmsnorm(const float* x, int n, const float* w, float eps, float* out);
+void rouge_rope(float* x, int heads, int head_dim, int pos, float theta);
+void rouge_swiglu(const float* gate, const float* up, int n, float* out);
+void rouge_transformer_block(int S, int D, int Hq, int Hkv, int Dq, int Dk,
+                              const float* x, const float* wrms1,
+                              const float* wq, const float* wk, const float* wv,
+                              const float* wo, const float* wrms2,
+                              const float* wgate, const float* wup,
+                              const float* wdown, int Dff, float rope_theta,
+                              float rms_eps, float* out);
+
 typedef struct RougeComplex { float re, im; } RougeComplex;
 /* FFT: степени двойки — radix-2, остальные n — прямой O(N²) тем же
  * определением. inverse=0 forward, иначе inverse с /N. Успех -> 0. */
@@ -366,6 +413,51 @@ Implicit при этом не держит col-буфер (память O(tc·ts
   оценку кандидата;
 - в профиль попадает конфиг, который реально применялся, и
   `2*M*N*K / время`.
+
+## AI-часть: квантование, GQA-внимание, трансформерный блок
+
+Это то, что нужно современному инференсу, а не только «математика для
+демонстрации». Всё — на наших же ядрах, без чужих библиотек.
+
+- **Квантование INT8** в трёх схемах: симметричное per-tensor, симметричное
+  per-channel (по строке) и асимметричное per-group с целочисленной нулевой
+  точкой (как в AWQ/GPTQ). Границы ошибки указаны честно: симметричные — половина
+  шага, per-group — **шаг** (нулевая точка целочисленная, поэтому
+  представляемый интервал сдвинут максимум на полшага, и на границах к этому
+  добавляется полушаг округления — та же граница, что у AWQ/GPTQ/TensorRT).
+- **Целочисленный GEMM** с накоплением в int32: результат **точен** (проверяется
+  против целочисленного произведения в long double), ошибка насыщения int32
+  недостижима на практике. Ядро пока скалярное — это точный эталон, а не
+  «оптимизированный» путь; SIMD-ядро int8 — отдельная задача.
+- **GQA/MQA-внимание** со скользящим окном и **FP8-KV-кэшем** (наш формат
+  e4m3). Блок K/V копируется в локальный буфер один раз и используется всеми
+  головами запроса группы — иначе K/V читался бы заново для каждой головы.
+  Это не косметика: до переработки GQA был **в 26 раз медленнее** MHA при
+  четырёхкратном уменьшении объёма K/V; после — эффективность на голову
+  совпадает с MHA (4.25 против 4.21 GFLOP/s на замере ниже).
+- **Трансформерный блок** (pre-norm): RMSNorm → RoPE → GQA-внимание → выходная
+  проекция → SwiGLU-MLP. Проекции считаются **нашим блочным GEMM** с
+  автотюнером: переход с наивной тройной петли дал ускорение в **14 раз**
+  (566 мс → 40.5 мс на том же блоке). Раскладка весов — как у `nn.Linear`:
+  `[вход][выход]`.
+
+### Замеры AI-части (i5-1135G7, тот же путь `avx512+fma`, минимум из прогонов)
+
+```
+GEMM 256x256x256:
+  int8 (скалярный, накопление int32):    1.85 мс,  18.09 GFLOP/s
+  f32  (наш блочный, с автотюнером):      0.34 мс,  98.65 GFLOP/s
+внимание S=512, Dh=64, Hq=8, Hkv=2 (causal):
+  GQA:   63.13 мс,   4.25 GFLOP/s
+  MHA (одна голова, тот же объём Q):    7.97 мс,   4.21 GFLOP/s
+трансформерный блок S=256, D=512, Hq=8, Hkv=2, Dff=1376:
+    40.54 мс на блок,  36.63 GFLOP/s,   158.3 мкс/токен
+```
+
+Честно о границах: int8-путь медленнее f32 (скалярное ядро), GQA считает
+столько же, сколько MHA, если голов запроса столько же (выигрыш GQA — в
+экономии **памяти и трафика** K/V, а не в арифметике), а трансформерный блок
+на 158 мкс/токен — это CPU без SIMD-интринсиков в ядре.
 
 ## Узкие места (честно)
 
