@@ -81,9 +81,10 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | 构建为原生目标文件 —— 从未执行 |
 | `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | 构建**并在真实 GPU 上执行** —— 见下文 |
 
-`software/rouge-compiler/tests/kernels/` 中全部十个标准内核 —— `vadd`、
-`block_reduce`、`atomic_reduce`、`fp16_reduce`、`gemm_tile`、`shfl_reduce`、
-`atom_cas`、`shfl_pred`、`vote_pred`、`shfl_pred_all` —— 都能在四种三元组下构建。
+`software/rouge-compiler/tests/kernels/` 中全部十五个标准内核 —— `vadd`、
+`block_reduce`、`atomic_reduce`、`fp16_reduce`、`fp8_cvt`、`gemm_tile`、
+`shfl_reduce`、`atom_cas`、`shfl_pred`、`vote_pred`、`shfl_pred_all`、
+`mma_tile`、`mma_forms`、`mma_pipe`、`ldmatrix_tile` —— 都能在四种三元组下构建。
 
 ### 在真实硬件上执行
 
@@ -95,15 +96,20 @@ API（驱动侧 JIT）把生成的 PTX 加载到真实的 GeForce MX450（sm_75�
 任何性能数字 —— 详见
 [docs/06-compiler-architecture.md](docs/06-compiler-architecture.md)。
 
+`ldmatrix` 是第一个在真实硅片上跑起来的矩阵类 warp 集体指令（sm_75：它只
+访问 shared 内存，不需要张量核心）。`mma` 与 `stmatrix` 能用 `ptxas` 在
+sm_80/sm_90 下汇编，但本机显卡没有张量核心，因此它们的**执行**目前只有
+compile-verify。
+
 ```
 $ ctest --test-dir build
 ...
- 5/16 aot_native_block_reduce ..............   Passed   smem 1024B 16x256
- 6/16 aot_native_atomic_reduce .............   Passed   sum=4608 count=4096
- 7/16 aot_native_fp16_reduce ...............   Passed   32x32 f16/bf16
- 8/16 aot_native_gemm_tile .................   Passed   2x2 blocks 16x16
-13/16 compiler_nvcc_ptx ....................   Passed   nvcc -> ptx2ir -> clang
-100% tests passed out of 16
+ 7/56 Test  #7: aot_native_block_reduce ..................   Passed    0.08 sec
+ 8/56 Test  #8: aot_native_atomic_reduce .................   Passed    0.07 sec
+23/56 Test #23: compiler_foreign_ptx .....................   Passed    0.36 sec
+33/56 Test #33: compiler_nvptx_gpu_exec ..................   Passed    7.73 sec
+35/56 Test #35: compiler_nvcc_gpu_exec ...................   Passed    0.52 sec
+100% tests passed out of 56
 ```
 
 > [!NOTE]
@@ -143,8 +149,9 @@ $ ctest --test-dir build
 | 同步 | `bar.sync` → 运行时屏障 |
 | Warp | `shfl.{idx,bfly,up,down}`（含带谓词的目的寄存器）、`vote.*`、`activemask` |
 | 原子操作 | `atom.add` `cas` `exch` `min` `max`、`red.add.*` → `atomicrmw` / `cmpxchg` |
+| 矩阵 | `mma.sync.aligned`（.row.col m16n8k16 f16/bf16/e4m3/e5m2/u8/s8 → f32/f16/s32，m16n8k8 f16/bf16 → f32/f16）、`ldmatrix`/`stmatrix.sync.aligned.m8n8.x{1,2,4}[.trans].b16` |
 
-张量指令（`mma`）、`f16x2` 向量形式和 `cvt.sat` 舍入模式尚未实现，会被报告为错误。
+`wmma.*`、`movmatrix`、`mma.sp`（稀疏）以及 `cvt.sat.*` 舍入模式尚未实现，会被报告为错误——大声拒绝，绝不近似。
 
 ### 文档
 

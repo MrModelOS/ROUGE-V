@@ -83,10 +83,11 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | собирается в нативный объект — не исполнялось |
 | `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | собирается **и исполняется на настоящей видеокарте** — см. ниже |
 
-Под все четыре тройки собираются десять канонических ядер из
+Под все четыре тройки собираются пятнадцать канонических ядер из
 `software/rouge-compiler/tests/kernels/`: `vadd`, `block_reduce`,
-`atomic_reduce`, `fp16_reduce`, `gemm_tile`, `shfl_reduce`, `atom_cas`,
-`shfl_pred`, `vote_pred`, `shfl_pred_all`.
+`atomic_reduce`, `fp16_reduce`, `fp8_cvt`, `gemm_tile`, `shfl_reduce`, `atom_cas`,
+`shfl_pred`, `vote_pred`, `shfl_pred_all`, `mma_tile`, `mma_forms`, `mma_pipe`,
+`ldmatrix_tile`.
 
 ### Исполнено на реальном железе
 
@@ -98,6 +99,11 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 дополнительно гоняет настоящее вендорное ядро (`nvcc real_nvcc.cu`) насквозь. На
 машинах без NVIDIA GPU sm_75+ тесты дают SKIP, а не провал.
 
+`ldmatrix` — первый варп-коллектив матричного семейства, исполненный на
+настоящем кремнии (sm_75: это трафик в shared-память, тензорные ядра не нужны).
+`mma` и `stmatrix` собираются `ptxas` под sm_80/sm_90, но на этой карте
+тензорных ядер нет, поэтому их **исполнение** остаётся только compile-verify.
+
 Строка AMD остаётся утверждением о **сборке**: AMD-видеокарты в проекте нет.
 Ни та ни другая строка ничего не говорят о производительности: мерялась только
 бит-идентичность хост-эталону. Цель меняет адресные пространства в эмитимом IR —
@@ -108,12 +114,12 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 ```
 $ ctest --test-dir build
 ...
- 7/25 aot_native_block_reduce ..............   Passed
- 8/25 aot_native_atomic_reduce .............   Passed
-17/25 compiler_foreign_ptx ....................   Passed
-23/25 compiler_nvptx_gpu_exec ..............   Passed
-25/25 compiler_nvcc_gpu_exec ...............   Passed
-100% tests passed out of 25
+ 7/56 Test  #7: aot_native_block_reduce ..................   Passed    0.08 sec
+ 8/56 Test  #8: aot_native_atomic_reduce .................   Passed    0.07 sec
+23/56 Test #23: compiler_foreign_ptx .....................   Passed    0.36 sec
+33/56 Test #33: compiler_nvptx_gpu_exec ..................   Passed    7.73 sec
+35/56 Test #35: compiler_nvcc_gpu_exec ...................   Passed    0.52 sec
+100% tests passed out of 56
 ```
 
 > [!NOTE]
@@ -154,9 +160,10 @@ $ ctest --test-dir build
 | Синхронизация | `bar.sync` → барьер рантайма |
 | Warp | `shfl.{idx,bfly,up,down}` (в т.ч. с условной записью), `vote.*`, `activemask` |
 | Атомики | `atom.add` `cas` `exch` `min` `max`, `red.add.*` → `atomicrmw` / `cmpxchg` |
+| Матрицы | `mma.sync.aligned` (.row.col m16n8k16 f16/bf16/e4m3/e5m2/u8/s8 → f32/f16/s32, m16n8k8 f16/bf16 → f32/f16), `ldmatrix`/`stmatrix.sync.aligned.m8n8.x{1,2,4}[.trans].b16` |
 
-Тензорные инструкции (`mma`), векторные формы `f16x2` и режимы округления
-`cvt.sat` пока не реализованы и сообщаются как ошибки.
+`wmma.*`, `movmatrix`, `mma.sp` (sparse) и режимы округления `cvt.sat.*` пока
+не реализованы и сообщаются как ошибки — громкий отказ, а не приближение.
 
 ### Документация
 

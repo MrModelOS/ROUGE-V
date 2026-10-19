@@ -79,7 +79,7 @@ OK
 Outside the supported subset you get a refusal, not a wrong answer:
 
 ```
-rouge-run: REFUSED: unsupported PTX op 'mma.sync.aligned.m16n8k16...' @ 4
+rouge-run: REFUSED: warp-cooperative 'wmma.mma.sync.aligned.m16n16k8.row.col.f32.f16.f16.f32' is not lowered (wmma is a different matrix API; movmatrix is a warp-wide permutation): refused loudly rather than lowered as something else
 This instruction is outside the supported subset. Nothing was emitted;
 nothing was approximated.
 ```
@@ -113,9 +113,10 @@ clang --target=amdgcn-amd-amdhsa -mcpu=gfx1100 -c kernel-amd.ll -o kernel-amd.o
 | `amdgcn-amd-amdhsa` | AMD RDNA 3 | `-mcpu=gfx1100` | compiles to a native object — never executed |
 | `nvptx64-nvidia-cuda` | NVIDIA | `-march=sm_75` | compiles **and executes on a real GPU** — see below |
 
-All ten canonical kernels in `software/rouge-compiler/tests/kernels/` — `vadd`,
-`block_reduce`, `atomic_reduce`, `fp16_reduce`, `gemm_tile`, `shfl_reduce`,
-`atom_cas`, `shfl_pred`, `vote_pred`, `shfl_pred_all` — build for all four triples.
+All fifteen canonical kernels in `software/rouge-compiler/tests/kernels/` — `vadd`,
+`block_reduce`, `atomic_reduce`, `fp16_reduce`, `fp8_cvt`, `gemm_tile`, `shfl_reduce`,
+`atom_cas`, `shfl_pred`, `vote_pred`, `shfl_pred_all`, `mma_tile`, `mma_forms`,
+`mma_pipe`, `ldmatrix_tile` — build for all four triples.
 
 ### Executed on real hardware
 
@@ -126,6 +127,11 @@ reference — all ten canonical kernels, two datasets for `fp16_reduce`/`gemm_ti
 plus a two-block grid proving the multi-block path. `compiler_nvcc_gpu_exec`
 additionally runs genuine vendor output (`nvcc real_nvcc.cu`) end to end. On
 machines without an sm_75+ NVIDIA GPU the tests report SKIP, never failure.
+
+`ldmatrix` is the first warp-collective matrix op that ran on real silicon
+here (sm_75 — it is shared-memory traffic, no tensor cores needed). `mma` and
+`stmatrix` assemble with `ptxas` at sm_80/sm_90, but this card has no tensor
+cores, so their *execution* remains compile-verified only.
 
 The AMD row stays a **compile-time** claim: no AMD device is involved anywhere
 in the project. Neither row says anything about performance — only bit-identity
@@ -147,12 +153,12 @@ driver needed to launch a translated kernel.
 ```
 $ ctest --test-dir build
 ...
- 7/25 aot_native_block_reduce ..............   Passed
- 8/25 aot_native_atomic_reduce .............   Passed
-17/25 compiler_foreign_ptx ....................   Passed
-23/25 compiler_nvptx_gpu_exec ..............   Passed
-25/25 compiler_nvcc_gpu_exec ...............   Passed
-100% tests passed out of 25
+ 7/56 Test  #7: aot_native_block_reduce ..................   Passed    0.08 sec
+ 8/56 Test  #8: aot_native_atomic_reduce .................   Passed    0.07 sec
+23/56 Test #23: compiler_foreign_ptx .....................   Passed    0.36 sec
+33/56 Test #33: compiler_nvptx_gpu_exec ..................   Passed    7.73 sec
+35/56 Test #35: compiler_nvcc_gpu_exec ...................   Passed    0.52 sec
+100% tests passed out of 56
 ```
 
 > [!NOTE]
@@ -195,9 +201,10 @@ requirement that they agree bit-for-bit on every kernel.
 | Synchronization | `bar.sync` → runtime barrier |
 | Warp | `shfl.{idx,bfly,up,down}` (incl. predicated destinations), `vote.*`, `activemask` |
 | Atomics | `atom.add` `cas` `exch` `min` `max`, `red.add.*` → `atomicrmw` / `cmpxchg` |
+| Matrix | `mma.sync.aligned` (.row.col m16n8k16 f16/bf16/e4m3/e5m2/u8/s8 → f32/f16/s32, m16n8k8 f16/bf16 → f32/f16), `ldmatrix`/`stmatrix.sync.aligned.m8n8.x{1,2,4}[.trans].b16` |
 
-Tensor instructions (`mma`), warp `f16x2` vector forms, and `cvt.sat` rounding
-modes are not implemented yet and are reported as errors.
+`wmma.*`, `movmatrix`, `mma.sp` (sparse) and `cvt.sat.*` rounding modes are
+not implemented and are reported as errors — refused loudly, never approximated.
 
 ### Documentation
 
