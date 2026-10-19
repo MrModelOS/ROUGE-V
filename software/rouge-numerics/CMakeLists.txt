@@ -10,6 +10,11 @@ project(rouge-numerics LANGUAGES CXX)
 #   ctest --test-dir build --output-on-failure
 
 option(ROUGE_BUILD_TESTS "Build unit tests" ON)
+# When pulled in as a subproject (rouge-cuda needs the cuBLAS compat shim),
+# the parent can suppress the numerics unit tests with a normal variable.
+if(DEFINED ROUGE_NUMERICS_NO_TESTS)
+  set(ROUGE_BUILD_TESTS OFF)
+endif()
 # Опционально: собрать под инструкции этой машины (-march=native). По умолчанию
 # выключено — иначе бинарь перестаёт работать на других процессорах. Без этого
 # флага ядро само выбирает набор инструкций в рантайме (baseline/avx2/avx512).

@@ -13,6 +13,12 @@ add_compile_options(-Wall -Wextra)
 # ---- Dependencies ----
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../rouge-ptx ${CMAKE_CURRENT_BINARY_DIR}/rouge-ptx)
 
+# The cuBLAS compat shim lives in rouge-numerics (our own GEMM behind the
+# cuBLAS API). The vendor-program test needs BOTH shims in one build: the
+# CUDA runtime/driver surface and the cuBLAS surface.
+set(ROUGE_NUMERICS_NO_TESTS ON)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../rouge-numerics ${CMAKE_CURRENT_BINARY_DIR}/rouge-numerics)
+
 # ---- Shared library: interposes CUDA symbols (LD_PRELOAD-ready) ----
 add_library(rouge-cuda SHARED
   src/driver_api.cpp

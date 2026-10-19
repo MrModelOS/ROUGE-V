@@ -161,3 +161,23 @@ if(ROUGE_NVCC_PROG)
 else()
   message(STATUS "foreign_program: SKIP (nvcc not found)")
 endif()
+
+# Same idea, but the vendor program calls the REAL cuBLAS (no CUDA kernel at
+# all): the test proves that a program linked against NVIDIA's proprietary
+# BLAS computes on our shim, on a machine without NVIDIA.
+if(ROUGE_NVCC_PROG)
+  add_executable(test_foreign_cublas test_foreign_cublas.cpp)
+  target_link_libraries(test_foreign_cublas PRIVATE ${CMAKE_DL_LIBS})
+  set(_fc_work ${CMAKE_CURRENT_BINARY_DIR}/foreign-cublas)
+  add_test(NAME foreign_cublas_program
+    COMMAND ${CMAKE_COMMAND}
+      -DNVCC=${ROUGE_NVCC_PROG}
+      -DPROGRAM=${CMAKE_CURRENT_SOURCE_DIR}/programs/cublas_gemm.cu
+      -DWORK_DIR=${_fc_work}
+      -DSHIM=$<TARGET_FILE:rouge-cuda>
+      -DCUBLAS_SHIM=$<TARGET_FILE:rouge-cublas>
+      -DTEST_BIN=$<TARGET_FILE:test_foreign_cublas>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/foreign_cublas_program.cmake)
+else()
+  message(STATUS "foreign_cublas_program: SKIP (nvcc not found)")
+endif()
