@@ -178,7 +178,8 @@ $ ctest --test-dir build
 | [`rouge-ptx`](software/rouge-ptx/) | Shared PTX front-end: parser + reference interpreter |
 | [`rouge-compiler`](software/rouge-compiler/) | `ptx2ir`, the AOT translator; host runtime; MLIR contour |
 | [`rouge-cuda`](software/rouge-cuda/) | CUDA Driver/Runtime API interposition and fallback execution path |
-| [`rouge-numerics`](software/rouge-numerics/) | Own open math: GEMM (f32/f64/f16/bf16/FP8/complex), convolution, attention, FFT, sparse, RNG — plus cuBLAS/cuDNN compat shims over that code |
+| [`rouge-numerics`](software/rouge-numerics/) | Own open math: GEMM (f32/f64/f16/bf16/FP8/complex), convolution, attention, FFT, sparse, RNG, INT8 quantization — plus cuBLAS/cuDNN compat shims over that code |
+| [`rouge-render`](software/rouge-render/) | Own renderer: path tracer, à-trous denoiser, temporal upscaler — the open path where DLSS/OptiX would be |
 
 Both execution paths are built on the same parser. That is deliberate: one
 grammar, one set of rules for registers, parameters, `.shared` layout and
@@ -202,6 +203,34 @@ The losses are stated in the README of that component, not hidden. The
 `foreign_cublas_program` test closes the loop: a program linked against
 **NVIDIA's own libcublas** computes on our shim, on a machine with no
 NVIDIA present, and prints exactly what the real cuBLAS printed on the GPU.
+
+### Inference and rendering, the open way
+
+Two pieces of the stack that exist so that nothing has to be closed:
+
+- **Inference** (`rouge-numerics`): INT8 quantization in three schemes
+  (per-tensor, per-channel, asymmetric per-group with an integer zero point),
+  an **exact** integer GEMM (int32 accumulation), GQA/MQA attention with a
+  sliding window and an FP8 KV cache in our own e4m3 format, and a full
+  pre-norm transformer block (RMSNorm → RoPE → attention → SwiGLU MLP) whose
+  projections run on our blocked GEMM. On the test machine the block runs at
+  36.6 GFLOP/s; switching the projections from a naive triple loop to our GEMM
+  made it **14× faster** (566 → 40.5 ms).
+- **Rendering** (`rouge-render`): a path tracer (next-event estimation + MIS,
+  so the reference image is unbiased), an à-trous wavelet denoiser and a
+  temporal upscaler with jitter-aware reconstruction, history reprojection
+  and variance clipping. Measured against a converged reference of the same
+  render:
+
+  | Step | Ours | Baseline | Verdict |
+  |---|---|---|---|
+  | Denoise a 4-sample frame | PSNR 28.79, SSIM 0.927 | noisy: 27.91 / 0.873 | +0.88 dB, +0.054 SSIM |
+  | Upscale 2× (static camera) | PSNR 25.08, SSIM 0.816 | bilinear: 21.60 / 0.693 | +3.5 dB, +0.12 SSIM |
+  | Upscale 2× (moving camera) | PSNR 25.25, SSIM 0.826 | bilinear: 21.60 / 0.693 | +3.7 dB, +0.13 SSIM |
+
+  This is **not** DLSS: DLSS reconstructs with a closed neural network, ours
+  is a classical pipeline (bicubic + reprojection + clipping). The point is
+  that the whole path is open, ours, and measurable.
 
 ### Supported PTX
 

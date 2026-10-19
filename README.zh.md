@@ -127,10 +127,36 @@ $ ctest --test-dir build
 | [`rouge-ptx`](software/rouge-ptx/) | 共享 PTX 前端：解析器与参考解释器 |
 | [`rouge-compiler`](software/rouge-compiler/) | `ptx2ir`，AOT 翻译器；宿主运行时；MLIR 轮廓 |
 | [`rouge-cuda`](software/rouge-cuda/) | CUDA Driver/Runtime API 拦截与备用执行路径 |
+| [`rouge-numerics`](software/rouge-numerics/) | 自有开放数学：GEMM（f32/f64/f16/bf16/FP8/复数）、卷积、attention、FFT、稀疏、RNG、INT8 量化 —— 外加建立在其自有代码之上的 cuBLAS/cuDNN 兼容层 |
+| [`rouge-render`](software/rouge-render/) | 自有渲染器：路径追踪器、à-trous 降噪器、时域上采样器 —— 在本该是 DLSS/OptiX 之处走开放路线 |
 
 两条执行路径建立在同一个解析器之上。这是有意为之：同一套语法，同一套关于寄存器、
 参数、`.shared` 布局和标号的规则，从而使两条路径不会产生分歧。测试套件正是围绕
 这一要求构建的 —— 在每个内核上，两条路径必须给出**逐位相同**的结果。
+
+### 推理与图形 —— 以开放方式完成
+
+栈中这两部分的存在意义，是让任何闭源部件都不必被依赖：
+
+- **推理**（`rouge-numerics`）：三种方案的 INT8 量化（per-tensor、per-channel、
+  带整数零点的非对称 per-group）、**精确**整数 GEMM（int32 累加）、带滑动
+  窗口与自有 e4m3 格式 FP8-KV 缓存的 GQA/MQA attention，以及完整的 pre-norm
+  Transformer 块（RMSNorm → RoPE → attention → SwiGLU MLP），其投影由自有的
+  分块 GEMM 计算。在测试机上该块达到 36.6 GFLOP/s；把投影从朴素三重循环换成
+  我们的 GEMM 后**快了 14 倍**（566 → 40.5 毫秒）。
+- **图形**（`rouge-render`）：路径追踪器（next-event estimation + MIS，使参考
+  图像无偏）、à-trous 小波降噪器，以及带抖动感知重建、历史重投影与 variance
+  clipping 的时域上采样器。相对同一渲染的收敛参考图的测量（i5-1135G7，64×64，
+  参考 256 spp）：
+
+  | 步骤 | 本项目结果 | 基线 | 结论 |
+  |---|---|---|---|
+  | 对 4 采样帧降噪 | PSNR 28.79，SSIM 0.927 | 含噪：27.91 / 0.873 | +0.88 dB，+0.054 SSIM |
+  | 2× 上采样（相机静止） | PSNR 25.08，SSIM 0.816 | 双线性：21.60 / 0.693 | +3.5 dB，+0.12 SSIM |
+  | 2× 上采样（相机移动） | PSNR 25.25，SSIM 0.826 | 双线性：21.60 / 0.693 | +3.7 dB，+0.13 SSIM |
+
+  这**不是 DLSS**：DLSS 的重建基于闭源神经网络，这里是经典流水线（双三次 +
+  重投影 + 裁剪）。意义在于整条路径是开放的、属于我们、并且可测量。
 
 ### 支持的 PTX 子集
 
