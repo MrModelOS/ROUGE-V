@@ -138,7 +138,7 @@ add_test(NAME mlir_simt_to_scf_shared
   COMMAND rouge-opt --rouge-simt-to-scf
           ${CMAKE_CURRENT_SOURCE_DIR}/test/simt_to_scf_shared.mlir)
 set_tests_properties(mlir_simt_to_scf_shared PROPERTIES
-  PASS_REGULAR_EXPRESSION "using shared memory is refused")
+  PASS_REGULAR_EXPRESSION "shared memory passed as a parameter is refused")
 
 # Векторизация unit-stride доступов: структурная проверка + СЕМАНТИЧЕСКАЯ
 # (скалярная и векторная версии обязаны посчитать одно и то же).
@@ -217,13 +217,40 @@ set_tests_properties(mlir_rouge_to_scf PROPERTIES
   PASS_REGULAR_EXPRESSION
     "launches converted=1 refused=0;scf.for")
 
-# Общая память — memref с непустым адресным пространством: адресное
-# пространство живёт в ТИПЕ, и проход обязан отказать громко.
+# Общая память, ПРИХОДЯЩАЯ ПАРАМЕТРОМ: отказ громкий (копия на блок должна
+# жить у вызывающего, а запуск не знает размера).
 add_test(NAME mlir_rouge_to_scf_shared
   COMMAND rouge-opt --rouge-to-scf
           ${CMAKE_CURRENT_SOURCE_DIR}/test/rouge_to_scf_shared.mlir)
 set_tests_properties(mlir_rouge_to_scf_shared PROPERTIES
-  PASS_REGULAR_EXPRESSION "using shared memory is refused")
+  PASS_REGULAR_EXPRESSION "shared memory passed as a parameter is refused")
+
+# Общая память, ОБЪЯВЛЕННАЯ ВНУТРИ ЯДРА: адресное пространство живёт в ТИПЕ,
+# и объявление превращается в private-накопитель на блок (ядро вызывается
+# один раз на блок) — отказа здесь больше нет.
+add_test(NAME mlir_rouge_to_scf_shared_alloc
+  COMMAND rouge-opt --rouge-to-scf
+          ${CMAKE_CURRENT_SOURCE_DIR}/test/rouge_to_scf_shared_alloc.mlir)
+set_tests_properties(mlir_rouge_to_scf_shared_alloc PROPERTIES
+  PASS_REGULAR_EXPRESSION
+    "launches converted=1 refused=0;memref.alloc\\(\\) : memref<64xf32>")
+
+# СЕМАНТИЧЕСКАЯ проверка общей памяти: ядро с .shared обязано посчитать то
+# же, что эталон (сумма 64 * 1.5 = 96). Структурная проверка ничего не
+# говорит о правильности вычисления — это говорит эта.
+if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE)
+  add_test(NAME mlir_rouge_shared_semantics
+    COMMAND ${CMAKE_COMMAND}
+      -DROUGE_OPT=$<TARGET_FILE:rouge-opt>
+      -DMLIR_OPT=${MLIR_OPT_EXE}
+      -DMLIR_TRANSLATE=${MLIR_TRANSLATE_EXE}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/test/rouge_shared_semantics.mlir
+      -DRUNTIME_C=$<TARGET_FILE:mlir_print_f32>
+      -DEXPECTED=sum=96.000000
+      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/rouge-shared-semantics
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/rouge_semantics.cmake)
+endif()
 
 # Полная цепочка на НАШЕМ диалекте: rouge -> SCF -> Vector -> LLVM IR ->
 # ассемблер RISC-V (настоящие vle32.v) -> исполнение под qemu-riscv64.

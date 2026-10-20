@@ -173,6 +173,77 @@ struct SimtLoweringBase {
     return kernel;
   }
 
+  // The default memory space: whatever a memref without a space gets;
+  // comparing against it avoids depending on how MLIR spells it.
+  static Attribute defaultMemorySpace(MLIRContext *ctx) {
+    return MemRefType::get({1}, Float32Type::get(ctx)).getMemorySpace();
+  }
+
+  static bool isSharedMemRef(Type t, MLIRContext *ctx) {
+    auto mr = dyn_cast<MemRefType>(t);
+    return mr && mr.getMemorySpace() != defaultMemorySpace(ctx);
+  }
+
+  // The SHARED memory of a kernel.
+  //
+  // In our dialect the shared memory is DECLARED inside the kernel (a
+  // memref.alloc with the shared address space) — exactly like CUDA's
+  // ".shared" declaration. The kernel runs once per block, so turning the
+  // declaration into a private allocation gives exactly the lifetime the
+  // shared memory has: it lives as long as the block, and the next block
+  // gets a fresh one. The barrier keeps the phases apart, so the ordering
+  // requirement of the shared memory holds.
+  //
+  // A shared memory passed as a PARAMETER cannot be handled this way: the
+  // per-block copy would have to live in the caller, and the launch does not
+  // know the size. That is refused loudly.
+  static LogicalResult lowerSharedMemory(KernelOp kernel) {
+    MLIRContext *ctx = kernel.getContext();
+    Attribute defaultSpace = defaultMemorySpace(ctx);
+
+    for (Type t : kernel.getFunctionType().getInputs()) {
+      if (!isSharedMemRef(t, ctx)) continue;
+      kernel.emitError(
+          "a shared memory passed as a parameter is refused: declare it "
+          "inside the kernel (a memref.alloc with the shared address space) "
+          "so that the per-block copy is created together with the block");
+      return failure();
+    }
+
+    SmallVector<Operation *> allocs;
+    kernel.walk([&](Operation *op) {
+      if (isa<memref::AllocOp, memref::AllocaOp>(op)) allocs.push_back(op);
+    });
+    SmallVector<Value> sharedAllocs;
+    for (Operation *op : allocs) {
+      auto mr = cast<MemRefType>(op->getResult(0).getType());
+      if (mr.getMemorySpace() == defaultSpace) continue;
+      // MLIR 23: the layout comes before the memory space.
+      MemRefType newType = MemRefType::get(
+          mr.getShape(), mr.getElementType(), mr.getLayout(), defaultSpace);
+      // The type of the result is changed in place: the op keeps its
+      // attributes (the alignment, the dynamic sizes) and its uses (the
+      // dealloc, the loads) follow the new type.
+      op->getResult(0).setType(newType);
+      sharedAllocs.push_back(op->getResult(0));
+    }
+
+    // The shared memory dies with the BLOCK, so there is nothing to free:
+    // the dealloc is removed. Left in place, it would run once per thread
+    // (the phases are loops over the threads) — a double free.
+    SmallVector<Operation *> deallocs;
+    kernel.walk([&](Operation *op) {
+      if (!isa<memref::DeallocOp>(op)) return;
+      for (Value operand : op->getOperands())
+        if (llvm::is_contained(sharedAllocs, operand)) {
+          deallocs.push_back(op);
+          return;
+        }
+    });
+    for (Operation *op : deallocs) op->erase();
+    return success();
+  }
+
   // The kernel body: phases of thread loops. `launch` may be a null op: a
   // kernel without a launch is lowered on its own (the block size then comes
   // from an explicit block_dim in the body). `takesBlockId` reports whether
@@ -183,6 +254,11 @@ struct SimtLoweringBase {
     Region &body = kernel.getBody();
     if (body.empty()) return success();
 
+    // The shared memory: the declaration inside the kernel becomes a private
+    // allocation (the kernel runs once per block, so the allocation is per
+    // block). A shared memory that arrives as a parameter is refused.
+    if (failed(lowerSharedMemory(kernel))) return failure();
+
     if (usesSharedMemory(kernel)) {
       kernel.emitError("a kernel using shared memory is refused for now (the "
                        "per-block copy of the shared memory would be lost "
@@ -190,6 +266,7 @@ struct SimtLoweringBase {
                        "a memory space and be copied per block)");
       return failure();
     }
+
     if (hasBarrierInDivergentRegion(kernel)) {
       kernel.emitError("a barrier inside a divergent branch is refused — "
                        "every thread of the scope must reach the same "
@@ -246,6 +323,39 @@ struct SimtLoweringBase {
       return failure();
     }
 
+    // The body's ops split into two groups:
+    //   * loop-invariant (constants, address computations that do not depend
+    //     on the thread id) — they are hoisted OUT of the thread loops, once
+    //     per function; otherwise a value defined in the first phase would
+    //     not dominate its use in the second one;
+    //   * thread-dependent — they go into the body of the phase's loop.
+    // Both groups are CLONED: the originals die with the old kernel, and a
+    // clone that still referred to them would be a dangling reference.
+    std::function<bool(Operation *, unsigned)> dependsOnThread =
+        [&](Operation *op, unsigned depth) -> bool {
+      if (depth > 16) return true;  // unknown -> assume dependent (safe)
+      // The thread id itself is the loop's induction variable: it is
+      // "dependent" by definition (hoisting it out of the loop would give
+      // every thread the same value).
+      if (isa<ThreadIdOp>(op)) return true;
+      for (Value operand : op->getOperands()) {
+        Operation *def = operand.getDefiningOp();
+        if (!def) continue;
+        if (isa<ThreadIdOp>(def)) return true;
+        if (dependsOnThread(def, depth + 1)) return true;
+      }
+      return false;
+    };
+
+    SmallVector<Operation *> invariantOps, dependentOps;
+    for (Operation *op : ops) {
+      if (isa<BarrierOp>(op)) continue;
+      if (dependsOnThread(op, 0))
+        dependentOps.push_back(op);
+      else
+        invariantOps.push_back(op);
+    }
+
     // The new function: the same arguments plus the block id (if the body
     // uses it), because the block id now lives in the launch's loop.
     auto fnType = cast<FunctionType>(kernel.getFunctionType());
@@ -296,39 +406,6 @@ struct SimtLoweringBase {
     Value c0 = arith::ConstantIndexOp::create(builder, 0);
     Value c1 = arith::ConstantIndexOp::create(builder, 1);
 
-    // The body's ops split into two groups:
-    //   * loop-invariant (constants, address computations that do not depend
-    //     on the thread id) — they are hoisted OUT of the thread loops, once
-    //     per function; otherwise a value defined in the first phase would
-    //     not dominate its use in the second one;
-    //   * thread-dependent — they go into the body of the phase's loop.
-    // Both groups are CLONED: the originals die with the old kernel, and a
-    // clone that still referred to them would be a dangling reference.
-    std::function<bool(Operation *, unsigned)> dependsOnThread =
-        [&](Operation *op, unsigned depth) -> bool {
-      if (depth > 16) return true;  // unknown -> assume dependent (safe)
-      // The thread id itself is the loop's induction variable: it is
-      // "dependent" by definition (hoisting it out of the loop would give
-      // every thread the same value).
-      if (isa<ThreadIdOp>(op)) return true;
-      for (Value operand : op->getOperands()) {
-        Operation *def = operand.getDefiningOp();
-        if (!def) continue;
-        if (isa<ThreadIdOp>(def)) return true;
-        if (dependsOnThread(def, depth + 1)) return true;
-      }
-      return false;
-    };
-
-    SmallVector<Operation *> invariantOps, dependentOps;
-    for (Operation *op : ops) {
-      if (isa<BarrierOp>(op)) continue;
-      if (dependsOnThread(op, 0))
-        dependentOps.push_back(op);
-      else
-        invariantOps.push_back(op);
-    }
-
     // Hoisted invariants: cloned into the function's entry block, in order.
     // The clone goes through an IRMapping, so an invariant op that uses the
     // result of another invariant op (a constant used by an address
@@ -340,6 +417,55 @@ struct SimtLoweringBase {
       Operation *clone = builder.clone(*op, invMapper);
       invMapper.map(op->getResults(), clone->getResults());
       invariantClone[op] = clone;
+    }
+
+    // The identity ops (the thread id, the block id) are not tied to a
+    // phase: they are values of the whole kernel, and a LATER phase may use
+    // the thread id that an earlier phase defined. So their mapping is set up
+    // in EVERY phase — otherwise the clone of a later phase would refer to
+    // the op in the old kernel, which is erased at the end (a dangling
+    // reference, and a crash much later).
+    SmallVector<Operation *> threadIdOps, blockIdOps;
+    for (Operation *op : ops) {
+      if (isa<ThreadIdOp>(op))
+        threadIdOps.push_back(op);
+      else if (isa<BlockIdOp>(op))
+        blockIdOps.push_back(op);
+    }
+
+    // A value defined in one phase and used in another: the phases are
+    // SEPARATE loops, so such a value does not survive from one loop to the
+    // next. Carrying it would mean passing it between the loops (the
+    // iter_args of scf.for), and until that is implemented the honest answer
+    // is a refusal: the kernel is not silently mis-lowered.
+    {
+      DenseMap<Operation *, unsigned> phaseOf;
+      for (unsigned p = 0; p < phases.size(); ++p)
+        for (unsigned idx : phases[p]) phaseOf[ops[idx]] = p;
+      for (unsigned p = 0; p < phases.size(); ++p) {
+        for (unsigned idx : phases[p]) {
+          Operation *op = ops[idx];
+          if (isa<ThreadIdOp, BlockIdOp>(op)) continue;
+          for (Value operand : op->getOperands()) {
+            Operation *def = operand.getDefiningOp();
+            if (!def) continue;
+            if (isa<ThreadIdOp, BlockIdOp>(def)) continue;
+            // The invariants are hoisted out of the loops, so they dominate
+            // every phase and are not a cross-phase dependency.
+            if (std::find(invariantOps.begin(), invariantOps.end(), def) !=
+                invariantOps.end())
+              continue;
+            auto it = phaseOf.find(def);
+            if (it == phaseOf.end() || it->second == p) continue;
+            op->emitError(
+                "a value defined in one phase is used in another phase — the "
+                "phases are separate loops, so the value does not survive "
+                "between them; carry it through the loop (iter_args) or "
+                "refuse the kernel");
+            return failure();
+          }
+        }
+      }
     }
 
     // Phases now refer to the dependent ops by index.
@@ -394,27 +520,25 @@ struct SimtLoweringBase {
       // refer to the values of the body — without the mapping they would
       // keep referring to the old kernel, which is a dangling reference.
       IRMapping mapper;
-      for (unsigned idx : phase) {
-        Operation *op = ops[idx];
-        if (auto tid = dyn_cast<ThreadIdOp>(op)) {
-          if (!isX(tid.getDimension())) {
-            tid.emitError("only the x dimension of the thread id is "
-                          "supported");
-            phaseFailed = true;
-            return failure();
-          }
-          mapper.map(tid.getResult(), tidValue);
-          continue;
+      // The identity ops are mapped in EVERY phase (see above): a later
+      // phase may use the thread id that an earlier phase defined.
+      for (Operation *op : threadIdOps) {
+        auto tid = cast<ThreadIdOp>(op);
+        if (!isX(tid.getDimension())) {
+          tid.emitError("only the x dimension of the thread id is supported");
+          phaseFailed = true;
+          return failure();
         }
-        if (auto bid = dyn_cast<BlockIdOp>(op)) {
-          if (!isX(bid.getDimension())) {
-            bid.emitError("only the x dimension of the block id is supported");
-            phaseFailed = true;
-            return failure();
-          }
-          if (blockIdArg) mapper.map(bid.getResult(), blockIdArg);
-          continue;
+        mapper.map(tid.getResult(), tidValue);
+      }
+      for (Operation *op : blockIdOps) {
+        auto bid = cast<BlockIdOp>(op);
+        if (!isX(bid.getDimension())) {
+          bid.emitError("only the x dimension of the block id is supported");
+          phaseFailed = true;
+          return failure();
         }
+        if (blockIdArg) mapper.map(bid.getResult(), blockIdArg);
       }
       // The invariants are visible from the loop body.
       for (Operation *op : invariantOps) {
