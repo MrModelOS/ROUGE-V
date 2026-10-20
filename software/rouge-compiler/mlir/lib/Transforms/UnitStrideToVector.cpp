@@ -78,6 +78,19 @@ VectorType vectorOf(Type elem, int64_t width) {
   return VectorType::get({width}, elem);
 }
 
+// The alignment of a vector access. WITHOUT this attribute the LLVM lowering
+// assumes the alignment of the ELEMENT (4 bytes for f32), not of the vector
+// (16 bytes for vector<4xf32>) — a vector access may then be lowered as
+// an aligned 16-byte access on a 4-byte-aligned pointer. The attribute
+// exists since LLVM 21.
+llvm::MaybeAlign alignmentOf(VectorType vecTy) {
+  const int64_t bits =
+      vecTy.getElementType().isF32() ? 32 : vecTy.getElementTypeBitWidth();
+  const uint64_t bytes = (uint64_t)bits * (uint64_t)vecTy.getNumElements() / 8;
+  if (bytes == 0) return llvm::MaybeAlign();
+  return llvm::MaybeAlign((uint64_t)llvm::PowerOf2Ceil(bytes));
+}
+
 // A constant index value.
 struct ConstIndex {
   bool found = false;
@@ -334,16 +347,19 @@ struct UnitStrideToVector
         auto load = cast<memref::LoadOp>(item.op);
         VectorType vecTy = vectorOf(item.memrefTy.getElementType(), width_);
         Value idx = remapIndex(item.index, iv, vecIv);
-        auto vecLoad =
-            vector::LoadOp::create(builder, vecTy, load.getMemRef(), ValueRange{idx});
+        auto vecLoad = vector::LoadOp::create(builder, vecTy, load.getMemRef(),
+                                             ValueRange{idx}, /*nontemporal=*/false,
+                                             alignmentOf(vecTy));
         mapped[load.getResult()] = vecLoad.getResult();
         continue;
       }
       if (item.kind == BodyKind::Store) {
         auto store = cast<memref::StoreOp>(item.op);
+        VectorType vecTy = vectorOf(item.memrefTy.getElementType(), width_);
         Value val = mapped.lookup(item.value);
         Value idx = remapIndex(item.index, iv, vecIv);
-        vector::StoreOp::create(builder, val, store.getMemRef(), ValueRange{idx});
+        vector::StoreOp::create(builder, val, store.getMemRef(), ValueRange{idx},
+                               /*nontemporal=*/false, alignmentOf(vecTy));
         continue;
       }
       if (item.kind == BodyKind::Constant) {

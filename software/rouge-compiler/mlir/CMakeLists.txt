@@ -129,6 +129,30 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE)
       -P ${CMAKE_CURRENT_SOURCE_DIR}/vector_semantics.cmake)
 endif()
 
+# Полная цепочка SIMT -> SCF -> Vector -> RVV: модуль векторизуется, lowers
+# в LLVM IR, собирается llc -march=rv64gcv и исполняется под qemu-riscv64.
+# Скалярная версия того же модуля собирается и запускается так же — результаты
+# должны совпасть, а в ассемблере векторной сборки должны быть настоящие
+# инструкции RVV (vle32.v / vse32.v).
+find_program(LLC_EXE llc HINTS ${MLIR_BIN_DIR})
+find_program(QEMU_RISCV qemu-riscv64
+  HINTS $ENV{HOME}/.local/pkgs/qemu-user-11.1.2-1-x86_64/usr/bin
+        /usr/local/bin /usr/bin)
+if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND LLC_EXE AND QEMU_RISCV)
+  add_test(NAME mlir_unit_stride_to_vector_rvv
+    COMMAND ${CMAKE_COMMAND}
+      -DROUGE_OPT=$<TARGET_FILE:rouge-opt>
+      -DMLIR_OPT=${MLIR_OPT_EXE}
+      -DMLIR_TRANSLATE=${MLIR_TRANSLATE_EXE}
+      -DLLC=${LLC_EXE}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DQEMU=${QEMU_RISCV}
+      -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/test/simt_to_rvv.mlir
+      -DHARNESS_C=${CMAKE_CURRENT_SOURCE_DIR}/test/rv_vector_harness.c
+      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/vector-rvv
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/vector_rvv.cmake)
+endif()
+
 # Синтаксис memref.atomic_rmw изменился в MLIR 23 — отдельный вход и
 # отдельная ячейка только для новых версий.
 if(MLIR_VERSION_MAJOR GREATER_EQUAL 23)

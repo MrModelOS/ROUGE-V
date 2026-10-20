@@ -195,8 +195,21 @@ struct SimtToScf
       }
       ++converted;
     }
+    // A gpu.module whose kernels were all converted is now empty and has no
+    // business staying in the module: the LLVM lowering of the contour does
+    // not know the GPU dialect and would refuse the whole module.
+    SmallVector<gpu::GPUModuleOp> gpuModules;
+    module.walk([&](gpu::GPUModuleOp m) { gpuModules.push_back(m); });
+    unsigned dropped = 0;
+    for (gpu::GPUModuleOp m : gpuModules) {
+      if (m.getBody()->empty()) {
+        m->erase();
+        ++dropped;
+      }
+    }
     llvm::errs() << "rouge-simt-to-scf: kernels converted=" << converted
-                 << " refused=" << refused << "\n";
+                 << " refused=" << refused
+                 << " empty gpu.modules dropped=" << dropped << "\n";
 
   }
 
