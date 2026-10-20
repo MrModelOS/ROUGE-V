@@ -131,14 +131,6 @@ bool hasBarrierInDivergentRegion(Operation *body) {
 // scf.for body callback we only have a plain OpBuilder, and MLIR 23's static
 // create() wants an ImplicitLocOpBuilder (which cannot be built from an
 // OpBuilder — the class is not copyable).
-// scf.yield terminator (MLIR 23 wants an ImplicitLocOpBuilder, which cannot
-// be made from a plain OpBuilder, so the op is built directly).
-static void makeYield(OpBuilder &b, Location loc) {
-  OperationState st(loc, scf::YieldOp::getOperationName());
-  st.addOperands({});
-  st.addTypes({});
-  b.create(st);
-}
 
 static Value makeIndexCast(OpBuilder &b, Location loc, Type type, Value v) {
   OperationState st(loc, arith::IndexCastOp::getOperationName());
