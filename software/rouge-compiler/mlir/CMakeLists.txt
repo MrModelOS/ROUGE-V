@@ -92,13 +92,21 @@ set_tests_properties(mlir_simt_to_scf PROPERTIES
   PASS_REGULAR_EXPRESSION
     "kernels converted=1 refused=0;scf.for")
 
-# A kernel with a divergent branch must be REFUSED with a loud error, not
-# rewritten: the pass has no divergence model yet.
+# A divergent branch (no barrier inside) is NOT an error: the threads run
+# sequentially, so each takes its own path. The kernel must be lowered.
 add_test(NAME mlir_simt_to_scf_divergent
   COMMAND rouge-opt --rouge-simt-to-scf
           ${CMAKE_CURRENT_SOURCE_DIR}/test/simt_to_scf_divergent.mlir)
 set_tests_properties(mlir_simt_to_scf_divergent PROPERTIES
-  PASS_REGULAR_EXPRESSION "divergent control flow is not supported")
+  PASS_REGULAR_EXPRESSION "kernels converted=1 refused=0")
+
+# A BARRIER inside a divergent branch breaks the gpu.barrier contract, so the
+# result would be undefined — the pass must refuse loudly.
+add_test(NAME mlir_simt_to_scf_barrier_divergence
+  COMMAND rouge-opt --rouge-simt-to-scf
+          ${CMAKE_CURRENT_SOURCE_DIR}/test/simt_to_scf_barrier_divergence.mlir)
+set_tests_properties(mlir_simt_to_scf_barrier_divergence PROPERTIES
+  PASS_REGULAR_EXPRESSION "barrier inside a divergent branch")
 
 # Векторизация unit-stride доступов: структурная проверка + СЕМАНТИЧЕСКАЯ
 # (скалярная и векторная версии обязаны посчитать одно и то же).

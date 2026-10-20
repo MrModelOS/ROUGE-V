@@ -62,6 +62,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
@@ -92,15 +93,35 @@ bool dependsOnThreadId(Value v, unsigned depth = 0) {
   return false;
 }
 
-// A branch whose condition depends on the thread id diverges.
-bool hasDivergentBranch(Operation *body) {
+// A branch whose condition depends on the thread id diverges: different
+// threads take different paths.
+//
+// Such a branch is NOT an error by itself. Our lowering runs the threads
+// SEQUENTIALLY (one thread's whole body, then the next one's), so a divergent
+// branch simply means "each thread takes its own path" — the same semantics
+// the hardware has, minus the parallelism. What that changes is the memory
+// ORDER between threads: without a barrier, the order between threads is
+// undefined on a GPU anyway, so a sequential order is a valid instance of
+// it.
+//
+// The one case that is genuinely unsound is a BARRIER inside a divergent
+// region: the gpu.barrier contract says all threads of the scope must reach
+// the same dynamic instance of it, and a divergent branch breaks that. The
+// GPU's result is then undefined, and the phase decomposition (which assumes
+// every thread reaches every barrier) is no longer valid. That is what we
+// refuse.
+bool hasBarrierInDivergentRegion(Operation *body) {
   bool found = false;
   body->walk([&](Operation *op) {
-    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-      if (dependsOnThreadId(ifOp.getCondition())) found = true;
-    }
-    if (auto br = dyn_cast<cf::CondBranchOp>(op)) {
-      if (dependsOnThreadId(br.getCondition())) found = true;
+    if (found) return;
+    if (!isa<gpu::BarrierOp>(op)) return;
+    // Is the barrier inside a conditional region?
+    for (Operation *parent = op->getParentOp(); parent; parent = parent->getParentOp()) {
+      if (isa<scf::IfOp>(parent) || isa<cf::CondBranchOp>(parent)) {
+        found = true;
+        return;
+      }
+      if (isa<func::FuncOp>(parent) || isa<gpu::GPUFuncOp>(parent)) break;
     }
   });
   return found;
@@ -228,9 +249,11 @@ struct SimtToScf
     Region &body = kernel.getBody();
     if (body.empty()) return success();
 
-    if (hasDivergentBranch(kernel)) {
-      kernel.emitError("rouge-simt-to-scf: divergent control flow is not "
-                       "supported yet (the pass refuses instead of guessing)");
+    if (hasBarrierInDivergentRegion(kernel)) {
+      kernel.emitError("rouge-simt-to-scf: a barrier inside a divergent branch "
+                       "is refused — the gpu.barrier contract requires every "
+                       "thread of the scope to reach the same instance of it, "
+                       "so the result would be undefined");
       return failure();
     }
 
@@ -368,26 +391,16 @@ struct SimtToScf
     }
 
     // Hoisted invariants: cloned into the function's entry block, in order.
-    // Their operands are remapped too: an invariant op may well use the
+    // The clone goes through an IRMapping, so an invariant op that uses the
     // result of another invariant op (a constant used by an address
-    // computation), and that result exists only as a clone.
+    // computation) refers to the CLONE, and the mapping also covers the
+    // contents of nested regions.
+    IRMapping invMapper;
     DenseMap<Operation *, Operation *> invariantClone;
-    for (Operation *op : invariantOps)
-      invariantClone[op] = builder.clone(*op);
     for (Operation *op : invariantOps) {
-      Operation *cloned = invariantClone[op];
-      SmallVector<Value> newOperands;
-      for (Value operand : cloned->getOperands()) {
-        Operation *def = operand.getDefiningOp();
-        auto it = def ? invariantClone.find(def) : invariantClone.end();
-        if (it != invariantClone.end() && it->second != cloned) {
-          newOperands.push_back(
-              it->second->getResult(cast<OpResult>(operand).getResultNumber()));
-          continue;
-        }
-        newOperands.push_back(operand);
-      }
-      cloned->setOperands(newOperands);
+      Operation *clone = builder.clone(*op, invMapper);
+      invMapper.map(op->getResults(), clone->getResults());
+      invariantClone[op] = clone;
     }
 
     // Phases now refer to the dependent ops by index.
@@ -433,65 +446,53 @@ struct SimtToScf
       Value tidValue = iv;
       if (tidValue.getType() != threadIdType)
         tidValue = makeIndexCast(bodyBuilder, loc, threadIdType, tidValue);
-      // Clone the whole phase first, remembering old -> new. Only afterwards
-      // are the operands remapped: a clone of this phase may use the result
-      // of ANOTHER op of the same phase, and that other op is itself only
-      // alive as a clone — the original dies with the old kernel.
-      DenseMap<Operation *, Operation *> phaseClone;
+      // Clone the phase through an IRMapping. The mapping carries three
+      // things: the thread id -> the induction variable, the hoisted
+      // invariants -> their clones, and the results of the ops of this phase
+      // -> their clones. Going through the mapping (instead of rewriting the
+      // operands by hand) is what makes the NESTED regions come along: a
+      // divergent branch inside the body carries a region, and its contents
+      // refer to the values of the body — without the mapping they would
+      // keep referring to the old kernel, which is a dangling reference.
+      IRMapping mapper;
       for (unsigned idx : phase) {
-        Operation *cloned = bodyBuilder.clone(*ops[idx]);
-        phaseClone[ops[idx]] = cloned;
-      }
-      for (unsigned idx : phase) {
-        Operation *cloned = phaseClone[ops[idx]];
-        SmallVector<Value> newOperands;
-        for (Value operand : cloned->getOperands()) {
-          Operation *def = operand.getDefiningOp();
-          if (def) {
-            if (isa<gpu::ThreadIdOp>(def)) {
-              newOperands.push_back(tidValue);
-              continue;
-            }
-            auto inv = invariantClone.find(def);
-            if (inv != invariantClone.end()) {
-              newOperands.push_back(
-                  inv->second->getResult(cast<OpResult>(operand).getResultNumber()));
-              continue;
-            }
-            auto ph = phaseClone.find(def);
-            if (ph != phaseClone.end()) {
-              newOperands.push_back(
-                  ph->second->getResult(cast<OpResult>(operand).getResultNumber()));
-              continue;
-            }
-          }
-          newOperands.push_back(operand);
-        }
-        cloned->setOperands(newOperands);
-        if (auto tid = dyn_cast<gpu::ThreadIdOp>(cloned)) {
+        Operation *op = ops[idx];
+        if (auto tid = dyn_cast<gpu::ThreadIdOp>(op)) {
           if (tid.getDimension() != gpu::Dimension::x) {
             tid.emitError("rouge-simt-to-scf: only the x dimension of "
                           "gpu.thread_id is supported");
             phaseFailed = true;
             return failure();
           }
-          tid.getResult().replaceAllUsesWith(tidValue);
-          tid->erase();
+          mapper.map(tid.getResult(), tidValue);
           continue;
         }
-        if (auto bid = dyn_cast<gpu::BlockIdOp>(cloned)) {
+        if (auto bid = dyn_cast<gpu::BlockIdOp>(op)) {
           if (bid.getDimension() != gpu::Dimension::x) {
             bid.emitError("rouge-simt-to-scf: only the x dimension of "
                           "gpu.block_id is supported");
             phaseFailed = true;
             return failure();
           }
-          if (blockIdArg) {
-            bid.getResult().replaceAllUsesWith(blockIdArg);
-            bid->erase();
-            continue;
-          }
+          if (blockIdArg) mapper.map(bid.getResult(), blockIdArg);
+          continue;
         }
+      }
+      // The invariants are visible from the loop body.
+      for (Operation *op : invariantOps) {
+        Operation *clone = invariantClone[op];
+        for (auto pair : llvm::zip(op->getResults(), clone->getResults()))
+          mapper.map(std::get<0>(pair), std::get<1>(pair));
+      }
+      for (unsigned idx : phase) {
+        Operation *op = ops[idx];
+        // The thread id and the block id have no counterpart in the lowered
+        // form: they ARE the induction variable and the block argument, so
+        // they are not cloned at all (cloning them would also overwrite the
+        // mapping to the induction variable).
+        if (isa<gpu::ThreadIdOp, gpu::BlockIdOp>(op)) continue;
+        Operation *cloned = bodyBuilder.clone(*op, mapper);
+        mapper.map(op->getResults(), cloned->getResults());
       }
       // The body of an scf.for must end with scf.yield. The op is created
       // through the dialect's own builder (a raw OperationState would need
