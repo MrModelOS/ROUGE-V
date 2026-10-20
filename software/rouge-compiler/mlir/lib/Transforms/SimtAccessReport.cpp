@@ -161,6 +161,7 @@ void registerRougeSimtTransformsPasses() {
   // anonymous namespace there).
   registerSimtToScfPass();
   registerRougeUnitStrideToVectorPass();
+  registerRougeToScfPass();
 }
 
 }  // namespace rouge

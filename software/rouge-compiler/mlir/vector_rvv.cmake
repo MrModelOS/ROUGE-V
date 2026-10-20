@@ -20,6 +20,9 @@
 #   CLANG          a C compiler
 #   QEMU           qemu-riscv64
 #   INPUT          the .mlir module
+#   SIMT_PASS      the pass that lowers SIMT into loops; by default the
+#                  upstream gpu dialect's one (--rouge-simt-to-scf), and
+#                  --rouge-to-scf for OUR dialect
 #   HARNESS_C      the freestanding RISC-V harness (C source; it is compiled
 #                  for riscv64 HERE, not for the host — the register names
 #                  and the exit syscall are RISC-V ones)
@@ -34,17 +37,23 @@ endforeach()
 
 file(MAKE_DIRECTORY "${WORK_DIR}")
 
+# The pass that lowers the SIMT structure into loops: the upstream gpu
+# dialect's one, or ours.
+if(NOT DEFINED SIMT_PASS OR "${SIMT_PASS}" STREQUAL "")
+  set(SIMT_PASS --rouge-simt-to-scf)
+endif()
+
 # 1) The SIMT module -> SCF (the scalar reference) and -> SCF -> Vector.
 set(scf_mlir "${WORK_DIR}/scf.mlir")
 set(vec_mlir "${WORK_DIR}/vectorised.mlir")
 execute_process(
-  COMMAND "${ROUGE_OPT}" --rouge-simt-to-scf "${INPUT}" -o "${scf_mlir}"
+  COMMAND "${ROUGE_OPT}" ${SIMT_PASS} "${INPUT}" -o "${scf_mlir}"
   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0)
   message(FATAL_ERROR "vector rvv: FAILED - rouge-opt (scf) exited ${rc}: ${err}")
 endif()
 execute_process(
-  COMMAND "${ROUGE_OPT}" --rouge-simt-to-scf --rouge-unit-stride-to-vector
+  COMMAND "${ROUGE_OPT}" ${SIMT_PASS} --rouge-unit-stride-to-vector
           "${INPUT}" -o "${vec_mlir}"
   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0)

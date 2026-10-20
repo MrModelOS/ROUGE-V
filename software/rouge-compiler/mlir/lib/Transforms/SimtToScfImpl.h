@@ -1,0 +1,527 @@
+//===- SimtToScfImpl.h - the shared SIMT -> SCF lowering -*- C++ -*-===//
+//
+// The lowering of a SIMT kernel into explicit loops, written ONCE and used
+// for two dialects:
+//
+//   * the upstream `gpu` dialect (the contour works with it today), and
+//   * our own `rouge` dialect (the 2.0 plan: the kernel is described in a
+//     dialect we own, and the SIMT-specific ops live in one place).
+//
+// The two dialects describe the same thing — a launch over a grid of blocks,
+// the thread/block identity, a barrier and the memory accesses — so the
+// lowering is the same transformation; only the op names differ. Duplicating
+// the transformation would mean two places to fix the same bug, and the bugs
+// here are subtle (dangling references to the erased kernel, the dominance
+// of a value defined in the first phase, the induction variable's type).
+//
+// The transformation (the classic "SIMT to SIMD" phase decomposition):
+//
+//   launch %grid, %block, @k(%A)
+//   @k(%A) { body0; barrier; body1 }
+//
+// becomes
+//
+//   scf.for %b = 0 to %grid.x {            // the launch: one block at a time
+//     scf.for %t = 0 to %block.x { body0' }   // phase 0: no barrier inside
+//     scf.for %t = 0 to %block.x { body1' }   // phase 1
+//   }
+//
+// The barrier itself disappears: it only said "all the threads of the block
+// reach this point", and after the decomposition every thread of phase 0 has
+// run before phase 1 starts — the barrier's ordering requirement holds by
+// construction.
+//
+// Splitting at the barriers is not optional. If the body stayed one loop,
+// thread 0 would run the whole body (including the code after the barrier)
+// before thread 1 ran the code before it — the barrier's meaning would be
+// lost.
+//
+// What this lowering does NOT do (and says so):
+//   * it does not vectorize — that is a separate pass;
+//   * a divergent branch is NOT refused: our lowering runs the threads
+//     SEQUENTIALLY, so each thread takes its own path — the same semantics
+//     the hardware has, minus the parallelism. What that changes is the
+//     memory ORDER between threads, and without a barrier that order is
+//     undefined on a GPU anyway;
+//   * a BARRIER inside a divergent branch IS refused: the barrier contract
+//     requires every thread of the scope to reach the same instance of it,
+//     so the result would be undefined, and the phase decomposition would
+//     not hold;
+//   * a kernel that uses SHARED memory is refused: the per-block copy of the
+//     shared memory would be lost silently. The address space is part of the
+//     memref type, so the CPU lowering CAN turn shared into private storage
+//     — but only once the copy is there.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef ROUGE_TRANSFORMS_SIMTTOSCFIMPL_H
+#define ROUGE_TRANSFORMS_SIMTTOSCFIMPL_H
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Operation.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/Verifier.h"
+#include "mlir/Pass/Pass.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <algorithm>
+#include <functional>
+#include <map>
+#include <memory>
+#include <string>
+
+namespace rouge {
+
+using namespace mlir;  // NOLINT: the implementation header is internal
+
+// Index cast without the deprecated builder::create overloads: inside the
+// scf.for body callback we only have a plain OpBuilder, and MLIR 23's static
+// create() wants an ImplicitLocOpBuilder (which cannot be built from an
+// OpBuilder — the class is not copyable).
+static Value makeIndexCast(OpBuilder &b, Location loc, Type type, Value v) {
+  OperationState st(loc, arith::IndexCastOp::getOperationName());
+  st.addOperands(v);
+  st.addTypes(type);
+  return b.create(st)->getResult(0);
+}
+
+// Cast to index only when it is actually needed: an index->index cast is
+// invalid IR.
+static Value castToIndex(OpBuilder &b, Location loc, Value v) {
+  if (v.getType().isIndex()) return v;
+  return makeIndexCast(b, loc, b.getIndexType(), v);
+}
+
+// The lowering itself. The op types are the template parameters, so the
+// gpu-dialect and the rouge-dialect passes share the code.
+template <typename KernelOp, typename LaunchOp, typename ThreadIdOp,
+          typename BlockIdOp, typename BlockDimOp, typename GridDimOp,
+          typename BarrierOp, typename ReturnOp, typename DimensionT>
+struct SimtLoweringBase {
+  // True if the dimension is the x one. Both dialects number the dimensions
+  // x, y, z — and the check goes through the stringifier, so it does not
+  // depend on the numbering.
+  static bool isX(DimensionT dim) {
+    return stringifyDimension(dim) == "x";
+  }
+
+  // True if the value (transitively, through the arithmetic the kernel uses)
+  // depends on the thread id.
+  static bool dependsOnThreadId(Value v, unsigned depth = 0) {
+    if (!v || depth > 8) return false;
+    if (isa<ThreadIdOp>(v.getDefiningOp())) return true;
+    Operation *def = v.getDefiningOp();
+    if (!def) return false;
+    for (Value operand : def->getOperands())
+      if (dependsOnThreadId(operand, depth + 1)) return true;
+    return false;
+  }
+
+  // A barrier inside a conditional region breaks the barrier contract: the
+  // threads of the scope do not all reach the same instance of it, so the
+  // result is undefined and the phase decomposition does not hold.
+  static bool hasBarrierInDivergentRegion(Operation *body) {
+    bool found = false;
+    body->walk([&](Operation *op) {
+      if (found) return;
+      if (!isa<BarrierOp>(op)) return;
+      for (Operation *parent = op->getParentOp(); parent;
+           parent = parent->getParentOp()) {
+        if (isa<scf::IfOp>(parent)) {
+          found = true;
+          return;
+        }
+        if (isa<func::FuncOp>(parent)) break;
+      }
+    });
+    return found;
+  }
+
+  // The kernels that use SHARED memory (a memref with a non-default memory
+  // space) are refused: the per-block copy of the shared memory would be
+  // lost silently, and the accesses would read the wrong memory.
+  static bool usesSharedMemory(Operation *kernel) {
+    bool hasShared = false;
+    // The default memory space is whatever a memref without a space gets;
+    // comparing against it avoids depending on how MLIR spells it.
+    const Attribute defaultSpace =
+        MemRefType::get({1}, Float32Type::get(kernel->getContext()))
+            .getMemorySpace();
+    kernel->walk([&](Operation *op) {
+      auto check = [&](Type t) {
+        if (auto mr = dyn_cast<MemRefType>(t))
+          if (mr.getMemorySpace() != defaultSpace) hasShared = true;
+      };
+      for (Type t : op->getOperandTypes()) check(t);
+      for (Type t : op->getResultTypes()) check(t);
+    });
+    return hasShared;
+  }
+
+  // The kernel of a launch.
+  static KernelOp findKernel(ModuleOp module, LaunchOp launch) {
+    auto kernel = module.lookupSymbol<KernelOp>(
+        launch.getKernelAttr().getLeafReference());
+    if (!kernel)
+      launch.emitError("the launch's kernel symbol does not name a kernel");
+    return kernel;
+  }
+
+  // The kernel body: phases of thread loops. `launch` may be a null op: a
+  // kernel without a launch is lowered on its own (the block size then comes
+  // from an explicit block_dim in the body). `takesBlockId` reports whether
+  // the new function takes the block id as an extra argument — the caller
+  // needs it to build the call.
+  static LogicalResult convertKernel(KernelOp kernel, LaunchOp launch,
+                                     bool &takesBlockId) {
+    Region &body = kernel.getBody();
+    if (body.empty()) return success();
+
+    if (usesSharedMemory(kernel)) {
+      kernel.emitError("a kernel using shared memory is refused for now (the "
+                       "per-block copy of the shared memory would be lost "
+                       "silently; the shared memory must become a memref with "
+                       "a memory space and be copied per block)");
+      return failure();
+    }
+    if (hasBarrierInDivergentRegion(kernel)) {
+      kernel.emitError("a barrier inside a divergent branch is refused — "
+                       "every thread of the scope must reach the same "
+                       "instance of the barrier, so the result would be "
+                       "undefined");
+      return failure();
+    }
+
+    Location loc = kernel.getLoc();
+    OpBuilder typeBuilder(kernel.getContext());
+
+    Block &srcBlock = body.front();
+    SmallVector<Operation *> ops;
+    for (Operation &op : srcBlock)
+      if (!isa<ReturnOp>(op)) ops.push_back(&op);
+
+    // Phase split at the barriers. The phases hold INDICES into `ops`: the
+    // ops themselves are cloned into the new function below, and the CLONES
+    // are what end up in the loops. (Cloning only the phase ops would leave
+    // the clones referring to the values of the old kernel, which is erased
+    // at the end — a dangling reference.)
+    SmallVector<SmallVector<unsigned>> phases;
+    SmallVector<unsigned> current;
+    for (unsigned i = 0; i < ops.size(); ++i) {
+      if (isa<BarrierOp>(ops[i])) {
+        phases.push_back(current);
+        current.clear();
+        continue;
+      }
+      current.push_back(i);
+    }
+    phases.push_back(current);
+
+    // The thread count: the launch's block size, or an explicit block_dim x
+    // in the body.
+    Value threadCount;
+    Type threadIdType = typeBuilder.getIndexType();
+    for (Operation &op : srcBlock) {
+      if (auto tid = dyn_cast<ThreadIdOp>(&op)) {
+        threadIdType = tid.getResult().getType();
+        break;
+      }
+    }
+    if (launch) {
+      threadCount = launch.getBlockSizeX();
+    } else {
+      for (Operation &op : srcBlock)
+        if (auto dim = dyn_cast<BlockDimOp>(&op))
+          if (isX(dim.getDimension())) threadCount = dim.getResult();
+    }
+    if (!threadCount) {
+      kernel.emitError("no block size (the launch's block size or an explicit "
+                       "block_dim x) — cannot size the thread loop");
+      return failure();
+    }
+
+    // The new function: the same arguments plus the block id (if the body
+    // uses it), because the block id now lives in the launch's loop.
+    auto fnType = cast<FunctionType>(kernel.getFunctionType());
+    SmallVector<Type> newArgTypes(fnType.getInputs());
+    bool usesBlockId = false;
+    for (Operation &op : srcBlock)
+      if (isa<BlockIdOp>(&op)) usesBlockId = true;
+    if (usesBlockId) newArgTypes.push_back(threadIdType);
+    takesBlockId = usesBlockId;
+
+    ModuleOp module = kernel->template getParentOfType<ModuleOp>();
+    const std::string tmpName = (kernel.getName() + ".rouge.tmp").str();
+    ImplicitLocOpBuilder moduleBuilder(loc, module.getBodyRegion());
+    moduleBuilder.setInsertionPointToStart(module.getBody());
+    auto newFn = func::FuncOp::create(moduleBuilder, tmpName,
+                                      typeBuilder.getFunctionType(newArgTypes, {}));
+    newFn.setVisibility(kernel.getVisibility());
+    Block *entry = newFn.addEntryBlock();
+    ImplicitLocOpBuilder builder(loc, newFn.getRegion());
+    builder.setInsertionPointToStart(entry);
+
+    // The old kernel's arguments and the new function's arguments must be
+    // the same values: the ops cloned below reference the old ones, and the
+    // old kernel is erased at the end.
+    {
+      Block &oldEntry = body.front();
+      auto oldArgs = oldEntry.getArguments();
+      auto newArgs = entry->getArguments();
+      for (unsigned i = 0; i < oldArgs.size() && i < newArgs.size(); ++i)
+        oldArgs[i].replaceAllUsesWith(newArgs[i]);
+    }
+    Value blockIdArg =
+        usesBlockId ? entry->getArgument(newArgTypes.size() - 1) : Value();
+
+    // The thread count usually comes from the launch op (an operand of it,
+    // defined in the HOST function). The new kernel function is a sibling of
+    // that function, not a nested region, so the value is not visible there:
+    // it has to be cloned in — otherwise the loop bound would dangle the
+    // moment the launch op is erased.
+    if (threadCount && !isa<BlockArgument>(threadCount)) {
+      if (Operation *def = threadCount.getDefiningOp()) {
+        Operation *clone = builder.clone(*def);
+        threadCount =
+            clone->getResult(cast<OpResult>(threadCount).getResultNumber());
+      }
+    }
+    Value threadBound = castToIndex(builder, loc, threadCount);
+    Value c0 = arith::ConstantIndexOp::create(builder, 0);
+    Value c1 = arith::ConstantIndexOp::create(builder, 1);
+
+    // The body's ops split into two groups:
+    //   * loop-invariant (constants, address computations that do not depend
+    //     on the thread id) — they are hoisted OUT of the thread loops, once
+    //     per function; otherwise a value defined in the first phase would
+    //     not dominate its use in the second one;
+    //   * thread-dependent — they go into the body of the phase's loop.
+    // Both groups are CLONED: the originals die with the old kernel, and a
+    // clone that still referred to them would be a dangling reference.
+    std::function<bool(Operation *, unsigned)> dependsOnThread =
+        [&](Operation *op, unsigned depth) -> bool {
+      if (depth > 16) return true;  // unknown -> assume dependent (safe)
+      // The thread id itself is the loop's induction variable: it is
+      // "dependent" by definition (hoisting it out of the loop would give
+      // every thread the same value).
+      if (isa<ThreadIdOp>(op)) return true;
+      for (Value operand : op->getOperands()) {
+        Operation *def = operand.getDefiningOp();
+        if (!def) continue;
+        if (isa<ThreadIdOp>(def)) return true;
+        if (dependsOnThread(def, depth + 1)) return true;
+      }
+      return false;
+    };
+
+    SmallVector<Operation *> invariantOps, dependentOps;
+    for (Operation *op : ops) {
+      if (isa<BarrierOp>(op)) continue;
+      if (dependsOnThread(op, 0))
+        dependentOps.push_back(op);
+      else
+        invariantOps.push_back(op);
+    }
+
+    // Hoisted invariants: cloned into the function's entry block, in order.
+    // The clone goes through an IRMapping, so an invariant op that uses the
+    // result of another invariant op (a constant used by an address
+    // computation) refers to the CLONE, and the mapping also covers the
+    // contents of nested regions.
+    IRMapping invMapper;
+    DenseMap<Operation *, Operation *> invariantClone;
+    for (Operation *op : invariantOps) {
+      Operation *clone = builder.clone(*op, invMapper);
+      invMapper.map(op->getResults(), clone->getResults());
+      invariantClone[op] = clone;
+    }
+
+    // Phases now refer to the dependent ops by index.
+    SmallVector<SmallVector<unsigned>> phaseDependent;
+    for (SmallVector<unsigned> &phase : phases) {
+      SmallVector<unsigned> dep;
+      for (unsigned idx : phase) {
+        Operation *op = ops[idx];
+        if (std::find(invariantOps.begin(), invariantOps.end(), op) !=
+            invariantOps.end())
+          continue;
+        dep.push_back(idx);
+      }
+      phaseDependent.push_back(dep);
+    }
+
+    bool phaseFailed = false;
+    auto buildPhase = [&](SmallVector<unsigned> &phase) -> LogicalResult {
+      // The op is created through the raw OperationState: the ODS builder in
+      // MLIR 23 leaves the body region to the caller, and the op must land in
+      // a block before it can be touched at all.
+      OperationState st(loc, scf::ForOp::getOperationName());
+      st.addOperands({c0, threadBound, c1});
+      st.addTypes({});
+      st.addRegion();
+      auto forOp = cast<scf::ForOp>(builder.create(st));
+      Region &bodyRegion = forOp.getRegion();
+      Block *bodyBlock = nullptr;
+      if (bodyRegion.empty()) {
+        bodyBlock = new Block();
+        bodyRegion.push_back(bodyBlock);
+      } else {
+        bodyBlock = &bodyRegion.front();
+      }
+      if (bodyBlock->getNumArguments() == 0)
+        bodyBlock->addArgument(builder.getIndexType(), loc);
+      Value iv = bodyBlock->getArgument(0);
+
+      OpBuilder bodyBuilder = builder;
+      bodyBuilder.setInsertionPointToStart(bodyBlock);
+      // The thread id becomes the induction variable; if the op's type in
+      // this MLIR version differs, an explicit cast keeps the uses valid.
+      Value tidValue = iv;
+      if (tidValue.getType() != threadIdType)
+        tidValue = makeIndexCast(bodyBuilder, loc, threadIdType, tidValue);
+      // Clone the phase through an IRMapping. The mapping carries three
+      // things: the thread id -> the induction variable, the hoisted
+      // invariants -> their clones, and the results of the ops of this phase
+      // -> their clones. Going through the mapping (instead of rewriting the
+      // operands by hand) is what makes the NESTED regions come along: a
+      // divergent branch inside the body carries a region, and its contents
+      // refer to the values of the body — without the mapping they would
+      // keep referring to the old kernel, which is a dangling reference.
+      IRMapping mapper;
+      for (unsigned idx : phase) {
+        Operation *op = ops[idx];
+        if (auto tid = dyn_cast<ThreadIdOp>(op)) {
+          if (!isX(tid.getDimension())) {
+            tid.emitError("only the x dimension of the thread id is "
+                          "supported");
+            phaseFailed = true;
+            return failure();
+          }
+          mapper.map(tid.getResult(), tidValue);
+          continue;
+        }
+        if (auto bid = dyn_cast<BlockIdOp>(op)) {
+          if (!isX(bid.getDimension())) {
+            bid.emitError("only the x dimension of the block id is supported");
+            phaseFailed = true;
+            return failure();
+          }
+          if (blockIdArg) mapper.map(bid.getResult(), blockIdArg);
+          continue;
+        }
+      }
+      // The invariants are visible from the loop body.
+      for (Operation *op : invariantOps) {
+        Operation *clone = invariantClone[op];
+        for (auto pair : llvm::zip(op->getResults(), clone->getResults()))
+          mapper.map(std::get<0>(pair), std::get<1>(pair));
+      }
+      for (unsigned idx : phase) {
+        Operation *op = ops[idx];
+        // The thread id and the block id have no counterpart in the lowered
+        // form: they ARE the induction variable and the block argument, so
+        // they are not cloned at all (cloning them would also overwrite the
+        // mapping to the induction variable).
+        if (isa<ThreadIdOp, BlockIdOp>(op)) continue;
+        Operation *cloned = bodyBuilder.clone(*op, mapper);
+        mapper.map(op->getResults(), cloned->getResults());
+      }
+      // The body of an scf.for must end with scf.yield. The op is created
+      // through the dialect's own builder (a raw OperationState would need
+      // the dialect to be loaded, and the check for that is what the MLIR
+      // context does on creation).
+      {
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToEnd(bodyBlock);
+        scf::YieldOp::create(builder);
+      }
+      builder.setInsertionPointAfter(forOp);
+      return phaseFailed ? failure() : success();
+    };
+
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      for (SmallVector<unsigned> &phase : phaseDependent)
+        if (failed(buildPhase(phase))) return failure();
+    }
+    func::ReturnOp::create(builder);
+
+    const std::string realName = kernel.getName().str();
+    kernel->erase();
+    newFn.setName(realName);
+    return success();
+  }
+
+  // The launch: a loop over the grid that calls the (now loop-based) kernel.
+  static LogicalResult convertLaunch(LaunchOp launch, bool takesBlockId) {
+    Location loc = launch.getLoc();
+    ModuleOp module = launch->template getParentOfType<ModuleOp>();
+    ImplicitLocOpBuilder builder(loc, module.getBodyRegion());
+    builder.setInsertionPoint(launch);
+
+    Value gridX = launch.getGridSizeX();
+    Value c0 = arith::ConstantIndexOp::create(builder, 0);
+    Value c1 = arith::ConstantIndexOp::create(builder, 1);
+    Value gridBound = castToIndex(builder, loc, gridX);
+
+    OperationState gst(loc, scf::ForOp::getOperationName());
+    gst.addOperands({c0, gridBound, c1});
+    gst.addTypes({});
+    gst.addRegion();
+    auto forOp = cast<scf::ForOp>(builder.create(gst));
+    // The body of the loop must EXIST before anyone inserts into it: the op
+    // was built from a raw OperationState, so its region is empty until we
+    // push a block into it. (Taking getBody() of an empty region and
+    // inserting into it is how the module ended up with a destroyed op still
+    // sitting in a block.)
+    Region &bodyRegion = forOp.getRegion();
+    Block *bodyBlock = new Block();
+    bodyBlock->addArgument(builder.getIndexType(), loc);
+    bodyRegion.push_back(bodyBlock);
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(bodyBlock);
+
+    // The call: the kernel operands, plus the block id ONLY if the kernel
+    // takes one (convertKernel appends it to the signature exactly when the
+    // body uses the block id; passing it unconditionally would make the call
+    // have an extra operand of the wrong type).
+    SmallVector<Value> args(launch.getKernelOperands().begin(),
+                            launch.getKernelOperands().end());
+    if (takesBlockId) {
+      // The block id argument is appended to the kernel signature, so its
+      // type is the one the kernel expects.
+      Type blockIdType = builder.getIndexType();
+      auto kernel = module.lookupSymbol<KernelOp>(
+          launch.getKernelAttr().getLeafReference());
+      if (kernel && !kernel.getFunctionType().getInputs().empty())
+        blockIdType = kernel.getFunctionType().getInputs().back();
+      Value blockId = forOp.getInductionVar();
+      if (blockId.getType() != blockIdType)
+        blockId = makeIndexCast(builder, loc, blockIdType, blockId);
+      args.push_back(blockId);
+    }
+
+    func::CallOp::create(builder, launch.getKernelAttr().getLeafReference(),
+                         launch->getResultTypes(), args);
+    // The body of an scf.for must end with scf.yield.
+    {
+      OpBuilder::InsertionGuard yieldGuard(builder);
+      builder.setInsertionPointToEnd(bodyBlock);
+      scf::YieldOp::create(builder);
+    }
+
+    // The launch op itself goes away.
+    launch->erase();
+    return success();
+  }
+};
+
+}  // namespace rouge
+
+#endif // ROUGE_TRANSFORMS_SIMTTOSCFIMPL_H

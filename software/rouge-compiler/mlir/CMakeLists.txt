@@ -26,16 +26,39 @@ endif()
 
 message(STATUS "rouge MLIR contour: building against MLIR ${MLIR_VERSION}")
 
+# ---- our own dialect (the "rouge" dialect) --------------------------------
+add_subdirectory(tools/rouge-dialect)
+
 # ---- pass library ------------------------------------------------------
+add_library(rouge-mlir-dialect STATIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/IR/RougeDialect.cpp)
+add_dependencies(rouge-mlir-dialect rouge-dialect-headers)
+target_include_directories(rouge-mlir-dialect PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_BINARY_DIR}/include
+  ${MLIR_INCLUDE_DIRS}
+  ${LLVM_INCLUDE_DIRS})
+target_link_libraries(rouge-mlir-dialect PUBLIC
+  MLIRIR
+  MLIRSupport
+  MLIRSideEffectInterfaces)
+# MLIR собран без RTTI: та же опция нужна и нашему диалекту, иначе vtable
+# диалекта тянет typeinfo mlir::Dialect, которого в библиотеке нет.
+if(NOT LLVM_ENABLE_RTTI)
+  target_compile_options(rouge-mlir-dialect PUBLIC -fno-rtti)
+endif()
+
 add_library(rouge-mlir-passes STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtAccessReport.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtToScf.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/UnitStrideToVector.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/UnitStrideToVector.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/RougeToScf.cpp)
 target_include_directories(rouge-mlir-passes PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS})
 target_link_libraries(rouge-mlir-passes PUBLIC
+  rouge-mlir-dialect
   MLIRIR
   MLIRPass
   MLIRSupport
@@ -64,7 +87,8 @@ target_link_libraries(rouge-opt PRIVATE
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRGPUDialect
-  MLIRVectorDialect)
+  MLIRVectorDialect
+  rouge-mlir-dialect)
 
 # ---- tests ------------------------------------------------------------
 # Тест проверяет не только код возврата, но и СОДЕРЖИМОЕ отчёта: pass
@@ -177,4 +201,45 @@ if(MLIR_VERSION_MAJOR GREATER_EQUAL 23)
             ${CMAKE_CURRENT_SOURCE_DIR}/test/simt_access_report_atomic.mlir)
   set_tests_properties(mlir_simt_access_report_atomic PROPERTIES
     PASS_REGULAR_EXPRESSION "atomics=1")
+endif()
+
+# ---- наш собственный диалект (rouge) -------------------------------------
+#
+# Тот же lowering, но на наших операциях: запуск — это rouge.launch, ядро —
+# обычная func.func, идентификатор потока — rouge.thread_id. Это проверка
+# того, что диалект — ЗАМЕНА апстримному gpu-диалекту, а не переименование.
+add_test(NAME mlir_rouge_to_scf
+  COMMAND rouge-opt --rouge-to-scf
+          ${CMAKE_CURRENT_SOURCE_DIR}/test/rouge_to_scf.mlir)
+set_tests_properties(mlir_rouge_to_scf PROPERTIES
+  # Launch becomes a loop over the grid, the body is split into phases at the
+  # barrier (two thread loops), and the rouge ops are gone.
+  PASS_REGULAR_EXPRESSION
+    "launches converted=1 refused=0;scf.for")
+
+# Общая память — memref с непустым адресным пространством: адресное
+# пространство живёт в ТИПЕ, и проход обязан отказать громко.
+add_test(NAME mlir_rouge_to_scf_shared
+  COMMAND rouge-opt --rouge-to-scf
+          ${CMAKE_CURRENT_SOURCE_DIR}/test/rouge_to_scf_shared.mlir)
+set_tests_properties(mlir_rouge_to_scf_shared PROPERTIES
+  PASS_REGULAR_EXPRESSION "using shared memory is refused")
+
+# Полная цепочка на НАШЕМ диалекте: rouge -> SCF -> Vector -> LLVM IR ->
+# ассемблер RISC-V (настоящие vle32.v) -> исполнение под qemu-riscv64.
+# Скалярная и векторная сборки обязаны посчитать одно и то же.
+if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND LLC_EXE AND QEMU_RISCV)
+  add_test(NAME mlir_rouge_to_rvv
+    COMMAND ${CMAKE_COMMAND}
+      -DROUGE_OPT=$<TARGET_FILE:rouge-opt>
+      -DMLIR_OPT=${MLIR_OPT_EXE}
+      -DMLIR_TRANSLATE=${MLIR_TRANSLATE_EXE}
+      -DLLC=${LLC_EXE}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DQEMU=${QEMU_RISCV}
+      -DSIMT_PASS=--rouge-to-scf
+      -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/test/rouge_to_rvv.mlir
+      -DHARNESS_C=${CMAKE_CURRENT_SOURCE_DIR}/test/rv_vector_harness.c
+      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/rouge-vector-rvv
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/vector_rvv.cmake)
 endif()

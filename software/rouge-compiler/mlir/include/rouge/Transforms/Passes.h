@@ -41,6 +41,13 @@ void registerSimtToScfPass();
 std::unique_ptr<mlir::Pass> createRougeUnitStrideToVectorPass();
 void registerRougeUnitStrideToVectorPass();
 
+// !rouge-to-scf — the SIMT -> SCF lowering for OUR dialect: the launch
+// becomes a loop over the grid, the body is split into phases at the
+// barriers, the thread id becomes the induction variable of the thread
+// loop, and the address space stays in the memref type.
+std::unique_ptr<mlir::Pass> createRougeToScfPass();
+void registerRougeToScfPass();
+
 
 }  // namespace rouge
 

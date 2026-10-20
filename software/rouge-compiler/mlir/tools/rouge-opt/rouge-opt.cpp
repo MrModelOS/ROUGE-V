@@ -9,6 +9,7 @@
 // ради одного анализа незачем. Набора выше хватает для форм, которые читает
 // контур (см. test/simt_access_report.mlir).
 
+#include "rouge/IR/RougeDialect.h"
 #include "rouge/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -25,7 +26,8 @@ int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   registry.insert<mlir::gpu::GPUDialect, mlir::memref::MemRefDialect,
                   mlir::arith::ArithDialect, mlir::vector::VectorDialect,
-                  mlir::func::FuncDialect, mlir::scf::SCFDialect>();
+                  mlir::func::FuncDialect, mlir::scf::SCFDialect,
+                  rouge::RougeDialect>();
 
   // Имя регистрации — как в Passes.h (раньше драйвер звал несуществующее
   // registerRougeTransformsPasses; это всплыло только при первой реальной
