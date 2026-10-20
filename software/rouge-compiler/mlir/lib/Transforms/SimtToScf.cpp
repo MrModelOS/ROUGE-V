@@ -241,6 +241,39 @@ struct SimtToScf
     Region &body = kernel.getBody();
     if (body.empty()) return success();
 
+    // A kernel that uses SHARED memory is refused for now. In the GPU
+    // dialect the shared memory is a memref with a non-default memory
+    // space; the new plain function would keep the memref but the shared
+    // semantics (one copy per block, barriers between the phases) would be
+    // lost, and the accesses would silently read the wrong memory. The
+    // proper handling is a memref with a memory space (the address space as
+    // part of the TYPE) plus the per-block copy — that is the next step of
+    // the contour.
+    {
+      bool hasShared = false;
+      // The default memory space is whatever a memref without a space gets;
+      // comparing against it avoids depending on how MLIR spells it.
+      const Attribute defaultSpace =
+          MemRefType::get({1}, Float32Type::get(kernel.getContext()))
+              .getMemorySpace();
+      kernel.walk([&](Operation *op) {
+        auto check = [&](Type t) {
+          if (auto mr = dyn_cast<MemRefType>(t))
+            if (mr.getMemorySpace() != defaultSpace) hasShared = true;
+        };
+        for (Type t : op->getOperandTypes()) check(t);
+        for (Type t : op->getResultTypes()) check(t);
+      });
+      if (hasShared) {
+        kernel.emitError("rouge-simt-to-scf: a kernel using shared memory is "
+                         "refused for now (the per-block copy of the shared "
+                         "memory would be lost silently; the shared memory "
+                         "must become a memref with a memory space and be "
+                         "copied per block)");
+        return failure();
+      }
+    }
+
     if (hasBarrierInDivergentRegion(kernel)) {
       kernel.emitError("rouge-simt-to-scf: a barrier inside a divergent branch "
                        "is refused — the gpu.barrier contract requires every "

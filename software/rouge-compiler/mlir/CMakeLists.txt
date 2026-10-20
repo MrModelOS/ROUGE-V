@@ -108,6 +108,14 @@ add_test(NAME mlir_simt_to_scf_barrier_divergence
 set_tests_properties(mlir_simt_to_scf_barrier_divergence PROPERTIES
   PASS_REGULAR_EXPRESSION "barrier inside a divergent branch")
 
+# Ядро с общей памятью: memref с непустым адресным пространством. Копия
+# общей памяти на блок была бы потеряна молча — проход обязан отказать.
+add_test(NAME mlir_simt_to_scf_shared
+  COMMAND rouge-opt --rouge-simt-to-scf
+          ${CMAKE_CURRENT_SOURCE_DIR}/test/simt_to_scf_shared.mlir)
+set_tests_properties(mlir_simt_to_scf_shared PROPERTIES
+  PASS_REGULAR_EXPRESSION "using shared memory is refused")
+
 # Векторизация unit-stride доступов: структурная проверка + СЕМАНТИЧЕСКАЯ
 # (скалярная и векторная версии обязаны посчитать одно и то же).
 add_test(NAME mlir_unit_stride_to_vector
