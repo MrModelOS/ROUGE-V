@@ -27,12 +27,9 @@ endif()
 message(STATUS "rouge MLIR contour: building against MLIR ${MLIR_VERSION}")
 
 # ---- pass library ------------------------------------------------------
-# SimtToScf.cpp (проход SIMT->SCF) НЕ включён: он написан, но в MLIR 23
-# требует доводки (см. mlir/README.md, раздел «SIMT -> SCF: что нашли»).
-# Включать его в сборку с падающим верификатором нельзя: контур должен
-# оставаться зелёным.
 add_library(rouge-mlir-passes STATIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtAccessReport.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtAccessReport.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtToScf.cpp)
 target_include_directories(rouge-mlir-passes PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${MLIR_INCLUDE_DIRS}
@@ -80,6 +77,26 @@ set_tests_properties(mlir_simt_access_report PROPERTIES
   # проверять нельзя.
   PASS_REGULAR_EXPRESSION
     "mixed access.*vectorize only the runs between barriers;unit-stride candidate.*SIMT->RVV vectorizable")
+
+# SIMT -> SCF: thread/block ids become explicit loops, the body is split
+# into phases at barriers, the launch becomes a loop over the grid.
+add_test(NAME mlir_simt_to_scf
+  COMMAND rouge-opt --rouge-simt-to-scf
+          ${CMAKE_CURRENT_SOURCE_DIR}/test/simt_to_scf.mlir)
+set_tests_properties(mlir_simt_to_scf PROPERTIES
+  # The kernel must become two thread loops (the barrier splits the body into
+  # phases), the launch must become a grid loop, and gpu.thread_id must be
+  # gone (replaced by the induction variable).
+  PASS_REGULAR_EXPRESSION
+    "kernels converted=1 refused=0;scf.for")
+
+# A kernel with a divergent branch must be REFUSED with a loud error, not
+# rewritten: the pass has no divergence model yet.
+add_test(NAME mlir_simt_to_scf_divergent
+  COMMAND rouge-opt --rouge-simt-to-scf
+          ${CMAKE_CURRENT_SOURCE_DIR}/test/simt_to_scf_divergent.mlir)
+set_tests_properties(mlir_simt_to_scf_divergent PROPERTIES
+  PASS_REGULAR_EXPRESSION "divergent control flow is not supported")
 
 # Синтаксис memref.atomic_rmw изменился в MLIR 23 — отдельный вход и
 # отдельная ячейка только для новых версий.

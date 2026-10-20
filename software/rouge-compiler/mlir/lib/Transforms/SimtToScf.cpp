@@ -69,6 +69,8 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <functional>
+#include <map>
+#include <string>
 #include <memory>
 #include <string>
 
@@ -132,9 +134,21 @@ static Value castToIndex(OpBuilder &b, Location loc, Value v) {
 }
 
 
+// Перемапливает операнды клона: thread id -> индуктивная переменная,
+// определение из инвариантов -> их клон, определение из той же фазы -> её
+// клон. Всё, что осталось, — аргумент функции (уже переподставлен) или
+// литерал.
+//
+// Это НЕЛЬЗЯ пропускать: клон, ссылающийся на оригинал, — это висячая
+// ссылка (оригинал умирает вместе со старым ядром), и она проявляется
+// сильно позже и совсем в другом месте.
 struct SimtToScf
     : public PassWrapper<SimtToScf, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SimtToScf)
+
+  // Ядра, принимающие block id дополнительным аргументом: без этого
+  // вызов получает лишний операнд не того типа.
+  std::map<std::string, bool> kernelTakesBlockId_;
 
   StringRef getArgument() const final { return "rouge-simt-to-scf"; }
   StringRef getDescription() const final {
@@ -180,6 +194,7 @@ struct SimtToScf
     }
     llvm::errs() << "rouge-simt-to-scf: kernels converted=" << converted
                  << " refused=" << refused << "\n";
+
   }
 
   gpu::LaunchFuncOp findLaunch(ModuleOp module, gpu::GPUFuncOp kernel) {
@@ -261,6 +276,7 @@ struct SimtToScf
     for (Operation &op : srcBlock)
       if (isa<gpu::BlockIdOp>(&op)) usesBlockId = true;
     if (usesBlockId) newArgTypes.push_back(threadIdType);
+    kernelTakesBlockId_[kernel.getName().str()] = usesBlockId;
 
     ModuleOp module = kernel->getParentOfType<ModuleOp>();
     const std::string tmpName = (kernel.getName() + ".rouge.tmp").str();
@@ -313,6 +329,10 @@ struct SimtToScf
     std::function<bool(Operation *, unsigned)> dependsOnThread =
         [&](Operation *op, unsigned depth) -> bool {
       if (depth > 16) return true;  // unknown -> assume dependent (safe)
+      // The thread id itself is the loop's induction variable: it is
+      // "dependent" by definition (hoisting it out of the loop would give
+      // every thread the same value).
+      if (isa<gpu::ThreadIdOp>(op)) return true;
       for (Value operand : op->getOperands()) {
         Operation *def = operand.getDefiningOp();
         if (!def) continue;
@@ -332,9 +352,27 @@ struct SimtToScf
     }
 
     // Hoisted invariants: cloned into the function's entry block, in order.
+    // Their operands are remapped too: an invariant op may well use the
+    // result of another invariant op (a constant used by an address
+    // computation), and that result exists only as a clone.
     DenseMap<Operation *, Operation *> invariantClone;
     for (Operation *op : invariantOps)
       invariantClone[op] = builder.clone(*op);
+    for (Operation *op : invariantOps) {
+      Operation *cloned = invariantClone[op];
+      SmallVector<Value> newOperands;
+      for (Value operand : cloned->getOperands()) {
+        Operation *def = operand.getDefiningOp();
+        auto it = def ? invariantClone.find(def) : invariantClone.end();
+        if (it != invariantClone.end() && it->second != cloned) {
+          newOperands.push_back(
+              it->second->getResult(cast<OpResult>(operand).getResultNumber()));
+          continue;
+        }
+        newOperands.push_back(operand);
+      }
+      cloned->setOperands(newOperands);
+    }
 
     // Phases now refer to the dependent ops by index.
     SmallVector<SmallVector<unsigned>> phaseDependent;
@@ -379,12 +417,17 @@ struct SimtToScf
       Value tidValue = iv;
       if (tidValue.getType() != threadIdType)
         tidValue = makeIndexCast(bodyBuilder, loc, threadIdType, tidValue);
+      // Clone the whole phase first, remembering old -> new. Only afterwards
+      // are the operands remapped: a clone of this phase may use the result
+      // of ANOTHER op of the same phase, and that other op is itself only
+      // alive as a clone — the original dies with the old kernel.
+      DenseMap<Operation *, Operation *> phaseClone;
       for (unsigned idx : phase) {
-        Operation *op = ops[idx];
-        // Clone this phase's op and remap its operands: an invariant
-        // operand -> its hoisted clone; a thread-id operand -> the induction
-        // variable.
-        Operation *cloned = bodyBuilder.clone(*op);
+        Operation *cloned = bodyBuilder.clone(*ops[idx]);
+        phaseClone[ops[idx]] = cloned;
+      }
+      for (unsigned idx : phase) {
+        Operation *cloned = phaseClone[ops[idx]];
         SmallVector<Value> newOperands;
         for (Value operand : cloned->getOperands()) {
           Operation *def = operand.getDefiningOp();
@@ -397,6 +440,12 @@ struct SimtToScf
             if (inv != invariantClone.end()) {
               newOperands.push_back(
                   inv->second->getResult(cast<OpResult>(operand).getResultNumber()));
+              continue;
+            }
+            auto ph = phaseClone.find(def);
+            if (ph != phaseClone.end()) {
+              newOperands.push_back(
+                  ph->second->getResult(cast<OpResult>(operand).getResultNumber()));
               continue;
             }
           }
@@ -471,41 +520,48 @@ struct SimtToScf
     gst.addTypes({});
     gst.addRegion();
     auto forOp = cast<scf::ForOp>(builder.create(gst));
+    // The body of the loop must EXIST before anyone inserts into it: the op
+    // was built from a raw OperationState, so its region is empty until we
+    // push a block into it. (Taking getBody() of an empty region and
+    // inserting into it is how the module ended up with a destroyed op still
+    // sitting in a block.)
+    Region &bodyRegion = forOp.getRegion();
+    Block *bodyBlock = new Block();
+    bodyBlock->addArgument(builder.getIndexType(), loc);
+    bodyRegion.push_back(bodyBlock);
     OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(forOp.getBody());
+    builder.setInsertionPointToStart(bodyBlock);
 
-    // The call: the kernel operands plus the block id.
+    // The call: the kernel operands, plus the block id ONLY if the kernel
+    // takes one (convertKernel appends it to the signature exactly when the
+    // body uses gpu.block_id; passing it unconditionally would make the call
+    // have an extra operand of the wrong type).
     SmallVector<Value> args(launch.getKernelOperands().begin(),
                             launch.getKernelOperands().end());
-    Type blockIdType = builder.getIndexType();
-    for (BlockArgument arg : forOp.getBody()->getArguments())
-      if (arg.getType() == blockIdType) break;
-    // The block id argument is appended to the kernel signature, so its type
-    // is the one the kernel expects: the same as the thread id.
-    auto kernel = module.lookupSymbol<func::FuncOp>(
-        launch.getKernelAttr().getLeafReference());
-    if (kernel && !kernel.getFunctionType().getInputs().empty()) {
-      blockIdType = kernel.getFunctionType().getInputs().back();
+    const std::string calleeName = launch.getKernelAttr().getLeafReference().str();
+    auto kernelIt = kernelTakesBlockId_.find(calleeName);
+    const bool takesBlockId =
+        kernelIt != kernelTakesBlockId_.end() && kernelIt->second;
+    if (takesBlockId) {
+      // The block id argument is appended to the kernel signature, so its
+      // type is the one the kernel expects: the same as the thread id.
+      Type blockIdType = builder.getIndexType();
+      auto kernel = module.lookupSymbol<func::FuncOp>(calleeName);
+      if (kernel && !kernel.getFunctionType().getInputs().empty())
+        blockIdType = kernel.getFunctionType().getInputs().back();
+      Value blockId = forOp.getInductionVar();
+      if (blockId.getType() != blockIdType)
+        blockId = makeIndexCast(builder, loc, blockIdType, blockId);
+      args.push_back(blockId);
     }
-    Value blockId = forOp.getInductionVar();
-    if (blockId.getType() != blockIdType)
-      blockId = makeIndexCast(builder, loc, blockIdType, blockId);
-    args.push_back(blockId);
 
     func::CallOp::create(builder, launch.getKernelAttr().getLeafReference(),
                          launch.getResultTypes(), args);
     // The body of an scf.for must end with scf.yield.
     {
-      Region &bodyRegion = forOp.getRegion();
-      Block *bodyBlock = bodyRegion.empty() ? new Block() : &bodyRegion.front();
-      if (bodyRegion.empty()) bodyRegion.push_back(bodyBlock);
-      if (bodyBlock->getNumArguments() == 0)
-        bodyBlock->addArgument(builder.getIndexType(), loc);
-      {
-        OpBuilder::InsertionGuard guard(builder);
-        builder.setInsertionPointToEnd(bodyBlock);
-        scf::YieldOp::create(builder);
-      }
+      OpBuilder::InsertionGuard yieldGuard(builder);
+      builder.setInsertionPointToEnd(bodyBlock);
+      scf::YieldOp::create(builder);
     }
 
     // The launch op itself goes away.
