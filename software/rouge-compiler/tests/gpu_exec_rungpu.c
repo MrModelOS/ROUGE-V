@@ -491,6 +491,73 @@ static int test_int8_gemm(CUmodule mod) {
   return 1;
 }
 
+
+// ---------------------------------------------------------------------------
+// kernel: cmp_signed -- signed vs unsigned comparisons.
+//
+// The expected values come from the PTX ISA itself (setp.lt.s32 is SIGNED),
+// computed here in C. A lowering that confuses the signedness passes on the
+// host for non-negative inputs and disagrees on the card for negative ones —
+// exactly what the differential fuzzer found.
+// ---------------------------------------------------------------------------
+static int test_cmp_signed(CUmodule mod) {
+  const int N = 64;
+  const unsigned seed = 12345u;
+  printf("  config: N=%d seed=%u, one thread per element\n", N, seed);
+  CUfunction fn;
+  CK(cuModuleGetFunction(&fn, mod, "cmp_signed"));
+
+  int* hin = (int*)malloc(sizeof(int) * (size_t)N);
+  int* hout = (int*)malloc(sizeof(int) * (size_t)N * 4);
+  for (int i = 0; i < N; ++i)
+    hin[i] = (i % 3 == 0) ? -(i + 1) : (i * 7919);
+
+  CUdeviceptr dOut, dIn;
+  CK(cuMemAlloc(&dOut, sizeof(int) * (size_t)N * 4));
+  CK(cuMemAlloc(&dIn, sizeof(int) * (size_t)N));
+  CK(cuMemcpyHtoD(dIn, hin, sizeof(int) * (size_t)N));
+  CK(cuMemcpyHtoD(dOut, hout, sizeof(int) * (size_t)N * 4));
+
+  unsigned nn = (unsigned)N;
+  void* args[] = {&dOut, &dIn, &nn, &seed};
+  CK(cuLaunchKernel(fn, 1, 1, 1, (unsigned)N, 1, 1, 0, 0, args, 0));
+  CUresult r = cuCtxSynchronize();
+  if (r != CUDA_SUCCESS) {
+    printf("  MISMATCH: launch/sync failed: %s (%s)\n", cuerr(r), cuerrstr(r));
+    return 3;
+  }
+  CK(cuMemcpyDtoH(hout, dOut, sizeof(int) * (size_t)N * 4));
+
+  int bad = 0, first = -1;
+  for (int i = 0; i < N; ++i) {
+    const int a = hin[i];
+    const int b = (int)seed;
+    const int want[4] = {a < b ? 1 : 0,
+                         (unsigned)a < (unsigned)b ? 1 : 0,
+                         a >= b ? 1 : 0,
+                         (unsigned)a >= (unsigned)b ? 1 : 0};
+    for (int k = 0; k < 4; ++k) {
+      const size_t idx = (size_t)i * 4 + (size_t)k;
+      if (hout[idx] != want[k]) {
+        if (first < 0) first = (int)idx;
+        ++bad;
+      }
+    }
+  }
+  if (!bad) {
+    printf("  OK: signed/unsigned comparisons match the PTX ISA semantics\n");
+  } else {
+    printf("  MISMATCH: %d of %d comparisons wrong, first at %d\n", bad, N * 4,
+           first);
+  }
+  cuMemFree(dOut);
+  cuMemFree(dIn);
+  cuModuleUnload(mod);
+  free(hin);
+  free(hout);
+  return bad ? 1 : 0;
+}
+
 // ---------------------------------------------------------------------------
 // kernel: block_reduce -- out[ctaid.x] = sum(data[ctaid.x*ntid.x .. +ntid.x))
 // ---------------------------------------------------------------------------
@@ -1396,6 +1463,12 @@ int main(int argc, char** argv) {
     printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
     if (rc && g_exit_code == 0) g_exit_code = rc;
   }
+  if (all || strcmp(kname, "cmp_signed") == 0) {
+    printf("== cmp_signed ==\n");
+    rc = test_cmp_signed(mod);
+    printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
+    if (rc && g_exit_code == 0) g_exit_code = rc;
+  }
   if (all || strcmp(kname, "int8_gemm") == 0) {
     printf("== int8_gemm ==\n");
     rc = test_int8_gemm(mod);
@@ -1509,6 +1582,7 @@ int main(int argc, char** argv) {
       strcmp(kname, "shfl_pred") && strcmp(kname, "vote_pred") &&
       strcmp(kname, "shfl_pred_all") && strcmp(kname, "foreign_vadd") &&
       strcmp(kname, "matrixmul16") && strcmp(kname, "int8_gemm") &&
+      strcmp(kname, "cmp_signed") &&
       strcmp(kname, "prmt_dp4a") &&
       strcmp(kname, "ldmatrix_sm75") &&
       strcmp(kname, "fp16_reduceB") && strcmp(kname, "gemm_tileB") &&

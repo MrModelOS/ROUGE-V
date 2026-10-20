@@ -231,6 +231,12 @@ class LlvmGen {
   // pointing into it.
   std::vector<rouge::PtxInstruction> body_;
   std::map<std::string, size_t> labels_;
+  // Значение предиката текущей инструкции (i1) — пусто, если инструкция не
+  // предицированная. Служебные случаи, где регистр пишется ВСЕГДА (shfl с
+  // предикатом назначения: там предикат значит «источник в диапазоне»), —
+  // через always_writes_.
+  std::string cur_pred_;
+  bool always_writes_ = false;
   std::string* error_;
   std::string out_;
   int uid_ = 0;
@@ -308,6 +314,19 @@ class LlvmGen {
   }
   void store_reg(const std::string& reg, const std::string& ssa) {
     const std::string ty = reg_type(reg);
+    // PTX ISA 9.7.3: предицированная инструкция при ЛОЖНОМ предикате не
+    // выполняется, и регистр-назначение НЕ пишется — там остаётся старое
+    // значение. Раньше запись была безусловной, и карта считала иначе
+    // (нашлось дифференциальным фазером).
+    if (!cur_pred_.empty() && !always_writes_) {
+      const std::string old = load_reg(reg);
+      const std::string sel = fresh("%psel");
+      line("  " + sel + " = select i1 " + cur_pred_ + ", " + ty + " " + ssa +
+           ", " + ty + " " + old);
+      line("  store " + ty + " " + sel + ", " + pt("%" + reg) + " %" + reg +
+           ", align " + align_of(ty));
+      return;
+    }
     line("  store " + ty + " " + ssa + ", " + pt("%" + reg) + " %" + reg + ", align " + align_of(ty));
   }
   // Load a register and reinterpret its bits as float. The operand may also be
@@ -902,6 +921,27 @@ class LlvmGen {
   bool emit_instruction(const rouge::PtxInstruction& ins, size_t idx) {
     const std::string op = ins.op;
     const auto& A = ins.args;
+
+    // Предикат текущей инструкции: грузим один раз, дальше store_reg()
+    // сам выбирает «писать или оставить старое значение».
+    cur_pred_.clear();
+    always_writes_ = false;
+    if (!ins.pred.empty()) {
+      const std::string pname =
+          ins.pred[0] == '!' ? ins.pred.substr(1) : ins.pred;
+      if (is_reg(pname)) {
+        std::string pv = load_reg(pname);
+        if (ins.pred[0] == '!') {
+          const std::string nv = fresh("%np");
+          line("  " + nv + " = xor i1 " + pv + ", true");
+          pv = nv;
+        }
+        cur_pred_ = pv;
+        // shfl: предикат в НАЗНАЧЕНИИ — это «источник в диапазоне», а не
+        // «выполнить или нет»: значение пишется всегда.
+        if (op.rfind("shfl", 0) == 0) always_writes_ = true;
+      }
+    }
 
     if (op == "ld.param.u64" || op == "ld.param.s64" || op == "ld.param.b64") {
       return emit_ld_param(ins, /*bits=*/64);
@@ -2176,6 +2216,7 @@ class LlvmGen {
   bool emit_alu_logic(const rouge::PtxInstruction& ins, size_t idx) {
     const auto& A = ins.args;
     const std::string op = ins.op;
+    if (!check_reg_width(ins, idx, op)) return false;
     const bool unary = op.rfind("not.", 0) == 0;
     if (A.size() != (unary ? 2u : 3u))
       return fail("bad " + op + " operands @ " + std::to_string(idx));
@@ -2203,10 +2244,39 @@ class LlvmGen {
     return true;
   }
 
+  // A typed ALU instruction (add.s32, mul.lo.s32, ...) must write a register
+  // of exactly that width. A mismatch in the DESTINATION (e.g.
+  // "add.u32 %rd6, %rd6, 0" on a 64-bit register) is invalid PTX and produced
+  // IR that computed something plausible on the host and something else on
+  // the card; refuse it loudly.
+  //
+  // A narrower SOURCE is accepted: our hand-written canonical kernels use
+  // "add.s64 %rd4, %rd2, %r7" (a byte offset widened on the fly), and both
+  // the interpreter and this lowering have always read such a source as
+  // zero-extended. The two paths agree, so the extension is consistent;
+  // it is a deviation from the ISA, and it is documented as one.
+  bool check_reg_width(const rouge::PtxInstruction& ins, size_t idx,
+                       const std::string& op) {
+    const int want = int_type_bits(op);
+    if (want == 0) return true;
+    if (ins.args.empty()) return true;
+    const std::string dst = strip_brackets(clean_operand(ins.args[0]));
+    if (!is_reg(dst)) return true;
+    const int have = reg_bits(dst);
+    if (have != 0 && have != want) {
+      fail("'" + op + "' expects a " + std::to_string(want) +
+           "-bit destination, but '" + dst + "' is " + std::to_string(have) +
+           "-bit @ " + std::to_string(idx));
+      return false;
+    }
+    return true;
+  }
+
   // mul.lo / mul.hi / mad.lo / mad.hi / div / rem on 32- and 64-bit types.
   bool emit_alu_muldiv(const rouge::PtxInstruction& ins, size_t idx) {
     const auto& A = ins.args;
     const std::string op = ins.op;
+    if (!check_reg_width(ins, idx, op)) return false;
     const int bits = int_type_bits(op);
     const bool is_mad = op.rfind("mad.", 0) == 0;
     const bool hi = op.find(".hi.") != std::string::npos;
@@ -2597,6 +2667,7 @@ class LlvmGen {
   bool emit_alu_unary(const rouge::PtxInstruction& ins, size_t idx) {
     const auto& A = ins.args;
     const std::string op = ins.op;
+    if (!check_reg_width(ins, idx, op)) return false;
     if ((A.size() == 4 || A.size() == 5) &&
         (op.rfind("bfi.", 0) == 0 || op.rfind("bfe.", 0) == 0))
       return emit_bitfield(ins, idx);
@@ -2815,6 +2886,7 @@ class LlvmGen {
     const bool fma = op.rfind("fma.", 0) == 0;
     if (A.size() != (fma ? 4u : 3u))
       return fail("bad arithmetic operands @ " + std::to_string(idx));
+    if (!check_reg_width(ins, idx, op)) return false;
 
     // f16x2/bf16x2 fallback: keep payload as i32 (vector of 2×half).
     // Real packed arithmetic will be vectorized in MLIR stage 2; for AOT
@@ -3663,13 +3735,15 @@ class LlvmGen {
     const auto pair = [](const std::string& a, const std::string& b) {
       return a + "." + b;
     };
-    if (pair(dst, src) == "u64.u32" || pair(dst, src) == "s64.u32") {
+    if (pair(dst, src) == "u64.u32") {
       const std::string z = fresh("%z");
       line("  " + z + " = zext i32 " + operand(A[1]) + " to i64");
       store_reg(A[0], z);
       return true;
     }
-    if (pair(dst, src) == "s64.s32") {
+    // A SIGNED 32-bit source widens with a sign extension: zext would turn
+    // -1 into 0xFFFFFFFF (a different value than the interpreter produces).
+    if (pair(dst, src) == "s64.u32" || pair(dst, src) == "s64.s32") {
       const std::string z = fresh("%z");
       line("  " + z + " = sext i32 " + operand(A[1]) + " to i64");
       store_reg(A[0], z);
@@ -3722,6 +3796,16 @@ class LlvmGen {
     const bool src32f = src == "f32";
     const int dstBits = dstI64 ? 64 : dstI32 ? 32 : 16;
     const int srcBits = src64i || src64f ? 64 : src32i || src32f ? 32 : 16;
+    // The source register's width must match the source type the mnemonic
+    // names: "cvt.u64.u32" reads a 32-bit register. A mismatch used to reach
+    // the lowering as a type error deep inside the emitted IR (clang then
+    // complained about the .ll, not about the PTX).
+    if ((src64i || src32i || src16i) && is_reg(A[1]) && reg_bits(A[1]) != 0 &&
+        reg_bits(A[1]) != srcBits)
+      return fail(ins.op + " expects a " + std::to_string(srcBits) +
+                  "-bit source, but '" + A[1] + "' is " +
+                  std::to_string(reg_bits(A[1])) + "-bit @ " +
+                  std::to_string(idx));
     const std::string srcTy = operand_type(A[1], srcBits);
     const std::string v = operand(A[1]);
 
@@ -3838,14 +3922,33 @@ class LlvmGen {
       return fail(ins.op + " float compare is not supported @ " +
                   std::to_string(idx));
     const std::string cond = spec.substr(0, spec.find('.'));
-    const std::string ll =
-        cond == "ge" ? "uge" : cond == "gt" ? "ugt" : cond == "lt" ? "ult"
-                             : cond == "le" ? "ule" : cond == "eq" ? "eq"
-                                                                   : "ne";
+    // The signedness comes from the TYPE (.s32 vs .u32), not from the
+    // condition: "setp.lt.s32" is a SIGNED comparison. Picking the icmp
+    // kind by the condition alone made every signed comparison unsigned —
+    // the kernel then computed a different answer on the card than the
+    // interpreter did (found by the differential fuzzer).
+    const size_t dot = spec.find('.');
+    const std::string ty = dot == std::string::npos ? "" : spec.substr(dot + 1);
+    const bool is_signed = !ty.empty() && ty[0] == 's';
+    const int bits = int_type_bits(ins.op);
+    const std::string ity = bits == 64 ? "i64" : "i32";
+    std::string ll;
+    if (cond == "lt")
+      ll = is_signed ? "slt" : "ult";
+    else if (cond == "gt")
+      ll = is_signed ? "sgt" : "ugt";
+    else if (cond == "le")
+      ll = is_signed ? "sle" : "ule";
+    else if (cond == "ge")
+      ll = is_signed ? "sge" : "uge";
+    else if (cond == "eq")
+      ll = "eq";
+    else
+      ll = "ne";
     const std::string x = operand(A[1]);
     const std::string y = operand(A[2]);
     const std::string c = fresh("%c");
-    line("  " + c + " = icmp " + ll + " i32 " + x + ", " + y);
+    line("  " + c + " = icmp " + ll + " " + ity + " " + x + ", " + y);
     store_reg(A[0], c);
     return true;
   }
@@ -4312,7 +4415,16 @@ class LlvmGen {
     }
     if (ins.op == "bra" || ins.op == "bra.uni") {
       if (ins.args.empty()) return;  // invalid; caught upstream
-      const std::string target = "b_" + ins.args[0];
+      const std::string& raw = ins.args[0];
+      // A branch to a label that is never defined must be a LOUD failure,
+      // not an IR with a reference to a nonexistent block: the latter
+      // produces IR that only the backend notices, and the error message
+      // points at the backend, not at the PTX.
+      if (!labels_.count(raw)) {
+        fail("branch to an undefined label '" + raw + "'");
+        return;
+      }
+      const std::string target = "b_" + raw;
       if (!ins.pred.empty()) {
         const std::string pred =
             ins.pred[0] == '!' ? ins.pred.substr(1) : ins.pred;

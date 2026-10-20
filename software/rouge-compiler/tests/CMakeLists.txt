@@ -32,7 +32,7 @@ target_link_libraries(test_ptx_to_llvm_warp PRIVATE rouge-compiler-lib rouge-ptx
 add_test(NAME compiler_ptx_to_llvm_warp COMMAND test_ptx_to_llvm_warp)
 
 # Stage 1 always runs: PTX -> LLVM IR via our translator CLI.
-foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt prmt_dp4a mma_tile mma_pipe)
+foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt prmt_dp4a cmp_signed mma_tile mma_pipe)
   add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
     COMMAND ptx2ir ${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kern}.ptx
@@ -45,7 +45,7 @@ endforeach()
 find_program(CLANG_EXECUTABLE clang)
 if(CLANG_EXECUTABLE)
   # Compile one IR module per canonical kernel: ptx2ir -> clang -O2 -> .o
-  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt prmt_dp4a mma_tile mma_pipe)
+  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt prmt_dp4a cmp_signed mma_tile mma_pipe)
     add_custom_command(
       OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.o
       COMMAND ${CLANG_EXECUTABLE} -O2 -c ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
@@ -146,6 +146,17 @@ if(CLANG_EXECUTABLE)
     ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
   add_test(NAME aot_native_prmt_dp4a COMMAND test_aot_prmt_dp4a
            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/prmt_dp4a.ptx)
+
+  # Test 2k-a: signed vs unsigned comparisons (cmp_signed kernel): the
+  # lowering must not confuse setp.lt.s32 with setp.lt.u32 — it did, and the
+  # differential fuzzer found it.
+  add_executable(test_aot_cmp_signed ${CMAKE_CURRENT_SOURCE_DIR}/test_aot_cmp_signed.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/cmp_signed.o)
+  target_link_libraries(test_aot_cmp_signed PRIVATE rouge-runtime rouge-ptx)
+  target_include_directories(test_aot_cmp_signed PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
+  add_test(NAME aot_native_cmp_signed COMMAND test_aot_cmp_signed
+           ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cmp_signed.ptx)
 
   # Test 2k-bis: INT8 GEMM (nvcc-compiled kernel, the prmt + dp4a path),
   # AOT vs interpreter. Integer arithmetic, so the check is bit-exact.
@@ -489,7 +500,7 @@ if(CLANG_EXECUTABLE AND CUDA_DRIVER_INCLUDE_DIR AND CUDA_DRIVER_LIBRARY)
       -DRUNNER=$<TARGET_FILE:gpu_exec_rungpu>
       -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
       -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/gpu-exec
-      "-DCELLS=vadd.vadd,prmt_dp4a.prmt_dp4a,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2,shfl_reduce.shfl_reduce,atom_cas.atom_cas,shfl_pred.shfl_pred,vote_pred.vote_pred,shfl_pred_all.shfl_pred_all,ldmatrix_tile.ldmatrix_sm75@ldmatrix_sm75"
+      "-DCELLS=vadd.vadd,prmt_dp4a.prmt_dp4a,cmp_signed.cmp_signed,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2,shfl_reduce.shfl_reduce,atom_cas.atom_cas,shfl_pred.shfl_pred,vote_pred.vote_pred,shfl_pred_all.shfl_pred_all,ldmatrix_tile.ldmatrix_sm75@ldmatrix_sm75"
       -DSM=sm_75
       -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_exec.cmake)
   set_tests_properties(compiler_nvptx_gpu_exec PROPERTIES
@@ -547,3 +558,6 @@ else()
   message(STATUS "[rouge-compiler] GPU exec tests disabled: need clang plus "
                  "the CUDA driver headers and libcuda")
 endif()
+
+# ---- Differential fuzzer (our compiler vs the real hardware) --------------
+add_subdirectory(fuzz)
