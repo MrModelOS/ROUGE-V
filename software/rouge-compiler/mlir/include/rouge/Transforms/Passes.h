@@ -35,6 +35,12 @@ void registerRougeSimtTransformsPasses();
 // another translation unit).
 void registerSimtToScfPass();
 
+// !rouge-unit-stride-to-vector — vectorises the unit-stride accesses of a
+// thread loop: the loop is split into a vector part (V elements per
+// iteration) and an exact scalar tail.
+std::unique_ptr<mlir::Pass> createRougeUnitStrideToVectorPass();
+void registerRougeUnitStrideToVectorPass();
+
 
 }  // namespace rouge
 

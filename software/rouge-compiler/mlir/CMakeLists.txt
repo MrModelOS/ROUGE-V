@@ -29,7 +29,8 @@ message(STATUS "rouge MLIR contour: building against MLIR ${MLIR_VERSION}")
 # ---- pass library ------------------------------------------------------
 add_library(rouge-mlir-passes STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtAccessReport.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtToScf.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtToScf.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/UnitStrideToVector.cpp)
 target_include_directories(rouge-mlir-passes PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${MLIR_INCLUDE_DIRS}
@@ -42,7 +43,8 @@ target_link_libraries(rouge-mlir-passes PUBLIC
   MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRMemRefDialect
-  MLIRSCFDialect)
+  MLIRSCFDialect
+  MLIRVectorDialect)
 target_compile_options(rouge-mlir-passes PRIVATE ${LLVM_COMPILE_OPTIONS})
 if(NOT LLVM_ENABLE_RTTI)
   target_compile_options(rouge-mlir-passes PUBLIC -fno-rtti)
@@ -97,6 +99,35 @@ add_test(NAME mlir_simt_to_scf_divergent
           ${CMAKE_CURRENT_SOURCE_DIR}/test/simt_to_scf_divergent.mlir)
 set_tests_properties(mlir_simt_to_scf_divergent PROPERTIES
   PASS_REGULAR_EXPRESSION "divergent control flow is not supported")
+
+# Векторизация unit-stride доступов: структурная проверка + СЕМАНТИЧЕСКАЯ
+# (скалярная и векторная версии обязаны посчитать одно и то же).
+add_test(NAME mlir_unit_stride_to_vector
+  COMMAND rouge-opt --rouge-unit-stride-to-vector
+          ${CMAKE_CURRENT_SOURCE_DIR}/test/unit_stride_to_vector.mlir)
+set_tests_properties(mlir_unit_stride_to_vector PROPERTIES
+  PASS_REGULAR_EXPRESSION
+    "loops vectorised=1 refused=0;vector.load")
+
+# The semantic check needs the MLIR tools (mlir-opt / mlir-translate) and a C
+# compiler; without them there is nothing to compare.
+get_filename_component(MLIR_BIN_DIR "${MLIR_DIR}/../../../bin" ABSOLUTE)
+find_program(MLIR_OPT_EXE mlir-opt HINTS ${MLIR_BIN_DIR})
+find_program(MLIR_TRANSLATE_EXE mlir-translate HINTS ${MLIR_BIN_DIR})
+if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE)
+  enable_language(C)
+  add_library(mlir_print_f32 STATIC test/print_f32.c)
+  add_test(NAME mlir_unit_stride_to_vector_semantics
+    COMMAND ${CMAKE_COMMAND}
+      -DROUGE_OPT=$<TARGET_FILE:rouge-opt>
+      -DMLIR_OPT=${MLIR_OPT_EXE}
+      -DMLIR_TRANSLATE=${MLIR_TRANSLATE_EXE}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/test/unit_stride_to_vector.mlir
+      -DRUNTIME_C=$<TARGET_FILE:mlir_print_f32>
+      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/vector-semantics
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/vector_semantics.cmake)
+endif()
 
 # Синтаксис memref.atomic_rmw изменился в MLIR 23 — отдельный вход и
 # отдельная ячейка только для новых версий.

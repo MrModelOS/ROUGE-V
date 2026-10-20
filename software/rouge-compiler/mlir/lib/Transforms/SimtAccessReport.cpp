@@ -160,6 +160,7 @@ void registerRougeSimtTransformsPasses() {
   // The rewriting pass lives in its own translation unit (its class is in an
   // anonymous namespace there).
   registerSimtToScfPass();
+  registerRougeUnitStrideToVectorPass();
 }
 
 }  // namespace rouge

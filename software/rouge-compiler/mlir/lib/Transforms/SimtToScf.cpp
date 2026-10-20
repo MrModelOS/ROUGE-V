@@ -150,6 +150,18 @@ struct SimtToScf
   // вызов получает лишний операнд не того типа.
   std::map<std::string, bool> kernelTakesBlockId_;
 
+  // The dialects whose ops this pass creates must be LOADED: an input
+  // without scf ops never loads the SCF dialect, and creating an op of an
+  // unloaded dialect is refused ("created with unregistered dialect").
+  // Declaring them as dependencies makes the framework load them BEFORE the
+  // pass runs — loading them from inside the pass would race with the
+  // framework (and with other passes running in parallel).
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<mlir::scf::SCFDialect, mlir::arith::ArithDialect,
+                    mlir::func::FuncDialect, mlir::gpu::GPUDialect,
+                    mlir::memref::MemRefDialect>();
+  }
+
   StringRef getArgument() const final { return "rouge-simt-to-scf"; }
   StringRef getDescription() const final {
     return "Turn SIMT thread/block ids into explicit loops (phase "
@@ -158,15 +170,6 @@ struct SimtToScf
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    module.getContext()->disableMultithreading();
-    // The dialects whose ops this pass creates must be LOADED in the context:
-    // an input without scf ops never loads the SCF dialect, and creating an
-    // op of an unloaded dialect is refused ("created with unregistered
-    // dialect").
-    MLIRContext *ctx = module.getContext();
-    ctx->getOrLoadDialect<mlir::scf::SCFDialect>();
-    ctx->getOrLoadDialect<mlir::arith::ArithDialect>();
-    ctx->getOrLoadDialect<mlir::func::FuncDialect>();
     if (failed(verify(module))) {
       module.emitError("rouge-simt-to-scf: module verification failed");
       return;
