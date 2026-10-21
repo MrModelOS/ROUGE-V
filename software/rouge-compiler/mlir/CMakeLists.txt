@@ -117,6 +117,7 @@ target_link_libraries(rouge-opt PRIVATE
   MLIRSCFDialect
   MLIRGPUDialect
   MLIRVectorDialect
+  MLIRTransforms
   rouge-mlir-dialect)
 
 # ---- tests ------------------------------------------------------------
@@ -353,4 +354,45 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND LLC_EXE AND QEMU
       -DHARNESS_C=${CMAKE_CURRENT_SOURCE_DIR}/test/rv_vector_harness.c
       -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/rouge-vector-rvv
       -P ${CMAKE_CURRENT_SOURCE_DIR}/vector_rvv.cmake)
+endif()
+
+# ---- бэкенд-драйвер (rouge-compile) --------------------------------------
+#
+# Плагин бэкенда: PTX -> диалект -> SCF -> Vector -> LLVM IR -> машина.
+# Своей кодогенерации у контура нет — её делает LLVM. Тест сквозной: на входе
+# PTX-ядро копирования, на выходе ассемблер, и в нём должны быть ВЕКТОРНЫЕ
+# обращения. Структурная проверка; семантику той же цепочки проверяет
+# mlir_rouge_to_rvv (исполнение под qemu).
+if(Python3_Interpreter_FOUND AND MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND LLC_EXE)
+  add_test(NAME mlir_rouge_compile_rvv
+    COMMAND ${CMAKE_COMMAND}
+      -DROUGE_OPT=$<TARGET_FILE:rouge-opt>
+      -DROUGE_PTX2MLIR=$<TARGET_FILE:rouge-ptx2mlir>
+      -DMLIR_OPT=${MLIR_OPT_EXE}
+      -DMLIR_TRANSLATE=${MLIR_TRANSLATE_EXE}
+      -DLLC=${LLC_EXE}
+      -DPYTHON=${Python3_EXECUTABLE}
+      -DDRIVER=${CMAKE_CURRENT_SOURCE_DIR}/tools/rouge-compile/rouge-compile
+      -DTARGET=rvv
+      "-DARGS=--block;64;--shape;0=64xf32;--shape;1=64xf32"
+      -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/test/vector_copy.ptx
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/vector_copy_rvv.s
+      "-DEXPECTED=vle32.v;vse32.v"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/rouge_compile.cmake)
+
+  add_test(NAME mlir_rouge_compile_cpu
+    COMMAND ${CMAKE_COMMAND}
+      -DROUGE_OPT=$<TARGET_FILE:rouge-opt>
+      -DROUGE_PTX2MLIR=$<TARGET_FILE:rouge-ptx2mlir>
+      -DMLIR_OPT=${MLIR_OPT_EXE}
+      -DMLIR_TRANSLATE=${MLIR_TRANSLATE_EXE}
+      -DLLC=${LLC_EXE}
+      -DPYTHON=${Python3_EXECUTABLE}
+      -DDRIVER=${CMAKE_CURRENT_SOURCE_DIR}/tools/rouge-compile/rouge-compile
+      -DTARGET=cpu
+      "-DARGS=--block;64;--shape;0=64xf32;--shape;1=64xf32"
+      -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/test/vector_copy.ptx
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/vector_copy_cpu.s
+      "-DEXPECTED=movaps"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/rouge_compile.cmake)
 endif()

@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""ROUGE-V: the backend driver — PTX to machine code.
+
+The point of the MLIR contour is that the BACKENDS are not code generators
+any more: the dialect is lowered to the standard dialects, then to the LLVM
+dialect, and the machine code comes from LLVM's own backends. This driver is
+the "plugin" that composes the pieces for a target:
+
+    PTX --rouge-ptx2mlir--> the rouge dialect
+        --rouge-to-scf-->   loops (the thread loop, the grid loop)
+        --rouge-unit-stride-to-vector-->  the vector loop + the scalar tail
+        --mlir-opt-->       the standard conversions (to the LLVM dialect)
+        --mlir-translate--> LLVM IR
+        --llc-->           the machine code (LLVM's backend, not ours)
+
+The targets:
+
+    cpu     x86-64
+    rvv     riscv64 with the vector extension (+v): the point of the whole
+            contour — the vectorised kernel becomes real RVV instructions
+
+The NVPTX target is not here yet: it needs our dialect to be lowered BACK
+into the gpu dialect (the reverse of the SIMT lowering), and until that
+exists the honest answer is that the GPU path is still the AOT one (ptx2ir).
+
+usage: rouge-compile <kernel.ptx> --target cpu|rvv [-o out.s]
+                      [--grid N] [--block N] [--shape I=64xi32]
+                      [--emit-llvm] [--keep-mlir]
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# The LLVM IR conversion chain: the standard MLIR passes that take the
+# standard dialects to the LLVM dialect. Nothing here is ours — that is the
+# point: the backends are LLVM's.
+CONVERSIONS = [
+    "--convert-scf-to-cf",
+    "--convert-cf-to-llvm",
+    "--convert-arith-to-llvm",
+    "--convert-index-to-llvm",
+    "--expand-strided-metadata",
+    "--finalize-memref-to-llvm",
+    "--convert-math-to-llvm",
+    "--convert-vector-to-llvm",
+    "--convert-func-to-llvm",
+    "--reconcile-unrealized-casts",
+]
+
+TARGETS = {
+    # the target -> the llc flags
+    "cpu": ["-mtriple=x86_64-unknown-linux-gnu"],
+    "rvv": ["-mtriple=riscv64-unknown-linux-gnu",
+            "-mattr=+v,+m,+a,+f,+d,+c"],
+}
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("input")
+    ap.add_argument("--target", default="cpu", choices=sorted(TARGETS))
+    ap.add_argument("-o", "--output")
+    ap.add_argument("--grid", default="1")
+    ap.add_argument("--block", default="0")
+    ap.add_argument("--shape", action="append", default=[])
+    ap.add_argument("--emit-llvm", action="store_true",
+                    help="stop at the LLVM IR")
+    ap.add_argument("--keep-mlir", action="store_true",
+                    help="keep the intermediate .mlir files")
+    ap.add_argument("--rouge-opt", default=os.environ.get("ROUGE_OPT", "rouge-opt"))
+    ap.add_argument("--ptx2mlir", default=os.environ.get("ROUGE_PTX2MLIR", "rouge-ptx2mlir"))
+    ap.add_argument("--mlir-opt", default=os.environ.get("MLIR_OPT", "mlir-opt"))
+    ap.add_argument("--mlir-translate",
+                    default=os.environ.get("MLIR_TRANSLATE", "mlir-translate"))
+    ap.add_argument("--llc", default=os.environ.get("LLC", "llc"))
+    args = ap.parse_args()
+
+    if not os.path.exists(args.input):
+        print("rouge-compile: no such file: %s" % args.input)
+        return 2
+
+    work = tempfile.mkdtemp(prefix="rouge-compile-")
+    try:
+        dialect = os.path.join(work, "kernel.mlir")
+        lowered = os.path.join(work, "kernel_lowered.mlir")
+        llvm_ir = os.path.join(work, "kernel.ll")
+        asm = os.path.join(work, "kernel.s")
+
+        # 1) PTX -> the rouge dialect.
+        cmd = [args.ptx2mlir, args.input, "--grid", args.grid,
+               "--block", args.block, "-o", dialect]
+        for shape in args.shape:
+            cmd += ["--shape", shape]
+        r = run(cmd)
+        if r.returncode != 0:
+            print("rouge-compile: the front-end refused the kernel:\n%s"
+                  % r.stderr.strip())
+            return 1
+
+        # 2) The dialect -> loops -> vector. The canonicaliser that follows
+        # removes what the vectoriser leaves behind: the empty scalar tail
+        # when the trip count is a multiple of the vector width, and the
+        # dead lane-wise thread ids.
+        r = run([args.rouge_opt, "--rouge-to-scf",
+                 "--rouge-unit-stride-to-vector", "--canonicalize", "--cse",
+                 dialect, "-o", lowered])
+        if r.returncode != 0:
+            print("rouge-compile: the lowering refused the kernel:\n%s"
+                  % r.stderr.strip())
+            return 1
+
+        # 3) The standard dialects -> the LLVM dialect -> the LLVM IR.
+        r = run([args.mlir_opt] + CONVERSIONS + [lowered, "-o", llvm_ir])
+        if r.returncode != 0:
+            print("rouge-compile: mlir-opt failed:\n%s" % r.stderr.strip())
+            return 1
+        r = run([args.mlir_translate, "--mlir-to-llvmir", llvm_ir, "-o",
+                 llvm_ir + ".out"])
+        if r.returncode != 0:
+            print("rouge-compile: mlir-translate failed:\n%s" % r.stderr.strip())
+            return 1
+        shutil.move(llvm_ir + ".out", llvm_ir)
+
+        if args.emit_llvm:
+            out = args.output or (os.path.splitext(args.input)[0] + ".ll")
+            shutil.copy(llvm_ir, out)
+            print("rouge-compile: the LLVM IR is in %s" % out)
+            return 0
+
+        # 4) The machine code: LLVM's backend, not ours.
+        r = run([args.llc] + TARGETS[args.target] + ["-O2", llvm_ir, "-o", asm])
+        if r.returncode != 0:
+            print("rouge-compile: llc failed:\n%s" % r.stderr.strip())
+            return 1
+        out = args.output or (os.path.splitext(args.input)[0] + ".s")
+        shutil.copy(asm, out)
+        print("rouge-compile: the %s assembly is in %s" % (args.target, out))
+
+        if args.keep_mlir:
+            for src, dst in ((dialect, "kernel_dialect.mlir"),
+                             (lowered, "kernel_lowered.mlir")):
+                shutil.copy(src, os.path.join(os.path.dirname(out) or ".", dst))
+        return 0
+    finally:
+        if not args.keep_mlir:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

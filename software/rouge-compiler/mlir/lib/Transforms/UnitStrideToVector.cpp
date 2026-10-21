@@ -242,15 +242,26 @@ struct UnitStrideToVector
     fn.walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
     unsigned converted = 0, refused = 0;
     for (scf::ForOp forOp : loops) {
+      // A host loop that launches the kernel (the SIMT -> SCF lowering turns
+      // the launch into a loop over the grid) is not a thread loop: its body
+      // is one call, and there is nothing to vectorise in it. It is skipped
+      // silently-but-visibly: it is not a refusal, because nothing on the
+      // way to vector code was lost.
+      bool launches = false;
+      forOp->walk([&](func::CallOp) { launches = true; });
+      if (launches) {
+        forOp.emitRemark("skipped: a host loop that launches the kernel");
+        continue;
+      }
       if (failed(vectorizeLoop(forOp))) {
         ++refused;
         continue;
       }
       ++converted;
     }
-    llvm::errs() << "rouge-unit-stride-to-vector: " << fn.getName()
-                 << ": loops vectorised=" << converted << " refused=" << refused
-                 << "\n";
+    llvm::errs() << ("rouge-unit-stride-to-vector: " + fn.getName().str() +
+                     ": loops vectorised=" + std::to_string(converted) +
+                     " refused=" + std::to_string(refused) + "\n");
   }
 
   // The analysis: can this loop be vectorised?
@@ -297,13 +308,14 @@ struct UnitStrideToVector
     // form it becomes a mask, and the accesses inside it become the masked
     // ones — the threads that took the other branch simply do not touch the
     // memory.
-    DenseMap<Operation *, unsigned> indexOf;
+    // The ops of the body, flattened: the top-level ops and, right after a
+    // divergent region, the ops of its region. Every value-defined-in-the-
+    // body lookup goes through this map, so a value produced INSIDE a
+    // divergent region is recognised as a value of the body (its producer
+    // lives in the region, not at the top level).
     SmallVector<Operation *> bodyOps;
-    for (Operation &op : forOp.getBody()->without_terminator()) {
-      indexOf[&op] = bodyOps.size();
+    for (Operation &op : forOp.getBody()->without_terminator())
       bodyOps.push_back(&op);
-    }
-    // The ops of a divergent region come right after the region itself.
     SmallVector<Operation *> flatOps;
     for (Operation *op : bodyOps) {
       flatOps.push_back(op);
@@ -326,6 +338,8 @@ struct UnitStrideToVector
       for (Operation &inner : ifOp.getThenRegion().front().without_terminator())
         flatOps.push_back(&inner);
     }
+    DenseMap<Operation *, unsigned> indexOf;
+    for (size_t k = 0; k < flatOps.size(); ++k) indexOf[flatOps[k]] = (unsigned)k;
     for (Operation *op : flatOps) {
       BodyOp item;
       item.op = op;
@@ -351,6 +365,23 @@ struct UnitStrideToVector
         // The region itself: in the vector form it becomes the mask.
         item.kind = BodyKind::Divergent;
       } else {
+        // Everything else must be an ELEMENT-WISE arithmetic op: those are
+        // the ops whose scalar type can be swapped for a vector type
+        // without changing the meaning. An op of any other dialect (a call,
+        // a reduction, an SCF region, a memref view) has no such swap, and
+        // guessing one would be a silent miscompile.
+        StringRef ns = op->getName().getDialectNamespace();
+        if (ns != "arith" && ns != "math") {
+          forOp.emitRemark("skipped: an op outside the supported set: " +
+                           op->getName().getStringRef());
+          return failure();
+        }
+        for (Type resTy : op->getResultTypes())
+          if (!resTy.isIntOrFloat() && !resTy.isIndex()) {
+            forOp.emitRemark(
+                "skipped: an element-wise op with a non-element result type");
+            return failure();
+          }
         item.kind = BodyKind::Elementwise;
       }
       // The memref constraints (1-D, static, aligned offset, element type).
@@ -385,10 +416,12 @@ struct UnitStrideToVector
       forOp.emitRemark("skipped: an empty body");
       return failure();
     }
-    // The data flow must be closed: every value used in the body comes from
-    // a load or a constant OF THIS BODY. Otherwise the vector types would
-    // not line up (a scalar from outside the body cannot be stored into a
-    // vector).
+    // The data flow must be closed: every value used in the body is either
+    // the thread id, a constant, or a value of THIS body. Otherwise the
+    // vector types would not line up (a scalar from outside the body cannot
+    // be stored into a vector). An element-wise chain is fine: every op of
+    // the chain is itself a body op, and each of its operands goes through
+    // this same check.
     for (const BodyOp &item : plan) {
       SmallVector<Value> uses;
       if (item.kind == BodyKind::Store)
@@ -412,9 +445,12 @@ struct UnitStrideToVector
           forOp.emitRemark("skipped: a value comes from outside the body");
           return failure();
         }
-        Operation *producer = bodyOps[it->second];
-        if (!isa<memref::LoadOp, arith::ConstantOp>(producer)) {
-          forOp.emitRemark("skipped: a value is not a load or a constant");
+        // A value computed under a mask is valid ONLY under that mask: the
+        // lanes that skipped the branch hold the pass-through value, not
+        // the computed one. Carrying it out would be a silent miscompile.
+        if (isInsideDivergence(def, bodyOps) && !item.divergent) {
+          forOp.emitRemark(
+              "skipped: a value crosses the boundary of a divergence");
           return failure();
         }
       }
@@ -444,10 +480,15 @@ struct UnitStrideToVector
     // computed per lane — that is exactly what a mask is.
     VectorType idxVecTy = VectorType::get({width_}, builder.getIndexType());
     Value laneIv;
+    Operation *laneStep = nullptr, *laneSplat = nullptr, *laneAdd = nullptr;
     {
       auto step = vector::StepOp::create(builder, loc, idxVecTy);
       auto splat = vector::BroadcastOp::create(builder, loc, idxVecTy, vecIv);
-      laneIv = builder.create<arith::AddIOp>(splat, step).getResult();
+      auto add = builder.create<arith::AddIOp>(splat, step);
+      laneIv = add.getResult();
+      laneStep = step;
+      laneSplat = splat;
+      laneAdd = add;
       mapped[iv] = laneIv;
     }
 
@@ -563,19 +604,27 @@ struct UnitStrideToVector
       }
       Operation *cloned = builder.clone(*item.op);
       cloned->setOperands(operands);
-      if (cloned->getNumResults() == 1) {
-        Type opTy = cloned->getOperand(0).getType();
-        if (isa<arith::CmpIOp>(cloned)) {
-          // A comparison gives a mask: a vector of i1.
-          cloned->getResult(0).setType(
-              VectorType::get({width_}, builder.getI1Type()));
-        } else if (isa<VectorType>(opTy)) {
-          cloned->getResult(0).setType(opTy);
-        }
+      // The result type follows the ORIGINAL result type, not the type of
+      // the first operand: arith.index_cast and arith.extui change the type
+      // of their result (index -> i32 -> i64), and a clone that kept a
+      // scalar result would not verify. A comparison already has an i1
+      // result, which becomes a vector of i1 — the mask.
+      for (OpResult res : cloned->getResults())
+        if (!isa<VectorType>(res.getType()))
+          res.setType(VectorType::get({width_}, res.getType()));
+      if (cloned->getNumResults() == 1)
         mapped[item.op->getResult(0)] = cloned->getResult(0);
-      }
     }
     // (the scf.for built by the ODS builder already has its scf.yield)
+
+    // The lane-wise thread ids are needed only by a divergence: a plain
+    // element-wise body never refers to them, and a dead step/broadcast/add
+    // would only clutter the IR.
+    if (laneIv.use_empty()) {
+      laneAdd->erase();
+      laneSplat->erase();
+      laneStep->erase();
+    }
 
     // 2) The tail: the original body, from the end of the vector part. It
     // goes AFTER the vector loop, not inside it.

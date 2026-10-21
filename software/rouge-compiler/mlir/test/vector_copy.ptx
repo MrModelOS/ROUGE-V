@@ -1,0 +1,33 @@
+// A copy kernel in the shape nvcc emits for `dst[i] = src[i]`.
+//
+// It is hand-written on purpose: the test has to stay independent of any
+// particular nvcc version, and the repository ships no generated binaries.
+// The shape is what matters: the address is `param + tid * element size`,
+// so the front-end recovers the element index and the vectoriser sees a
+// unit-stride access.
+.version 8.0
+.target sm_75
+.address_size 64
+
+.visible .entry vector_copy(.param .u64 p0, .param .u64 p1)
+{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<2>;
+
+    ld.param.u64 %rd1, [p0];
+    ld.param.u64 %rd2, [p1];
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd6, %r1, 4;
+
+    add.s64 %rd4, %rd4, %rd6;
+    ld.global.f32 %f1, [%rd4];
+
+    add.s64 %rd3, %rd3, %rd6;
+    st.global.f32 [%rd3], %f1;
+
+    ret;
+}

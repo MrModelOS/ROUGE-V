@@ -22,6 +22,7 @@
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
+#include "mlir/Transforms/Passes.h"
 
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
@@ -34,6 +35,14 @@ int main(int argc, char **argv) {
   // registerRougeTransformsPasses; это всплыло только при первой реальной
   // сборке контура).
   rouge::registerRougeSimtTransformsPasses();
+
+  // The generic clean-up passes the contour uses: the vectoriser leaves an
+  // empty scalar tail (a trip count that is a multiple of the vector width)
+  // and the front-end can leave dead arithmetic. They are registered by
+  // hand because this driver is not mlir-opt: it links only the dialects
+  // and the passes the contour needs.
+  mlir::registerCanonicalizerPass();
+  mlir::registerCSEPass();
 
   return mlir::asMainReturnCode(mlir::MlirOptMain(
       argc, argv, "ROUGE-V MLIR contour optimizer\n", registry));

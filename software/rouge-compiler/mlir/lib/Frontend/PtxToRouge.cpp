@@ -25,6 +25,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -46,6 +47,11 @@ namespace {
 // What the analysis knows about the value in a register.
 struct PtrValue {
   enum Kind { None, ParamPtr, Address, Offset } kind = None;
+  // The value is the thread id (the index of the thread inside the block).
+  // The vectoriser recognises "the thread id + a constant" as a unit-stride
+  // access, so the front-end has to keep that shape instead of an integer
+  // cast of it.
+  bool isThreadId = false;
   // ParamPtr: the value of a kernel parameter (a pointer).
   int paramIndex = -1;
   // Address / Offset: base + index * scale.
@@ -59,6 +65,8 @@ struct PtrValue {
 // A memory access, recovered from the address arithmetic.
 struct MemAccess {
   bool valid = false;
+  // The index of the access is the thread id itself.
+  bool indexIsThreadId = false;
   int paramIndex = -1;
   int sharedIndex = -1;
   std::string indexReg;
@@ -523,6 +531,21 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       continue;
     }
 
+    // A move of the thread id: the value IS the thread id, and the
+    // vectoriser recognises it as such (a unit-stride access).
+    if (op.starts_with("mov.") && ins.args.size() > 1) {
+      std::string src = regName(ins.args[1]);
+      if (src.rfind("tid.", 0) == 0 || src == "tid") {
+        PtrValue pv;
+        pv.kind = PtrValue::Offset;
+        pv.indexReg = regName(ins.args[0]);
+        pv.scale = 1;
+        pv.isThreadId = true;
+        ptrValue_[regName(ins.args[0])] = pv;
+        continue;
+      }
+    }
+
     // Every other value is a CANDIDATE for an element index with the scale
     // one: the PTX often computes the byte offset directly (the element is
     // one byte wide — the int8 case, for example). The scale is CHECKED at
@@ -559,6 +582,11 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       if (!acc.elemType)
         return fail("the element type of the load '" + op.str() + "' is not known");
       acc.elemBytes = bytesOf(acc.elemType);
+      if (!acc.indexReg.empty()) {
+        auto it = ptrValue_.find(acc.indexReg);
+        if (it != ptrValue_.end() && it->second.isThreadId)
+          acc.indexIsThreadId = true;
+      }
       access_[i] = acc;
       continue;
     }
@@ -581,6 +609,11 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       if (!acc.elemType)
         return fail("the element type of the store '" + op.str() + "' is not known");
       acc.elemBytes = bytesOf(acc.elemType);
+      if (!acc.indexReg.empty()) {
+        auto it = ptrValue_.find(acc.indexReg);
+        if (it != ptrValue_.end() && it->second.isThreadId)
+          acc.indexIsThreadId = true;
+      }
       access_[i] = acc;
       continue;
     }
@@ -658,6 +691,14 @@ Value PtxToRougeEmitter::operandValue(StringRef tok, Type type) {
 
 // The index of an access, in elements.
 Value PtxToRougeEmitter::accessIndex(const MemAccess &acc) {
+  // The index is the thread id: keep it that way (the vectoriser
+  // recognises "the thread id + a constant" as a unit-stride access).
+  if (acc.indexIsThreadId) {
+    auto op = builder_.create<rouge::ThreadIdOp>(
+        loc_, builder_.getIndexType(),
+        rouge::DimensionAttr::get(module_.getContext(), rouge::Dimension::x));
+    return op.getResult();
+  }
   Value raw;
   if (!acc.indexReg.empty()) raw = valueOfReg(acc.indexReg);
   if (!raw) {
@@ -1190,6 +1231,29 @@ Value PtxToRougeEmitter::emitCompare(StringRef op, Value a, Value b, Type type) 
   return builder_.create<arith::CmpIOp>(ip, a, b).getResult();
 }
 
+// Deletes the ops of the function that are pure and whose results are not
+// used. The front-end emits EVERY PTX instruction, including the address
+// arithmetic (which is already folded into the accesses) and the registers
+// that the kernel never reads; without this the loop body carries dead
+// index casts that the vectoriser has to reason about. Only ops with no
+// side effects are touched: a load stays even if its result is unused (the
+// front-end does not have to prove that the read was pointless).
+void eraseDeadPureOps(Operation *root) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    root->walk([&](Operation *op) {
+      if (op == root || !op->use_empty() || op->getNumRegions() != 0) return;
+      // A terminator (func.return is `Pure` as well) is what keeps the block
+      // valid: an unused return is not dead code.
+      if (op->hasTrait<OpTrait::IsTerminator>()) return;
+      if (!isMemoryEffectFree(op)) return;
+      op->erase();
+      changed = true;
+    });
+  }
+}
+
 // One kernel.
 LogicalResult PtxToRougeEmitter::emitKernel(const PtxFunction &fn) {
   fn_ = &fn;
@@ -1235,6 +1299,7 @@ LogicalResult PtxToRougeEmitter::emitKernel(const PtxFunction &fn) {
 
   if (failed(emitBody())) return failure();
   builder_.create<func::ReturnOp>();
+  eraseDeadPureOps(func_);
 
   // The host function with the launch: the launch configuration belongs to
   // the caller, so the host takes the kernel's arguments and launches the
