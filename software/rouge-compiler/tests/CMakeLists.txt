@@ -32,7 +32,7 @@ target_link_libraries(test_ptx_to_llvm_warp PRIVATE rouge-compiler-lib rouge-ptx
 add_test(NAME compiler_ptx_to_llvm_warp COMMAND test_ptx_to_llvm_warp)
 
 # Stage 1 always runs: PTX -> LLVM IR via our translator CLI.
-foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt prmt_dp4a cmp_signed mma_tile mma_pipe)
+foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt prmt_dp4a bitfield cmp_signed mma_tile mma_pipe)
   add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
     COMMAND ptx2ir ${CMAKE_CURRENT_SOURCE_DIR}/kernels/${kern}.ptx
@@ -45,7 +45,7 @@ endforeach()
 find_program(CLANG_EXECUTABLE clang)
 if(CLANG_EXECUTABLE)
   # Compile one IR module per canonical kernel: ptx2ir -> clang -O2 -> .o
-  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt prmt_dp4a cmp_signed mma_tile mma_pipe)
+  foreach(kern vadd block_reduce atomic_reduce fp16_reduce gemm_tile atom_cas shfl_reduce shfl_pred vote_pred shfl_pred_all fp8_cvt prmt_dp4a bitfield cmp_signed mma_tile mma_pipe)
     add_custom_command(
       OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${kern}.o
       COMMAND ${CLANG_EXECUTABLE} -O2 -c ${CMAKE_CURRENT_BINARY_DIR}/${kern}.ll
@@ -139,6 +139,18 @@ if(CLANG_EXECUTABLE)
   # Test 2k-a: byte permute and byte dot products (prmt/dp4a/dp2a), AOT vs
   # interpreter. The semantics follow the PTX ISA; the same kernel is checked
   # on a real card by compiler_nvptx_gpu_exec.
+  # Test 2j-bis: bfi/bfe/prmt pinned to the PTX ISA. Three-way comparison:
+  # the native code, the interpreter, and the ISA pseudo-code written out in
+  # the test. Two paths agreeing is not enough — they agreed on a wrong
+  # answer once.
+  add_executable(test_aot_bitfield test_aot_bitfield.cpp
+                 ${CMAKE_CURRENT_BINARY_DIR}/bitfield.o)
+  target_link_libraries(test_aot_bitfield PRIVATE rouge-runtime rouge-ptx)
+  target_include_directories(test_aot_bitfield PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rouge-ptx)
+  add_test(NAME aot_native_bitfield COMMAND test_aot_bitfield
+           ${CMAKE_CURRENT_SOURCE_DIR}/kernels/bitfield.ptx)
+
   add_executable(test_aot_prmt_dp4a test_aot_prmt_dp4a.cpp
                  ${CMAKE_CURRENT_BINARY_DIR}/prmt_dp4a.o)
   target_link_libraries(test_aot_prmt_dp4a PRIVATE rouge-runtime rouge-ptx)

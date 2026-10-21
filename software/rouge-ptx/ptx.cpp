@@ -890,12 +890,27 @@ bool parse_float_literal(const std::string& tok, uint64_t* bits, int* width) {
 uint64_t operand_u64(const ExecState& st, const std::string& tok) {
   uint64_t v = 0;
   if (st.spec_reg(tok, &v)) return v;
-  if (!tok.empty() && (std::isdigit(static_cast<unsigned char>(tok[0])) || tok[0] == '-')) {
+  if (!tok.empty() && (std::isdigit(static_cast<unsigned char>(tok[0])) ||
+                       tok[0] == '-' || tok[0] == '+')) {
     // "0f3F800000" is a float literal, not the integer 0: strtoull would
     // stop at the 'f' and silently yield 0 (vendor PTX is full of these).
     uint64_t fbits = 0;
     int fw = 0;
     if (parse_float_literal(tok, &fbits, &fw) && fw == 32) return fbits;
+    // A hexadecimal integer immediate ("0x1f", "-0x10") is legal PTX.
+    // strtoull(..., 10) stops at the 'x' and returns 0 — a silent wrong
+    // answer in the REFERENCE implementation, which is worse than
+    // anywhere else.
+    const char* s = tok.c_str();
+    bool neg = false;
+    if (*s == '+' || *s == '-') {
+      neg = (*s == '-');
+      ++s;
+    }
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+      const uint64_t h = std::strtoull(s + 2, nullptr, 16);
+      return neg ? static_cast<uint64_t>(-static_cast<int64_t>(h)) : h;
+    }
     return static_cast<uint64_t>(std::strtoull(tok.c_str(), nullptr, 10));
   }
   return st.reg(tok);
@@ -1490,35 +1505,63 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
 
     // ---- bfi / bfe: bit-field insert / extract ----------------------------
     // nvcc lowers __shfl through bfi, so real PTX needs it even though
-    // hand-written kernels rarely use it.
-    //   bfi.b32 d, a, b, c : insert field b of a starting at bit c&0xff,
-    //                       width (c>>8)&0xff  -> d
-    //   bfe.b32 d, a, b, c : extract that field out of a
+    // hand-written kernels rarely use it. The semantics below is the PTX
+    // ISA's (9.7.9), NOT a reconstruction:
+    //
+    //   bfi.type f, a, b, c, d;    pos = c & 0xff, len = d & 0xff
+    //       f = b; for (i = 0; i < len && pos+i <= msb; i++) f[pos+i] = a[i];
+    //   bfe.type d, a, b, c;       pos = b & 0xff, len = c & 0xff
+    //       the field a[pos .. pos+len-1], zero-extended (.u32/.u64) or
+    //       sign-extended from its top bit (.s32/.s64); len == 0 -> 0.
+    //
+    // An earlier version of this interpreter read a PACKED selector
+    // (pos | len << 8) in the last operand and inserted b into a instead of
+    // a into b. That is not PTX: nvcc's bfe would have been mis-read
+    // silently, which is exactly what this project refuses to do.
     if (op.rfind("bfi.", 0) == 0 || op.rfind("bfe.", 0) == 0) {
-      if (A.size() < 4) { if (error) *error = "bad " + op + " in " + fn.name; return 0; }
-      const uint64_t a = operand_u64(st, A[1]);
-      const uint64_t b = operand_u64(st, A[2]);
-      const uint32_t c = static_cast<uint32_t>(operand_u64(st, A[3]));
-      const unsigned start = c & 0xffu;
-      unsigned width = (c >> 8) & 0xffu;
-      if (width == 0) width = 32;
-      if (width > 32) width = 32;
-      const uint32_t mask32 = (width >= 32) ? 0xffffffffu
-                                            : ((1u << width) - 1u);
-      uint64_t r;
-      if (op.rfind("bfi.", 0) == 0) {
-        const uint32_t av = static_cast<uint32_t>(a) & ~mask32;
-        const uint32_t bv = static_cast<uint32_t>(b) & mask32;
-        r = av | (static_cast<uint64_t>(bv) << start);
-      } else {
-        r = (static_cast<uint32_t>(a) >> start) & mask32;
+      const bool insert = op.rfind("bfi.", 0) == 0;
+      const size_t need = insert ? 5u : 4u;
+      if (A.size() < need) {
+        if (error) *error = "bad " + op + " in " + fn.name;
+        return 0;
       }
-      int rb = 32;
+      int bits = 32;
       {
         const auto it = fn.regBits.find(A[0]);
-        if (it != fn.regBits.end()) rb = it->second;
+        if (it != fn.regBits.end()) bits = it->second;
       }
-      st.setreg(A[0], width_mask(r, rb));
+      const unsigned msb = (unsigned)bits - 1u;
+      if (insert) {
+        const uint64_t a = operand_u64(st, A[1]);
+        uint64_t f = operand_u64(st, A[2]);
+        const unsigned pos = (unsigned)(operand_u64(st, A[3]) & 0xffu);
+        const unsigned len = (unsigned)(operand_u64(st, A[4]) & 0xffu);
+        for (unsigned i = 0; i < len && pos + i <= msb; ++i) {
+          const uint64_t bit = (a >> i) & 1u;
+          const unsigned at = pos + i;
+          f = (f & ~(1ull << at)) | (bit << at);
+        }
+        st.setreg(A[0], width_mask(f, bits));
+      } else {
+        const uint64_t a = operand_u64(st, A[1]);
+        const unsigned pos = (unsigned)(operand_u64(st, A[2]) & 0xffu);
+        const unsigned len = (unsigned)(operand_u64(st, A[3]) & 0xffu);
+        // The sign bit: for a signed field, the top bit of the field; for
+        // .u32/.u64, zero. "len == 0 -> 0" is covered by the same loop.
+        const bool signedField = op.find(".s") != std::string::npos;
+        uint64_t d = 0;
+        if (len != 0) {
+          const unsigned top = (pos + len - 1u <= msb) ? pos + len - 1u : msb;
+          const uint64_t sbit = signedField ? ((a >> top) & 1u) : 0u;
+          for (unsigned i = 0; i <= msb; ++i) {
+            uint64_t bit;
+            if (i < len && pos + i <= msb) bit = (a >> (pos + i)) & 1u;
+            else bit = sbit;
+            d |= bit << i;
+          }
+        }
+        st.setreg(A[0], width_mask(d, bits));
+      }
       st.pc = next_pc;
       return 1;
     }

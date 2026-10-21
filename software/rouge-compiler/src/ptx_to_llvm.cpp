@@ -366,6 +366,24 @@ class LlvmGen {
   // hex, but not with a per-width digit count), and the payload already lives
   // in an i32/i64 alloca here, so re-spell the pattern as a decimal value.
   static std::string normalize_literal(const std::string& tok) {
+    // A hexadecimal integer immediate ("0x5a5a5a5a") is legal PTX but LLVM
+    // reads a bare 0x literal as a hex FLOATING-POINT constant and rejects
+    // it for an integer type. Re-spell it in decimal: the value fits the
+    // type's unsigned range, which is what LLVM wants.
+    if (tok.size() > 2 && tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) {
+      bool hex = true;
+      for (size_t i = 2; i < tok.size(); ++i) {
+        const char c = tok[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F'))) {
+          hex = false;
+          break;
+        }
+      }
+      if (hex)
+        return std::to_string(
+            std::strtoull(tok.c_str() + 2, nullptr, 16));
+    }
     const bool f32 = tok.size() == 10 && tok[0] == '0' && tok[1] == 'f';
     const bool f64 = tok.size() == 18 && tok[0] == '0' && tok[1] == 'd';
     if (!f32 && !f64) return tok;
@@ -2426,9 +2444,24 @@ class LlvmGen {
     (void)idx;
     const auto& A = ins.args;
     const bool insert = ins.op.rfind("bfi.", 0) == 0;
+    // PTX ISA 9.7.9 (NOT a reconstruction):
+    //   bfi.type f, a, b, c, d;  pos = c & 0xff, len = d & 0xff
+    //       f = b; for (i = 0; i < len && pos+i <= msb; i++) f[pos+i] = a[i];
+    //   bfe.type d, a, b, c;     pos = b & 0xff, len = c & 0xff
+    //       the field a[pos .. pos+len-1], zero- or sign-extended; len == 0
+    //       gives 0.
+    // The word is 32 or 64 bits; the arithmetic below runs in i64 and the
+    // final truncation drops the bits past the word, which is exactly the
+    // "pos+i <= msb" clamp of the ISA.
+    const size_t need = insert ? 5u : 4u;
+    if (A.size() < need) {
+      fail(insert ? "bad bfi (expected f, a, b, pos, len)"
+                  : "bad bfe (expected d, a, pos, len)");
+      return false;
+    }
     const std::string ty = reg_type(A[0]);
-    // bfi/bfe are defined on 32/64-bit words; the source registers may be
-    // narrower, so widen once and work in i64 throughout.
+    const bool is64 = (ty == "i64");
+    const unsigned bits = is64 ? 64u : 32u;
     const auto as_i64 = [&](const std::string& reg_tok) {
       const std::string v = operand(reg_tok);
       const std::string t = reg_type(reg_tok);
@@ -2437,77 +2470,115 @@ class LlvmGen {
       line("  " + w + " = zext " + t + " " + v + " to i64");
       return w;
     };
+    auto band = [&](const std::string& x, const std::string& y) {
+      const std::string r = fresh("%ba");
+      line("  " + r + " = and i64 " + x + ", " + y);
+      return r;
+    };
+    auto bumin = [&](const std::string& x, const std::string& y) {
+      const std::string c = fresh("%bu");
+      line("  " + c + " = icmp ult i64 " + x + ", " + y);
+      const std::string r = fresh("%bs");
+      line("  " + r + " = select i1 " + c + ", i64 " + x + ", i64 " + y);
+      return r;
+    };
+    auto bshift = [&](const std::string& x, const std::string& amt, char dir) {
+      const std::string r = fresh("%bh");
+      line("  " + r + " = " + (dir == 'l' ? "shl" : "lshr") + " i64 " + x +
+           ", " + amt);
+      return r;
+    };
+    auto bsel = [&](const std::string& cond, const std::string& t,
+                    const std::string& f) {
+      const std::string r = fresh("%bq");
+      line("  " + r + " = select i1 " + cond + ", i64 " + t + ", i64 " + f);
+      return r;
+    };
+    auto bcmp = [&](const char* pred, const std::string& x,
+                    const std::string& y) {
+      const std::string r = fresh("%bc");
+      line("  " + r + " = icmp " + pred + " i64 " + x + ", " + y);
+      return r;
+    };
+
     const std::string a = as_i64(A[1]);
-    const std::string b = insert ? as_i64(A[2]) : std::string();
+    const std::string bitsC = std::to_string(bits);
+    const std::string bitsMinus1 = std::to_string(bits - 1);
+    // pos and len are .u32 values restricted by the ISA to 8 bits.
+    const std::string posRaw =
+        insert ? as_i64(A[3]) : as_i64(A[2]);
+    const std::string lenRaw =
+        insert ? as_i64(A[4]) : as_i64(A[3]);
+    const std::string pos8 = band(posRaw, "255");
+    const std::string len8 = band(lenRaw, "255");
 
-    // PTX has two shapes: "bfi.b32 d,a,b,c" packs pos=c&0xff, width=(c>>8)&0xff,
-    // and "bfi.b32 d,a,b,pos,width" passes them separately. nvcc emits both.
-    const bool five = A.size() == 5;
-    std::string pos, width;
-    if (!five) {
-      const std::string d = operand(A[3]);
-      const std::string p = fresh("%bs");
-      line("  " + p + " = and i64 " + d + ", 255");
-      pos = p;
-      if (is_numeric(A[3])) {
-        int w = static_cast<int>((std::strtoll(A[3].c_str(), nullptr, 10) >> 8) & 0xff);
-        if (w == 0) w = 32;
-        width = std::to_string(w);
-      } else {
-        const std::string t1 = fresh("%bw1");
-        line("  " + t1 + " = lshr i64 " + d + ", 8");
-        const std::string t2 = fresh("%bw2");
-        line("  " + t2 + " = and i64 " + t1 + ", 255");
-        const std::string z = fresh("%bwz");
-        line("  " + z + " = icmp eq i64 " + t2 + ", 0");
-        const std::string t3 = fresh("%bw3");
-        line("  " + t3 + " = select i1 " + z + ", i64 32, i64 " + t2);
-        width = t3;
-      }
-    } else {
-      pos = operand(A[3]);
-      const std::string w = operand(A[4]);
-      const std::string z = fresh("%bwz");
-      line("  " + z + " = icmp eq i64 " + w + ", 0");
-      const std::string t = fresh("%bw3");
-      line("  " + t + " = select i1 " + z + ", i64 32, i64 " + w);
-      width = t;
-    }
-    // A 32-bit field never shifts past 31; clamping keeps LLVM shift amounts
-    // in range (out-of-range shifts are poison).
-    if (ty != "i64") {
-      const std::string c = fresh("%bp");
-      line("  " + c + " = and i64 " + pos + ", 31");
-      pos = c;
-    }
-    // mask = (1 << width) - 1, as a 64-bit value
-    const std::string one = fresh("%one");
-    line("  " + one + " = shl i64 1, " + width);
-    const std::string maskv = fresh("%mk");
-    line("  " + maskv + " = sub i64 " + one + ", 1");
-
-    const std::string r = fresh("%r");
+    std::string res;
     if (insert) {
-      const std::string keep = fresh("%k1");
-      line("  " + keep + " = xor i64 " + maskv + ", -1");
-      const std::string base = fresh("%b1");
-      line("  " + base + " = and i64 " + a + ", " + keep);
-      const std::string bv = fresh("%bv");
-      line("  " + bv + " = and i64 " + b + ", " + maskv);
-      const std::string sh = fresh("%sh");
-      line("  " + sh + " = shl i64 " + bv + ", " + pos);
-      line("  " + r + " = or i64 " + base + ", " + sh);
+      const std::string b = as_i64(A[2]);
+      // mask = (1 << min(len, bits-1)) - 1; len >= bits -> all ones.
+      const std::string shLen = bumin(len8, bitsMinus1);
+      const std::string one = fresh("%bo");
+      line("  " + one + " = shl i64 1, " + shLen);
+      const std::string low = fresh("%bl");
+      line("  " + low + " = sub i64 " + one + ", 1");
+      const std::string mask =
+          bsel(bcmp("uge", len8, bitsC), "-1", low);
+      // pos past the msb inserts nothing: f = b.
+      const std::string posOk = bcmp("ult", pos8, bitsC);
+      const std::string posSafe = bsel(posOk, pos8, "0");
+      const std::string shMask0 = bshift(mask, posSafe, 'l');
+      // A position past the msb inserts NOTHING: f stays b.
+      const std::string shMask = bsel(posOk, shMask0, "0");
+      const std::string notSh = fresh("%bn");
+      line("  " + notSh + " = xor i64 " + shMask + ", -1");
+      const std::string keep = band(b, notSh);
+      const std::string field = band(bshift(a, posSafe, 'l'), shMask);
+      res = fresh("%br");
+      line("  " + res + " = or i64 " + keep + ", " + field);
     } else {
-      const std::string sh = fresh("%sh");
-      line("  " + sh + " = lshr i64 " + a + ", " + pos);
-      line("  " + r + " = and i64 " + sh + ", " + maskv);
+      // start = min(pos, bits); effLen = min(len, bits - start).
+      const std::string start = bumin(pos8, bitsC);
+      const std::string remaining = fresh("%brem");
+      line("  " + remaining + " = sub i64 " + bitsC + ", " + start);
+      const std::string effLen = bumin(len8, remaining);
+      const std::string startSafe = bsel(bcmp("eq", start, bitsC), "0", start);
+      const std::string lenSafe = bumin(effLen, bitsMinus1);
+      const std::string one = fresh("%bo");
+      line("  " + one + " = shl i64 1, " + lenSafe);
+      const std::string low = fresh("%bl");
+      line("  " + low + " = sub i64 " + one + ", 1");
+      const std::string mask = bsel(bcmp("eq", effLen, bitsC), "-1", low);
+      const std::string field =
+          band(bshift(a, startSafe, 'r'), mask);
+      // The sign bit: the top bit of the field; when the field is empty but
+      // len != 0, the ISA takes bit msb of a.
+      const std::string idx = fresh("%bix");
+      line("  " + idx + " = add i64 " + start + ", " + effLen);
+      const std::string idx1 = fresh("%bix1");
+      line("  " + idx1 + " = sub i64 " + idx + ", 1");
+      const std::string sbitIdx =
+          bsel(bcmp("eq", effLen, "0"), bitsMinus1, idx1);
+      const std::string sbit =
+          band(bshift(a, sbitIdx, 'r'), "1");
+      const std::string neg = fresh("%bneg");
+      line("  " + neg + " = sub i64 0, " + sbit);
+      // fill = neg << effLen (nothing to fill when effLen == bits).
+      const std::string fillSh = bsel(bcmp("eq", effLen, bitsC), "0", effLen);
+      const std::string fillSh2 = bshift(neg, fillSh, 'l');
+      const std::string fill = bsel(bcmp("eq", effLen, bitsC), "0", fillSh2);
+      const std::string ext = fresh("%bx");
+      line("  " + ext + " = or i64 " + field + ", " + fill);
+      const bool signedField = ins.op.find(".s") != std::string::npos;
+      const std::string out = signedField ? ext : field;
+      // len == 0 -> 0, whatever the field says.
+      res = bsel(bcmp("eq", len8, "0"), "0", out);
     }
-    if (ty != "i64") {
+    if (!is64) {
       const std::string t = fresh("%t");
-      line("  " + t + " = trunc i64 " + r + " to " + ty);
+      line("  " + t + " = trunc i64 " + res + " to " + ty);
       store_reg(A[0], t);
     } else {
-      store_reg(A[0], r);
+      store_reg(A[0], res);
     }
     return true;
   }

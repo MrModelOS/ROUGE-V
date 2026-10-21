@@ -128,17 +128,6 @@ unsigned immediateFor(Op op, Rng& rng) {
       if (mode == 1) return 0x8000u | rng.u32(16);    // msb у старшего поля
       return 0xF000u | rng.u32(16);                   // все поля с msb
     }
-    case Op::Bfi: {
-      // bfi: pos в байтах 0..3, width в байтах 1..32.
-      const unsigned pos = rng.u32(4);
-      const unsigned width = 1 + rng.u32(32);
-      return pos | (width << 8);
-    }
-    case Op::Bfe: {
-      const unsigned pos = rng.u32(4);
-      const unsigned width = 1 + rng.u32(32);
-      return pos | (width << 8);
-    }
     default:
       return (unsigned)rng.i32();
   }
@@ -436,10 +425,24 @@ int main(int argc, char** argv) {
       } else if (op == Op::Dp4aS || op == Op::Dp4aU) {
         ptx += "    " + std::string(opName(op)) + " " + std::string(d) + ", " +
                std::string(a) + ", " + std::string(b) + ", 0;\n";
-      } else if (op == Op::Bfi || op == Op::Bfe) {
-        ptx += "    " + std::string(opName(op)) + " " + std::string(d) + ", " +
-               std::string(a) + ", " + std::string(b) + ", " +
-               std::to_string(imm) + ";\n";
+      } else if (op == Op::Bfi) {
+        // bfi.type f, a, b, c, d — the position and the length are SEPARATE
+        // operands (PTX ISA 9.7.9). The old generator packed them into one
+        // (pos | len << 8), which is not PTX at all.
+        const unsigned pos = rng.u32(33);  // 0..32, including "past the msb"
+        const unsigned len = rng.u32(33);  // 0..32, including "the whole word"
+        ptx += "    bfi.b32 " + std::string(d) + ", " + std::string(a) + ", " +
+               std::string(b) + ", " + std::to_string(pos) + ", " +
+               std::to_string(len) + ";\n";
+      } else if (op == Op::Bfe) {
+        // bfe.type d, a, b, c — there is no separate "second source": b is
+        // the position and c the length.
+        const bool sign = rng.u32(2) != 0;
+        const unsigned pos = rng.u32(33);
+        const unsigned len = rng.u32(33);
+        ptx += "    " + std::string(sign ? "bfe.s32" : "bfe.u32") + " " +
+               std::string(d) + ", " + std::string(a) + ", " +
+               std::to_string(pos) + ", " + std::to_string(len) + ";\n";
       } else if (op == Op::Mad) {
         // mad: d = a*b + c — третий операнд обязателен.
         ptx += "    mad.lo.s32 " + std::string(d) + ", " + std::string(a) + ", " +

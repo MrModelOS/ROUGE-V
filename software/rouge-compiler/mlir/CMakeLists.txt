@@ -240,9 +240,9 @@ endif()
 # LLVM IR -> бинарник -> исполнение на CPU). Результаты обязаны совпасть
 # ПОЭЛЕМЕНТНО.
 #
-# Операции ограничены теми, что фронтенд понимает: prmt/bfi/bfe он пока не
-# переводит и ОТКАЗЫВАЕТ громко (отказ — это тоже результат, но в этом цикле
-# он считается провалом: цикл проверяет известное подмножество).
+# Операции ограничены теми, что фронтенд понимает. Отказ фронтенда — это тоже
+# результат, но в этом цикле он считается провалом: цикл проверяет известное
+# подмножество, и потеря уже работающей операции не должна проходить молча.
 if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND
    Python3_Interpreter_FOUND)
   enable_language(C)
@@ -258,7 +258,7 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND
             --mlir-translate ${MLIR_TRANSLATE_EXE}
             --clang ${CLANG_EXECUTABLE}
             --runtime $<TARGET_FILE:mlir_print_i32>
-            --ops "add,sub,mul,shl,shru,shrs,and,or,xor,not,mins,maxs,popc,clz,setp,div,rem,dp4as,dp4au"
+            --ops "add,sub,mul,shl,shru,shrs,and,or,xor,not,mins,maxs,popc,clz,setp,div,rem,dp4as,dp4au,prmt,bfi,bfe"
             --iters 8
             --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir
             --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
@@ -284,6 +284,25 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND
             --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir-phases
             --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
   set_tests_properties(compiler_mlir_fuzz_phases PROPERTIES TIMEOUT 900)
+
+  # Каждый сохранённый провал — это ядро, которое когда-то нашло баг (так был
+  # найден `prmt`, терявший маску байта). Оно повторяется на том же входе и
+  # обязано проходить. Это регрессионный тест, а не «пример вывода»: падение
+  # здесь означает, что вернулось ровно то, что чинили.
+  add_test(NAME compiler_mlir_fuzz_cases
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/run_fuzz_mlir.py
+            --ptx2mlir $<TARGET_FILE:rouge-ptx2mlir>
+            --rouge-opt $<TARGET_FILE:rouge-opt>
+            --gen $<TARGET_FILE:fuzz_gen_kernel>
+            --interp $<TARGET_FILE:fuzz_run_interp>
+            --mlir-opt ${MLIR_OPT_EXE}
+            --mlir-translate ${MLIR_TRANSLATE_EXE}
+            --clang ${CLANG_EXECUTABLE}
+            --runtime $<TARGET_FILE:mlir_print_i32>
+            --replay ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases
+            --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir-cases)
+  set_tests_properties(compiler_mlir_fuzz_cases PROPERTIES TIMEOUT 900)
 endif()
 
 # ---- наш собственный диалект (rouge) -------------------------------------

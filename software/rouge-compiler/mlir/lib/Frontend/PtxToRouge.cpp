@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -1170,6 +1171,193 @@ LogicalResult PtxToRougeEmitter::emitInstruction(const PtxInstruction &ins,
       regValue_[dst] = sum;
       return success();
     }
+    // ---- bfi / bfe: bit-field insert / extract (PTX ISA 9.7.9) ----------
+    //
+    //   bfi.type f, a, b, c, d;   pos = c & 0xff, len = d & 0xff
+    //       f = b; for (i < len && pos+i <= msb) f[pos+i] = a[i];
+    //   bfe.type d, a, b, c;      pos = b & 0xff, len = c & 0xff
+    //       the field a[pos .. pos+len-1], zero- or sign-extended; len == 0
+    //       gives 0.
+    //
+    // The position and the length have to be COMPILE-TIME constants here:
+    // the clamps ("pos+i <= msb") and the sign bit would otherwise need a
+    // chain of selects whose only purpose is to be correct for a dynamic
+    // value, and a wrong clamp is a silent wrong answer. nvcc emits
+    // immediates in practice; a dynamic one is refused by name.
+    auto constantOf = [](Value v) -> std::optional<int64_t> {
+      if (auto c = v.getDefiningOp<arith::ConstantOp>())
+        if (auto i = dyn_cast<IntegerAttr>(c.getValue()))
+          return i.getInt();
+      return std::nullopt;
+    };
+    if (o.rfind("bfi.", 0) == 0 || o.rfind("bfe.", 0) == 0) {
+      const bool insert = o.rfind("bfi.", 0) == 0;
+      const size_t need = insert ? 5u : 4u;
+      if (ins.args.size() < need)
+        return fail(insert ? "bad bfi (expected f, a, b, pos, len)"
+                           : "bad bfe (expected d, a, pos, len)");
+      Type t = typeOfReg(dst);
+      auto intTy = dyn_cast<IntegerType>(t);
+      if (!intTy) return fail("bfi/bfe need an integer register");
+      const unsigned bits = intTy.getWidth();
+      Value a = operandValue(ins.args[1], t);
+      if (!a) return fail("the bfi/bfe source is not understood");
+      const size_t posArg = insert ? 3 : 2;
+      Value posV = operandValue(ins.args[posArg], t);
+      Value lenV = operandValue(ins.args[posArg + 1], t);
+      auto posOpt = constantOf(posV);
+      auto lenOpt = constantOf(lenV);
+      if (!posOpt || !lenOpt)
+        return fail("a dynamic bfi/bfe position or length is not supported: "
+                    "the clamps to the word have to be known at compile time");
+      const unsigned pos = (unsigned)(*posOpt & 0xff);
+      const unsigned len = (unsigned)(*lenOpt & 0xff);
+
+      if (insert) {
+        Value b = operandValue(ins.args[2], t);
+        if (!b) return fail("the bfi base is not understood");
+        // Nothing is written past the msb, and a position past it inserts
+        // nothing at all: f stays b.
+        const unsigned effLen = (pos >= bits) ? 0u : std::min(len, bits - pos);
+        if (effLen == 0) {
+          store(b);
+          return success();
+        }
+        const uint64_t low =
+            (effLen >= bits) ? ~uint64_t{0} : ((uint64_t{1} << effLen) - 1);
+        Value mask = constInt(t, (int64_t)low);
+        Value shMask = builder_.create<arith::ShLIOp>(mask, constInt(t, pos))
+                           .getResult();
+        Value keep =
+            builder_.create<arith::AndIOp>(
+                b, builder_.create<arith::XOrIOp>(
+                       shMask, constInt(t, -1)).getResult())
+                .getResult();
+        Value field =
+            builder_.create<arith::AndIOp>(
+                builder_.create<arith::ShLIOp>(a, constInt(t, pos)).getResult(),
+                shMask)
+                .getResult();
+        store(builder_.create<arith::OrIOp>(keep, field).getResult());
+        return success();
+      }
+
+      // bfe: the field is empty when len == 0, and the ISA's answer for
+      // anything past the msb is the sign replicated over the whole word.
+      const bool signedField = o.find(".s") != StringRef::npos;
+      if (len == 0) {
+        store(constInt(t, 0));
+        return success();
+      }
+      if (pos >= bits) {
+        if (!signedField) {
+          store(constInt(t, 0));
+          return success();
+        }
+        Value sbit = builder_.create<arith::AndIOp>(
+            builder_.create<arith::ShRUIOp>(a, constInt(t, (int64_t)bits - 1))
+                .getResult(),
+            constInt(t, 1))
+                         .getResult();
+        store(builder_.create<arith::SubIOp>(constInt(t, 0), sbit).getResult());
+        return success();
+      }
+      const unsigned effLen = std::min(len, bits - pos);
+      const uint64_t low =
+          (effLen >= bits) ? ~uint64_t{0} : ((uint64_t{1} << effLen) - 1);
+      Value field = builder_.create<arith::AndIOp>(
+          builder_.create<arith::ShRUIOp>(a, constInt(t, pos)).getResult(),
+          constInt(t, (int64_t)low))
+                        .getResult();
+      if (!signedField || effLen >= bits) {
+        store(field);
+        return success();
+      }
+      // Sign-extend: fill the bits above the field with its top bit.
+      Value sbit = builder_.create<arith::AndIOp>(
+          builder_.create<arith::ShRUIOp>(a, constInt(t, pos + effLen - 1))
+              .getResult(),
+          constInt(t, 1))
+                       .getResult();
+      Value fill = builder_.create<arith::ShLIOp>(
+          builder_.create<arith::SubIOp>(constInt(t, 0), sbit).getResult(),
+          constInt(t, effLen))
+                       .getResult();
+      store(builder_.create<arith::OrIOp>(field, fill).getResult());
+      return success();
+    }
+
+    // ---- prmt.b32: byte permute, mode 0 (PTX ISA 9.7.10.7) --------------
+    //
+    // The eight source bytes are the 64-bit value {b, a} from the low end:
+    // 0..3 are a's, 4..7 are b's. Each 4-bit field of the selector picks the
+    // byte for d.b0..d.b3; a field with bit 3 set replicates the selected
+    // byte's SIGN over the whole byte. Bits 19:16 of the selector are the
+    // MODE, and only mode 0 is implemented here.
+    //
+    // The selector must be a constant: the mode decides the meaning of the
+    // whole instruction, and a dynamic selector cannot be checked. Guessing
+    // would be a silent wrong answer for every mode-1 selector.
+    if (o.rfind("prmt.", 0) == 0) {
+      if (ins.args.size() < 4) return fail("bad prmt");
+      Type t = typeOfReg(dst);
+      auto intTy = dyn_cast<IntegerType>(t);
+      if (!intTy || intTy.getWidth() != 32)
+        return fail("prmt is supported only on 32-bit words");
+      Value a = operandValue(ins.args[1], t);
+      Value b = operandValue(ins.args[2], t);
+      Value selV = operandValue(ins.args[3], t);
+      if (!a || !b || !selV) return fail("the prmt is not understood");
+      auto selOpt = constantOf(selV);
+      if (!selOpt)
+        return fail("a dynamic prmt selector is not supported: the mode field "
+                    "(bits 19:16) cannot be checked");
+      const unsigned sel = (unsigned)*selOpt;
+      const unsigned mode = (sel >> 16) & 0xfu;
+      if (mode != 0)
+        return fail("the prmt mode " + std::to_string(mode) +
+                    " is not supported (only mode 0)");
+      Type i64 = IntegerType::get(module_.getContext(), 64);
+      Value wa = builder_.create<arith::ExtUIOp>(i64, a).getResult();
+      Value wb = builder_.create<arith::ExtUIOp>(i64, b).getResult();
+      Value wide = builder_.create<arith::OrIOp>(
+          wa, builder_.create<arith::ShLIOp>(wb, constInt(i64, 32)).getResult())
+                       .getResult();
+      Value res = constInt(t, 0);
+      for (unsigned i = 0; i < 4; ++i) {
+        const unsigned field = (sel >> (4 * i)) & 0xfu;
+        const unsigned idx = field & 7u;
+        // The byte itself: truncation alone would keep a's HIGH bytes too,
+        // so they would leak into the neighbouring output bytes after the
+        // shift back up. Mask to 8 bits.
+        Value byte =
+            builder_.create<arith::AndIOp>(
+                builder_.create<arith::TruncIOp>(
+                    t, builder_.create<arith::ShRUIOp>(
+                           wide, constInt(i64, idx * 8)).getResult())
+                    .getResult(),
+                constInt(t, 0xff))
+                .getResult();
+        if (field & 8u) {
+          // The sign of the selected byte, replicated: 0xff or 0x00.
+          Value sbit = builder_.create<arith::AndIOp>(
+              builder_.create<arith::ShRUIOp>(byte, constInt(t, 7)).getResult(),
+              constInt(t, 1))
+                           .getResult();
+          byte = builder_.create<arith::AndIOp>(
+              builder_.create<arith::SubIOp>(constInt(t, 0), sbit).getResult(),
+              constInt(t, 0xff))
+                     .getResult();
+        }
+        res = builder_.create<arith::OrIOp>(
+            res, builder_.create<arith::ShLIOp>(byte, constInt(t, 8 * i))
+                     .getResult())
+                  .getResult();
+      }
+      store(res);
+      return success();
+    }
+
     if (o.rfind("neg.", 0) == 0) {
       Type t = typeOfReg(dst);
       Value a = operandValue(ins.args[1], t);
