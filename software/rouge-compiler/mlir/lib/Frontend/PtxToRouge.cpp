@@ -468,7 +468,7 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       } else {
         // The scale is not a constant: this is not an address offset but an
         // ordinary 64-bit value (a global index, for example). It is emitted
-        // as it is.
+        // as it is, and it stays a candidate for an unscaled index.
         continue;
       }
       PtrValue pv;
@@ -507,20 +507,36 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       continue;
     }
 
-    // A conversion that keeps an offset: the index becomes the new
-    // register (the value may be truncated, which the PTX allows).
+    // A conversion: the value is preserved (modulo a truncation, which the
+    // PTX allows), so the index candidate survives the conversion.
     if (op.starts_with("cvt.")) {
       if (ins.args.size() < 2) return fail("bad cvt");
       const std::string src = regName(ins.args[1]);
       auto it = ptrValue_.find(src);
-      if (it != ptrValue_.end() && it->second.kind == PtrValue::Offset) {
-        PtrValue pv = it->second;
-        pv.indexReg = regName(ins.args[0]);
-        ptrValue_[regName(ins.args[0])] = pv;
-        skip_.insert(i);
-        continue;
-      }
+      PtrValue pv;
+      pv.kind = PtrValue::Offset;
+      pv.indexReg = regName(ins.args[0]);
+      pv.scale = 1;
+      if (it != ptrValue_.end() && it->second.kind == PtrValue::Offset)
+        pv.scale = it->second.scale;
+      ptrValue_[regName(ins.args[0])] = pv;
       continue;
+    }
+
+    // Every other value is a CANDIDATE for an element index with the scale
+    // one: the PTX often computes the byte offset directly (the element is
+    // one byte wide — the int8 case, for example). The scale is CHECKED at
+    // the access: it must be exactly the element size, so a wrong guess is
+    // refused rather than silently believed.
+    {
+      const std::string dstReg = regName(ins.args[0]);
+      if (!dstReg.empty() && !ptrValue_.count(dstReg)) {
+        PtrValue pv;
+        pv.kind = PtrValue::Offset;
+        pv.indexReg = dstReg;
+        pv.scale = 1;
+        ptrValue_[dstReg] = pv;
+      }
     }
 
     // A memory access: the address register must be understood.
