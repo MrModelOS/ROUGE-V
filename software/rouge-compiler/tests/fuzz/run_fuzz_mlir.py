@@ -88,6 +88,10 @@ def main():
     ap.add_argument("--runtime", required=True,
                     help="the compiled print_i32 runtime")
     ap.add_argument("--iters", type=int, default=16)
+    ap.add_argument("--template", default="chain", choices=["chain", "phases"],
+                    help="the kernel shape: 'chain' — the per-thread "
+                         "arithmetic chain; 'phases' — shared memory + a "
+                         "barrier between two phases")
     ap.add_argument("--work", default="fuzz-work-mlir")
     ap.add_argument("--cases", default="cases")
     ap.add_argument("--ops", default="",
@@ -111,7 +115,8 @@ def main():
     failures = 0
     for seed in range(1, args.iters + 1):
         gen_cmd = [args.gen, "--seed", str(seed), "--out", kern, "--input", in_bin,
-                   "--meta", os.path.join(args.work, "meta.txt")]
+                   "--meta", os.path.join(args.work, "meta.txt"),
+                   "--template", args.template]
         if args.ops:
             gen_cmd += ["--ops", args.ops]
         r = run(gen_cmd)

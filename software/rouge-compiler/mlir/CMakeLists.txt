@@ -263,6 +263,27 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND
             --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir
             --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
   set_tests_properties(compiler_mlir_fuzz PROPERTIES TIMEOUT 900)
+
+  # Тот же фазер, но на ДРУГОЙ ФОРМЕ ядра: общая память, барьер и две фазы,
+  # причём вторая фаза читает чужой элемент (n-1-tid). Это проверка
+  # семантики фаз и общей памяти, а не векторизатора: индекс намеренно не
+  # «поток + константа», и проход обязан оставить его скалярным.
+  add_test(NAME compiler_mlir_fuzz_phases
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/run_fuzz_mlir.py
+            --ptx2mlir $<TARGET_FILE:rouge-ptx2mlir>
+            --rouge-opt $<TARGET_FILE:rouge-opt>
+            --gen $<TARGET_FILE:fuzz_gen_kernel>
+            --interp $<TARGET_FILE:fuzz_run_interp>
+            --mlir-opt ${MLIR_OPT_EXE}
+            --mlir-translate ${MLIR_TRANSLATE_EXE}
+            --clang ${CLANG_EXECUTABLE}
+            --runtime $<TARGET_FILE:mlir_print_i32>
+            --template phases
+            --iters 8
+            --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir-phases
+            --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
+  set_tests_properties(compiler_mlir_fuzz_phases PROPERTIES TIMEOUT 900)
 endif()
 
 # ---- наш собственный диалект (rouge) -------------------------------------

@@ -1276,11 +1276,13 @@ LogicalResult PtxToRougeEmitter::emitKernel(const PtxFunction &fn) {
   if (!fn.sharedVars.empty()) {
     for (size_t si = 0; si < fn.sharedVars.size(); ++si) {
       const PtxSharedVar &sv = fn.sharedVars[si];
+      // A dynamic (.extern, unsized) declaration has no size until launch,
+      // and the launch would have to pass it: refused, not guessed.
+      if (sv.dynamic)
+        return fail("the dynamic .shared variable '" + sv.name +
+                    "' is not supported: its size is a launch parameter");
       Attribute space = builder_.getIntegerAttr(
           IntegerType::get(module_.getContext(), 32), 3);
-      MemRefType t = MemRefType::get(
-          {sv.count}, Float32Type::get(module_.getContext()),
-          MemRefLayoutAttrInterface(), space);
       // The element type of a shared variable is not in the PTX; the
       // accesses decide. Use the type of the accesses to it.
       Type elem = Float32Type::get(module_.getContext());
@@ -1290,8 +1292,17 @@ LogicalResult PtxToRougeEmitter::emitKernel(const PtxFunction &fn) {
           break;
         }
       }
-      MemRefType mt =
-          MemRefType::get({sv.count}, elem, MemRefLayoutAttrInterface(), space);
+      // The declaration counts in ITS element size (".b8 smem[256]" is 256
+      // BYTES), while the memref counts in the element type of the accesses.
+      // Getting this wrong UNDER-allocates whenever the declaration is
+      // coarser than the access (".b64 s[8]" read as i32).
+      const int64_t declBytes = (int64_t)sv.count * (int64_t)sv.elemBytes;
+      const int64_t elemBytes = bytesOf(elem);
+      if (elemBytes <= 0 || declBytes <= 0 || declBytes % elemBytes != 0)
+        return fail("the size of the shared variable '" + sv.name +
+                    "' is not a multiple of its element size");
+      MemRefType mt = MemRefType::get({declBytes / elemBytes}, elem,
+                                      MemRefLayoutAttrInterface(), space);
       auto alloc = builder_.create<memref::AllocOp>(mt);
       sharedValue_.push_back(alloc.getResult());
     }

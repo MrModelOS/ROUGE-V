@@ -144,6 +144,109 @@ unsigned immediateFor(Op op, Rng& rng) {
   }
 }
 
+// The "phases" template: shared memory + a barrier. A different kernel
+// SHAPE (two phases over the threads), not a different arithmetic chain, so
+// it is generated separately from the chain template:
+//
+//   __shared__ int sdata[64];
+//   sdata[tid] = in[tid] + seed;
+//   __syncthreads();
+//   out[tid*K + j] = f(sdata[n - 1 - tid], j, seed);
+//
+// The REVERSE index in the second phase is deliberate: it is not
+// "thread + const", so the pass must keep it scalar. The point of this
+// template is the semantics of the barrier (the phases) and of the shared
+// memory (a per-block scratchpad), not the vectoriser.
+std::string phasesKernel(uint64_t seed) {
+  Rng rng(seed);
+  const unsigned k1 = 1 + rng.u32(7);
+  const unsigned k2 = 1 + rng.u32(101);
+  std::string p;
+  p += "// ROUGE-V differential fuzzer kernel (generated, do not edit).\n";
+  p += "// template=phases seed=" + std::to_string(seed) + "\n";
+  p += ".version 8.0\n.target sm_75\n.address_size 64\n\n";
+  p += ".visible .entry fuzz_kernel(\n";
+  p += "    .param .u64 fuzz_kernel_param_0,\n";
+  p += "    .param .u64 fuzz_kernel_param_1,\n";
+  p += "    .param .u32 fuzz_kernel_param_2,\n";
+  p += "    .param .u32 fuzz_kernel_param_3\n";
+  p += ")\n{\n";
+  p += "    .shared .align 4 .b8 sdata[256];\n";
+  p += "    .reg .b32 %r<16>;\n";
+  p += "    .reg .b64 %rd<16>;\n\n";
+  p += "    ld.param.u64 %rd1, [fuzz_kernel_param_0];\n";
+  p += "    ld.param.u64 %rd2, [fuzz_kernel_param_1];\n";
+  p += "    ld.param.u32 %r1, [fuzz_kernel_param_2];\n";
+  p += "    ld.param.u32 %r2, [fuzz_kernel_param_3];\n";
+  p += "    cvta.to.global.u64 %rd3, %rd1;\n";
+  p += "    cvta.to.global.u64 %rd4, %rd2;\n";
+  p += "    mov.u32 %r6, %tid.x;\n";
+  p += "    mul.wide.u32 %rd7, %r6, 4;\n";
+  // The first phase: the shared memory is filled by the thread with the
+  // same index.
+  p += "    add.s64 %rd8, %rd4, %rd7;\n";
+  p += "    ld.global.s32 %r7, [%rd8];\n";
+  p += "    add.s32 %r7, %r7, %r2;\n";
+  p += "    cvta.shared.u64 %rd9, sdata;\n";
+  p += "    add.s64 %rd10, %rd9, %rd7;\n";
+  p += "    st.shared.s32 [%rd10], %r7;\n";
+  p += "    bar.sync 0;\n";
+  // The second phase: a DIFFERENT thread reads every element (n-1-tid).
+  p += "    sub.s32 %r8, %r1, %r6;\n";
+  p += "    sub.s32 %r8, %r8, 1;\n";
+  p += "    mul.wide.u32 %rd11, %r8, 4;\n";
+  p += "    add.s64 %rd12, %rd9, %rd11;\n";
+  p += "    ld.shared.s32 %r9, [%rd12];\n";
+  p += "    mad.lo.s32 %r10, %r9, " + std::to_string(k1) + ", " +
+         std::to_string(k2) + ";\n";
+  p += "    xor.b32 %r11, %r10, %r2;\n";
+  p += "    mul.lo.s32 %r12, %r10, 3;\n";
+  p += "    sub.s32 %r13, %r11, %r12;\n";
+  const char* vals[4] = {"%r10", "%r11", "%r12", "%r13"};
+  for (int j = 0; j < kOutPerThread; ++j) {
+    p += "    mul.lo.s32 %r14, %r6, " +
+         std::to_string(kOutPerThread) + ";\n";
+    p += "    add.s32 %r14, %r14, " + std::to_string(j) + ";\n";
+    p += "    mul.wide.u32 %rd13, %r14, 4;\n";
+    p += "    add.s64 %rd13, %rd13, %rd3;\n";
+    p += "    st.global.s32 [%rd13], " + std::string(vals[j]) + ";\n";
+  }
+  p += "    ret;\n}\n";
+  return p;
+}
+
+// The three files of one fuzz case: the PTX text, the input blob and the
+// metadata the driver reads.
+int writeOutputs(const std::string& ptx, const std::vector<int>& input,
+                 uint64_t seed, const char* outPath, const char* inPath,
+                 const char* metaPath) {
+  FILE* f = fopen(outPath, "wb");
+  if (!f) {
+    std::fprintf(stderr, "gen_kernel: cannot write %s\n", outPath);
+    return 1;
+  }
+  std::fwrite(ptx.data(), 1, ptx.size(), f);
+  fclose(f);
+
+  f = fopen(inPath, "wb");
+  if (!f) {
+    std::fprintf(stderr, "gen_kernel: cannot write %s\n", inPath);
+    return 1;
+  }
+  std::fwrite(input.data(), sizeof(int), input.size(), f);
+  fclose(f);
+
+  f = fopen(metaPath, "wb");
+  if (!f) {
+    std::fprintf(stderr, "gen_kernel: cannot write %s\n", metaPath);
+    return 1;
+  }
+  std::fprintf(f, "n=%d\nk=%d\nseed=%llu\n", kN, kOutPerThread,
+               (unsigned long long)seed);
+  fclose(f);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -155,6 +258,9 @@ int main(int argc, char** argv) {
   // Это режим «одна операция за раз»: он локализует расхождение до конкретной
   // инструкции, а не до случайной цепочки.
   std::string forcedOps;
+  // --template chain|phases — the kernel SHAPE. "chain" (the default) is
+  // the per-thread arithmetic chain; "phases" is shared memory + a barrier.
+  std::string tpl = "chain";
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
       seed = strtoull(argv[++i], nullptr, 10);
@@ -166,6 +272,13 @@ int main(int argc, char** argv) {
       metaPath = argv[++i];
     } else if (!strcmp(argv[i], "--ops") && i + 1 < argc) {
       forcedOps = argv[++i];
+    } else if (!strcmp(argv[i], "--template") && i + 1 < argc) {
+      tpl = argv[++i];
+      if (tpl != "chain" && tpl != "phases") {
+        std::fprintf(stderr, "gen_kernel: unknown template '%s'\n",
+                     tpl.c_str());
+        return 2;
+      }
     } else {
       std::fprintf(stderr,
                    "usage: %s --seed N --out k.ptx --input in.bin --meta m.txt\n",
@@ -193,6 +306,11 @@ int main(int argc, char** argv) {
       input[(size_t)i] = (int)r;
     }
   }
+
+  // Шаблон "phases": другая ФОРМА ядра (общая память + барьер), поэтому
+  // генератор цепочки операций здесь не участвует.
+  if (tpl == "phases") return writeOutputs(phasesKernel(seed), input, seed,
+                                           outPath, inPath, metaPath);
 
   // Цепочка операций: одна на каждый «результат» (K регистров), плюс
   // несколько общих шагов.
@@ -360,29 +478,5 @@ int main(int argc, char** argv) {
   ptx += "    ret;\n";
   ptx += "}\n";
 
-  FILE* f = fopen(outPath, "wb");
-  if (!f) {
-    std::fprintf(stderr, "gen_kernel: cannot write %s\n", outPath);
-    return 1;
-  }
-  std::fwrite(ptx.data(), 1, ptx.size(), f);
-  fclose(f);
-
-  f = fopen(inPath, "wb");
-  if (!f) {
-    std::fprintf(stderr, "gen_kernel: cannot write %s\n", inPath);
-    return 1;
-  }
-  std::fwrite(input.data(), sizeof(int), input.size(), f);
-  fclose(f);
-
-  f = fopen(metaPath, "wb");
-  if (!f) {
-    std::fprintf(stderr, "gen_kernel: cannot write %s\n", metaPath);
-    return 1;
-  }
-  std::fprintf(f, "n=%d\nk=%d\nseed=%llu\n", kN, kOutPerThread,
-               (unsigned long long)seed);
-  fclose(f);
-  return 0;
+  return writeOutputs(ptx, input, seed, outPath, inPath, metaPath);
 }

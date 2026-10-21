@@ -67,7 +67,9 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -360,6 +362,44 @@ struct SimtLoweringBase {
         invariantOps.push_back(op);
     }
 
+    // A third group: the values that depend on the thread id but ONLY through
+    // pure arithmetic — `index_cast(tid)`, `tid * 4`, `tid + 1`. The phases
+    // are separate loops, so such a value does not survive from one loop to
+    // the next; but it does not have to: it is a pure function of the
+    // induction variable, so every phase that needs it can RECOMPUTE it.
+    //
+    // This is not an optimisation, it is what real kernels look like: nvcc
+    // computes the thread index once and uses it in every phase, and
+    // refusing that would refuse most real kernels for no reason. What is
+    // still refused is a value that really crosses the boundary — one that
+    // depends on MEMORY (`index_cast(load ...)`), because recomputing it
+    // would silently read the memory at a different time.
+    DenseSet<Operation *> invariantSet(invariantOps.begin(),
+                                       invariantOps.end());
+    DenseSet<Operation *> rematSet;
+    std::function<bool(Operation *)> isRematerialisable =
+        [&](Operation *op) -> bool {
+      if (invariantSet.count(op) || rematSet.count(op)) return true;
+      if (op->getNumRegions() != 0) return false;
+      if (!isMemoryEffectFree(op)) return false;
+      for (Value operand : op->getOperands()) {
+        Operation *def = operand.getDefiningOp();
+        if (!def) return false;  // a block argument: not ours to recompute
+        if (isa<ThreadIdOp, BlockIdOp, BlockDimOp, GridDimOp>(def)) continue;
+        if (invariantSet.count(def) || rematSet.count(def)) continue;
+        if (!isRematerialisable(def)) return false;
+      }
+      rematSet.insert(op);
+      return true;
+    };
+    for (Operation *op : dependentOps) isRematerialisable(op);
+
+    // The position of every op in the original body: the recomputed values
+    // are cloned in the original program order, so an op always comes after
+    // the values it uses.
+    DenseMap<Operation *, unsigned> opIndex;
+    for (unsigned i = 0; i < ops.size(); ++i) opIndex[ops[i]] = i;
+
     // The new function: the same arguments plus the block id (if the body
     // uses it), because the block id now lives in the launch's loop.
     auto fnType = cast<FunctionType>(kernel.getFunctionType());
@@ -486,6 +526,9 @@ struct SimtLoweringBase {
             Operation *def = operand.getDefiningOp();
             if (!def) continue;
             if (isa<ThreadIdOp, BlockIdOp>(def)) continue;
+            // A pure function of the thread id is recomputed in every phase
+            // that needs it (see rematSet above).
+            if (rematSet.count(def)) continue;
             // The invariants are hoisted out of the loops, so they dominate
             // every phase and are not a cross-phase dependency.
             if (std::find(invariantOps.begin(), invariantOps.end(), def) !=
@@ -504,7 +547,9 @@ struct SimtLoweringBase {
       }
     }
 
-    // Phases now refer to the dependent ops by index.
+    // Phases now refer to the dependent ops by index. The invariants are
+    // hoisted out of the loops and the rematerialisable values are
+    // recomputed inside each phase, so neither is bound to a phase.
     SmallVector<SmallVector<unsigned>> phaseDependent;
     for (SmallVector<unsigned> &phase : phases) {
       SmallVector<unsigned> dep;
@@ -513,6 +558,7 @@ struct SimtLoweringBase {
         if (std::find(invariantOps.begin(), invariantOps.end(), op) !=
             invariantOps.end())
           continue;
+        if (rematSet.count(op)) continue;
         dep.push_back(idx);
       }
       phaseDependent.push_back(dep);
@@ -600,6 +646,33 @@ struct SimtLoweringBase {
         Operation *clone = invariantClone[op];
         for (auto pair : llvm::zip(op->getResults(), clone->getResults()))
           mapper.map(std::get<0>(pair), std::get<1>(pair));
+      }
+      // The values this phase needs and can recompute (a pure function of
+      // the thread id): collected transitively from the phase's own operands
+      // and cloned in the original program order, so an operand is always
+      // cloned before its use.
+      {
+        SmallVector<Operation *> needed;
+        SmallVector<Operation *> work;
+        DenseSet<Operation *> seen;
+        for (unsigned idx : phase)
+          for (Value operand : ops[idx]->getOperands())
+            if (Operation *def = operand.getDefiningOp()) work.push_back(def);
+        while (!work.empty()) {
+          Operation *op = work.pop_back_val();
+          if (!seen.insert(op).second) continue;
+          if (!rematSet.count(op)) continue;
+          needed.push_back(op);
+          for (Value operand : op->getOperands())
+            if (Operation *def = operand.getDefiningOp()) work.push_back(def);
+        }
+        std::sort(needed.begin(), needed.end(), [&](Operation *a, Operation *b) {
+          return opIndex.lookup(a) < opIndex.lookup(b);
+        });
+        for (Operation *op : needed) {
+          Operation *cloned = bodyBuilder.clone(*op, mapper);
+          mapper.map(op->getResults(), cloned->getResults());
+        }
       }
       for (unsigned idx : phase) {
         Operation *op = ops[idx];
