@@ -46,7 +46,7 @@ execute_process(
           --convert-scf-to-cf --convert-cf-to-llvm
           --convert-arith-to-llvm --convert-index-to-llvm
           --expand-strided-metadata --finalize-memref-to-llvm
-          --convert-vector-to-llvm --convert-func-to-llvm
+          --convert-math-to-llvm --convert-vector-to-llvm --convert-func-to-llvm
           --reconcile-unrealized-casts
           "${lowered_mlir}" -o "${WORK_DIR}/tmp.ll"
   RESULT_VARIABLE rc OUTPUT_VARIABLE o ERROR_VARIABLE e)

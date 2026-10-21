@@ -17,6 +17,9 @@ if(zstd_FOUND AND NOT TARGET zstd::libzstd_static)
   message(STATUS "rouge MLIR contour: zstd::libzstd_static -> shared zstd")
 endif()
 
+# Python нужен дифференциальному фазеру MLIR-контура.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
 find_package(MLIR CONFIG QUIET)
 
 if(NOT MLIR_FOUND)
@@ -48,6 +51,24 @@ if(NOT LLVM_ENABLE_RTTI)
   target_compile_options(rouge-mlir-dialect PUBLIC -fno-rtti)
 endif()
 
+# ---- the PTX front-end of the dialect -------------------------------------
+add_library(rouge-mlir-frontend STATIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Frontend/PtxToRouge.cpp)
+target_include_directories(rouge-mlir-frontend PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${MLIR_INCLUDE_DIRS}
+  ${LLVM_INCLUDE_DIRS})
+target_link_libraries(rouge-mlir-frontend PUBLIC
+  rouge-mlir-dialect
+  rouge-ptx
+  MLIRIR
+  MLIRArithDialect
+  MLIRFuncDialect
+  MLIRMemRefDialect
+  MLIRMathDialect
+  MLIRSCFDialect
+  MLIRSupport)
+
 add_library(rouge-mlir-passes STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtAccessReport.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtToScf.cpp
@@ -72,6 +93,14 @@ target_compile_options(rouge-mlir-passes PRIVATE ${LLVM_COMPILE_OPTIONS})
 if(NOT LLVM_ENABLE_RTTI)
   target_compile_options(rouge-mlir-passes PUBLIC -fno-rtti)
 endif()
+
+# ---- rouge-ptx2mlir: the PTX front-end as a tool --------------------------
+add_executable(rouge-ptx2mlir
+  ${CMAKE_CURRENT_SOURCE_DIR}/tools/rouge-ptx2mlir/rouge-ptx2mlir.cpp)
+target_link_libraries(rouge-ptx2mlir PRIVATE
+  rouge-mlir-frontend
+  MLIRIR
+  MLIRSupport)
 
 # ---- rouge-opt driver --------------------------------------------------
 add_executable(rouge-opt ${CMAKE_CURRENT_SOURCE_DIR}/tools/rouge-opt/rouge-opt.cpp)
@@ -201,6 +230,38 @@ if(MLIR_VERSION_MAJOR GREATER_EQUAL 23)
             ${CMAKE_CURRENT_SOURCE_DIR}/test/simt_access_report_atomic.mlir)
   set_tests_properties(mlir_simt_access_report_atomic PROPERTIES
     PASS_REGULAR_EXPRESSION "atomics=1")
+endif()
+
+# ---- дифференциальный фазер MLIR-контура --------------------------------
+#
+# Тот же PTX-ядро идёт двумя независимыми путями: наш текстовый интерпретатор
+# (эталон семантики) и наш MLIR-контур (фронтенд -> диалект rouge -> петли ->
+# LLVM IR -> бинарник -> исполнение на CPU). Результаты обязаны совпасть
+# ПОЭЛЕМЕНТНО.
+#
+# Операции ограничены теми, что фронтенд понимает: prmt/bfi/bfe он пока не
+# переводит и ОТКАЗЫВАЕТ громко (отказ — это тоже результат, но в этом цикле
+# он считается провалом: цикл проверяет известное подмножество).
+if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND
+   Python3_Interpreter_FOUND)
+  enable_language(C)
+  add_library(mlir_print_i32 STATIC test/print_i32.c)
+  add_test(NAME compiler_mlir_fuzz
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/run_fuzz_mlir.py
+            --ptx2mlir $<TARGET_FILE:rouge-ptx2mlir>
+            --rouge-opt $<TARGET_FILE:rouge-opt>
+            --gen $<TARGET_FILE:fuzz_gen_kernel>
+            --interp $<TARGET_FILE:fuzz_run_interp>
+            --mlir-opt ${MLIR_OPT_EXE}
+            --mlir-translate ${MLIR_TRANSLATE_EXE}
+            --clang ${CLANG_EXECUTABLE}
+            --runtime $<TARGET_FILE:mlir_print_i32>
+            --ops "add,sub,mul,shl,shru,shrs,and,or,xor,not,mins,maxs,popc,clz,setp,div,rem,dp4as,dp4au"
+            --iters 8
+            --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir
+            --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
+  set_tests_properties(compiler_mlir_fuzz PROPERTIES TIMEOUT 900)
 endif()
 
 # ---- наш собственный диалект (rouge) -------------------------------------

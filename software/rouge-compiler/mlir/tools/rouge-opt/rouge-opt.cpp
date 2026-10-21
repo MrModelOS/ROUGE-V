@@ -14,6 +14,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -27,7 +28,7 @@ int main(int argc, char **argv) {
   registry.insert<mlir::gpu::GPUDialect, mlir::memref::MemRefDialect,
                   mlir::arith::ArithDialect, mlir::vector::VectorDialect,
                   mlir::func::FuncDialect, mlir::scf::SCFDialect,
-                  rouge::RougeDialect>();
+                  mlir::math::MathDialect, rouge::RougeDialect>();
 
   // Имя регистрации — как в Passes.h (раньше драйвер звал несуществующее
   // registerRougeTransformsPasses; это всплыло только при первой реальной

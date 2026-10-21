@@ -67,7 +67,7 @@ function(rouge_to_llvm in_mlir out_ll)
             --convert-scf-to-cf --convert-cf-to-llvm
             --convert-arith-to-llvm --convert-index-to-llvm
             --expand-strided-metadata --finalize-memref-to-llvm
-            --convert-vector-to-llvm --convert-func-to-llvm
+            --convert-math-to-llvm --convert-vector-to-llvm --convert-func-to-llvm
             --reconcile-unrealized-casts
             "${in_mlir}" -o "${WORK_DIR}/tmp.ll"
     RESULT_VARIABLE rc OUTPUT_VARIABLE o ERROR_VARIABLE e)

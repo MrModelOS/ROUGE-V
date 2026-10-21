@@ -350,6 +350,10 @@ struct SimtLoweringBase {
     SmallVector<Operation *> invariantOps, dependentOps;
     for (Operation *op : ops) {
       if (isa<BarrierOp>(op)) continue;
+      // The identity and the sizes are not cloned: they are mapped to the
+      // induction variable, the block argument and the bounds of the loops
+      // (see below).
+      if (isa<ThreadIdOp, BlockIdOp, BlockDimOp, GridDimOp>(op)) continue;
       if (dependsOnThread(op, 0))
         dependentOps.push_back(op);
       else
@@ -402,9 +406,45 @@ struct SimtLoweringBase {
             clone->getResult(cast<OpResult>(threadCount).getResultNumber());
       }
     }
+    // The identity ops (the thread id, the block id) are not tied to a
+    // phase: they are values of the whole kernel, and a LATER phase may use
+    // the thread id that an earlier phase defined. So their mapping is set up
+    // in EVERY phase — otherwise the clone of a later phase would refer to
+    // the op in the old kernel, which is erased at the end (a dangling
+    // reference, and a crash much later).
+    SmallVector<Operation *> threadIdOps, blockIdOps, blockDimOps, gridDimOps;
+    for (Operation *op : ops) {
+      if (isa<ThreadIdOp>(op))
+        threadIdOps.push_back(op);
+      else if (isa<BlockIdOp>(op))
+        blockIdOps.push_back(op);
+      else if (isa<BlockDimOp>(op))
+        blockDimOps.push_back(op);
+      else if (isa<GridDimOp>(op))
+        gridDimOps.push_back(op);
+    }
+
     Value threadBound = castToIndex(builder, loc, threadCount);
     Value c0 = arith::ConstantIndexOp::create(builder, 0);
     Value c1 = arith::ConstantIndexOp::create(builder, 1);
+
+    // The grid size: the kernel may ask for it (rouge.grid_dim). It lives in
+    // the host function (it is an operand of the launch), so it has to be
+    // cloned in — exactly like the block size.
+    Value gridBoundInKernel;
+    if (!gridDimOps.empty()) {
+      if (!launch)
+        return failure();
+      Value gridSize = launch.getGridSizeX();
+      if (gridSize && !isa<BlockArgument>(gridSize)) {
+        if (Operation *def = gridSize.getDefiningOp()) {
+          Operation *clone = builder.clone(*def);
+          gridSize =
+              clone->getResult(cast<OpResult>(gridSize).getResultNumber());
+        }
+      }
+      gridBoundInKernel = castToIndex(builder, loc, gridSize);
+    }
 
     // Hoisted invariants: cloned into the function's entry block, in order.
     // The clone goes through an IRMapping, so an invariant op that uses the
@@ -412,25 +452,21 @@ struct SimtLoweringBase {
     // computation) refers to the CLONE, and the mapping also covers the
     // contents of nested regions.
     IRMapping invMapper;
+    // The block id and the sizes are mapped here as well: an invariant that
+    // uses the block id (the global index, for example) must refer to the
+    // argument of the new function, not to the op of the old kernel — that
+    // one is erased at the end (a dangling reference).
+    for (Operation *op : blockIdOps)
+      if (blockIdArg) invMapper.map(op->getResult(0), blockIdArg);
+    for (Operation *op : blockDimOps)
+      invMapper.map(op->getResult(0), threadBound);
+    for (Operation *op : gridDimOps)
+      invMapper.map(op->getResult(0), gridBoundInKernel);
     DenseMap<Operation *, Operation *> invariantClone;
     for (Operation *op : invariantOps) {
       Operation *clone = builder.clone(*op, invMapper);
       invMapper.map(op->getResults(), clone->getResults());
       invariantClone[op] = clone;
-    }
-
-    // The identity ops (the thread id, the block id) are not tied to a
-    // phase: they are values of the whole kernel, and a LATER phase may use
-    // the thread id that an earlier phase defined. So their mapping is set up
-    // in EVERY phase — otherwise the clone of a later phase would refer to
-    // the op in the old kernel, which is erased at the end (a dangling
-    // reference, and a crash much later).
-    SmallVector<Operation *> threadIdOps, blockIdOps;
-    for (Operation *op : ops) {
-      if (isa<ThreadIdOp>(op))
-        threadIdOps.push_back(op);
-      else if (isa<BlockIdOp>(op))
-        blockIdOps.push_back(op);
     }
 
     // A value defined in one phase and used in another: the phases are
@@ -540,6 +576,25 @@ struct SimtLoweringBase {
         }
         if (blockIdArg) mapper.map(bid.getResult(), blockIdArg);
       }
+      // The sizes: the bounds of the loops.
+      for (Operation *op : blockDimOps) {
+        auto dim = cast<BlockDimOp>(op);
+        if (!isX(dim.getDimension())) {
+          dim.emitError("only the x dimension of the block size is supported");
+          phaseFailed = true;
+          return failure();
+        }
+        mapper.map(dim.getResult(), threadBound);
+      }
+      for (Operation *op : gridDimOps) {
+        auto dim = cast<GridDimOp>(op);
+        if (!isX(dim.getDimension())) {
+          dim.emitError("only the x dimension of the grid size is supported");
+          phaseFailed = true;
+          return failure();
+        }
+        mapper.map(dim.getResult(), gridBoundInKernel);
+      }
       // The invariants are visible from the loop body.
       for (Operation *op : invariantOps) {
         Operation *clone = invariantClone[op];
@@ -548,11 +603,11 @@ struct SimtLoweringBase {
       }
       for (unsigned idx : phase) {
         Operation *op = ops[idx];
-        // The thread id and the block id have no counterpart in the lowered
-        // form: they ARE the induction variable and the block argument, so
-        // they are not cloned at all (cloning them would also overwrite the
-        // mapping to the induction variable).
-        if (isa<ThreadIdOp, BlockIdOp>(op)) continue;
+        // The thread id, the block id and the sizes have no counterpart in
+        // the lowered form: they ARE the induction variable, the block
+        // argument and the bounds of the loops, so they are not cloned at
+        // all (cloning them would also overwrite the mapping).
+        if (isa<ThreadIdOp, BlockIdOp, BlockDimOp, GridDimOp>(op)) continue;
         Operation *cloned = bodyBuilder.clone(*op, mapper);
         mapper.map(op->getResults(), cloned->getResults());
       }
