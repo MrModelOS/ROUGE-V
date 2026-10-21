@@ -313,6 +313,29 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE)
       -P ${CMAKE_CURRENT_SOURCE_DIR}/rouge_semantics.cmake)
 endif()
 
+# Модель расхождений: ветвление внутри тела потока становится МАСКОЙ
+# (vector<Nxi1>), а обращения — маскируемыми. Сериализации ветки больше нет.
+add_test(NAME mlir_divergence_mask
+  COMMAND rouge-opt --rouge-unit-stride-to-vector
+          ${CMAKE_CURRENT_SOURCE_DIR}/test/divergence_mask.mlir)
+set_tests_properties(mlir_divergence_mask PROPERTIES
+  PASS_REGULAR_EXPRESSION "vector.maskedstore")
+
+# СЕМАНТИЧЕСКАЯ проверка модели расхождений: скалярная и векторная сборки
+# обязаны посчитать одно и то же (первая половина скопирована, вторая — нет).
+if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE)
+  add_test(NAME mlir_divergence_mask_semantics
+    COMMAND ${CMAKE_COMMAND}
+      -DROUGE_OPT=$<TARGET_FILE:rouge-opt>
+      -DMLIR_OPT=${MLIR_OPT_EXE}
+      -DMLIR_TRANSLATE=${MLIR_TRANSLATE_EXE}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/test/divergence_mask.mlir
+      -DRUNTIME_C=$<TARGET_FILE:mlir_print_f32>
+      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/divergence-mask
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/vector_semantics.cmake)
+endif()
+
 # Полная цепочка на НАШЕМ диалекте: rouge -> SCF -> Vector -> LLVM IR ->
 # ассемблер RISC-V (настоящие vle32.v) -> исполнение под qemu-riscv64.
 # Скалярная и векторная сборки обязаны посчитать одно и то же.
