@@ -52,7 +52,7 @@ def main():
     ap.add_argument("--cases", default="cases")
     ap.add_argument("--sm", default="sm_75")
     ap.add_argument("--template", default="chain",
-                    choices=["chain", "phases", "demoted", "atomic"],
+                    choices=["chain", "phases", "demoted", "atomic", "loop"],
                     help="the kernel shape (the generator's --template mode)")
     args = ap.parse_args()
 

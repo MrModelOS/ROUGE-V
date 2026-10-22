@@ -302,19 +302,6 @@ struct SimtLoweringBase {
       return failure();
     }
 
-    // A kernel that already contains a loop (scf.while) cannot be phase-
-    // decomposed by this pass: the phase split assumes a flat instruction
-    // stream, and the remapping of the SIMT ops inside the loop's nested
-    // region is not implemented. Refuse gracefully instead of crashing.
-    bool hasNested = false;
-    kernel.getBody().walk([&](scf::WhileOp) { hasNested = true; });
-    if (hasNested) {
-      kernel.emitError("a kernel containing a loop (scf.while) is not "
-                       "supported by this pass yet — the SIMT-to-SCF phase "
-                       "decomposition assumes a flat instruction stream");
-      return failure();
-    }
-
     Location loc = kernel.getLoc();
     OpBuilder typeBuilder(kernel.getContext());
 
@@ -384,6 +371,13 @@ struct SimtLoweringBase {
         if (isa<ThreadIdOp>(def)) return true;
         if (dependsOnThread(def, depth + 1)) return true;
       }
+      // The NESTED regions: a loop or a divergent branch uses the values of
+      // its body, so an op that owns a region depends on the thread id if
+      // anything inside the region does.
+      for (Region &region : op->getRegions())
+        for (Block &block : region)
+          for (Operation &inner : block)
+            if (dependsOnThread(&inner, depth + 1)) return true;
       return false;
     };
 
@@ -569,27 +563,33 @@ struct SimtLoweringBase {
         for (unsigned idx : phases[p]) {
           Operation *op = ops[idx];
           if (isa<ThreadIdOp, BlockIdOp>(op)) continue;
-          for (Value operand : op->getOperands()) {
-            Operation *def = operand.getDefiningOp();
-            if (!def) continue;
-            if (isa<ThreadIdOp, BlockIdOp>(def)) continue;
-            // A pure function of the thread id is recomputed in every phase
-            // that needs it (see rematSet above).
-            if (rematSet.count(def)) continue;
-            // The invariants are hoisted out of the loops, so they dominate
-            // every phase and are not a cross-phase dependency.
-            if (std::find(invariantOps.begin(), invariantOps.end(), def) !=
-                invariantOps.end())
-              continue;
-            auto it = phaseOf.find(def);
-            if (it == phaseOf.end() || it->second == p) continue;
-            op->emitError(
-                "a value defined in one phase is used in another phase — the "
-                "phases are separate loops, so the value does not survive "
-                "between them; carry it through the loop (iter_args) or "
-                "refuse the kernel");
-            return failure();
-          }
+          // The operands of the op AND of everything inside its regions: a
+          // value used inside a nested region crosses the phase boundary
+          // just as much as one used by the op itself.
+          SmallVector<Operation *> inner;
+          op->walk([&](Operation *innerOp) { inner.push_back(innerOp); });
+          for (Operation *innerOp : inner)
+            for (Value operand : innerOp->getOperands()) {
+              Operation *def = operand.getDefiningOp();
+              if (!def) continue;
+              if (isa<ThreadIdOp, BlockIdOp>(def)) continue;
+              // A pure function of the thread id is recomputed in every phase
+              // that needs it (see rematSet above).
+              if (rematSet.count(def)) continue;
+              // The invariants are hoisted out of the loops, so they dominate
+              // every phase and are not a cross-phase dependency.
+              if (std::find(invariantOps.begin(), invariantOps.end(), def) !=
+                  invariantOps.end())
+                continue;
+              auto it = phaseOf.find(def);
+              if (it == phaseOf.end() || it->second == p) continue;
+              op->emitError(
+                  "a value defined in one phase is used in another phase — the "
+                  "phases are separate loops, so the value does not survive "
+                  "between them; carry it through the loop (iter_args) or "
+                  "refuse the kernel");
+              return failure();
+            }
         }
       }
     }
@@ -702,9 +702,17 @@ struct SimtLoweringBase {
         SmallVector<Operation *> needed;
         SmallVector<Operation *> work;
         DenseSet<Operation *> seen;
-        for (unsigned idx : phase)
-          for (Value operand : ops[idx]->getOperands())
-            if (Operation *def = operand.getDefiningOp()) work.push_back(def);
+        for (unsigned idx : phase) {
+          // The operands of the op AND of everything inside its regions: a
+          // nested region (a loop, a divergent branch) uses the values of
+          // the body, and those values must be remapped too — otherwise the
+          // clone would refer to the old kernel, which is erased at the end.
+          SmallVector<Operation *> inner;
+          ops[idx]->walk([&](Operation *op) { inner.push_back(op); });
+          for (Operation *innerOp : inner)
+            for (Value operand : innerOp->getOperands())
+              if (Operation *def = operand.getDefiningOp()) work.push_back(def);
+        }
         while (!work.empty()) {
           Operation *op = work.pop_back_val();
           if (!seen.insert(op).second) continue;

@@ -193,7 +193,7 @@ def main():
                     help="the compiled print_i32 runtime")
     ap.add_argument("--iters", type=int, default=16)
     ap.add_argument("--template", default="chain",
-                    choices=["chain", "phases", "demoted", "atomic"],
+                    choices=["chain", "phases", "demoted", "atomic", "loop"],
                     help="the kernel shape: 'chain' — the per-thread "
                          "arithmetic chain; 'phases' — shared memory + a "
                          "barrier between two phases")

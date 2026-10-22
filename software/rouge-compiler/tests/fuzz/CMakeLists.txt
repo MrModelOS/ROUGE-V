@@ -70,6 +70,24 @@ if(Python3_Interpreter_FOUND AND CLANG_EXECUTABLE)
             --cases ${CMAKE_CURRENT_SOURCE_DIR}/cases)
   set_tests_properties(compiler_ptx_fuzz_atomic PROPERTIES TIMEOUT 900)
 
+  # Шаблон "loop": счётный цикл. Проверяет AOT-путь на цикле (интерпретатор
+  # — эталон).
+  add_test(NAME compiler_ptx_fuzz_loop
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/run_fuzz.py
+            --ptx2ir $<TARGET_FILE:ptx2ir>
+            --clang ${CLANG_EXECUTABLE}
+            --gen $<TARGET_FILE:fuzz_gen_kernel>
+            --interp $<TARGET_FILE:fuzz_run_interp>
+            --host-runner ${CMAKE_CURRENT_SOURCE_DIR}/run_host.cpp
+            --runtime-lib $<TARGET_FILE:rouge-runtime>
+            --mode host
+            --template loop
+            --iters 8
+            --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-loop
+            --cases ${CMAKE_CURRENT_SOURCE_DIR}/cases)
+  set_tests_properties(compiler_ptx_fuzz_loop PROPERTIES TIMEOUT 900)
+
   if(TARGET fuzz_run_gpu)
     add_test(NAME compiler_ptx_fuzz_gpu
       COMMAND ${Python3_EXECUTABLE}
