@@ -389,30 +389,48 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND
             --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
   set_tests_properties(compiler_mlir_fuzz_dowhile PROPERTIES TIMEOUT 900)
 
-  # ---- фиксированное ядро: граница clamp у сдвигов -----------------------
+  # ---- фиксированные ядра: контур диалекта и AOT на одном раннере --------
   #
-  # Фазер берёт случайные сдвиги; здесь закреплены сами границы (32/33 для
-  # .b32, 17 для .b16, 65 для .b64). Ожидаемые значения в раннере выведены
-  # из текста ISA, а не из наших реализаций. Тот же селектор исполняет и
-  # AOT-ячейка compiler_nvptx_gpu_exec — если пути разойдутся, упадут оба.
-  add_test(NAME mlir_rouge_nvptx_shift_clamp
-    COMMAND ${CMAKE_COMMAND}
-      -DROUGE_COMPILE=${CMAKE_CURRENT_SOURCE_DIR}/tools/rouge-compile/rouge-compile
-      -DROUGE_OPT=$<TARGET_FILE:rouge-opt>
-      -DPTX2MLIR=$<TARGET_FILE:rouge-ptx2mlir>
-      -DMLIR_OPT=${MLIR_OPT_EXE}
-      -DMLIR_TRANSLATE=${MLIR_TRANSLATE_EXE}
-      -DCLANG=${CLANG_EXECUTABLE}
-      -DRUNNER=$<TARGET_FILE:gpu_exec_rungpu>
-      -DKERNEL=${CMAKE_CURRENT_SOURCE_DIR}/../tests/kernels/shift_clamp.ptx
-      -DSELECTOR=shift_clamp
-      -DBLOCK=64
-      -DSHAPES=0=64xi32,1=64xi32
-      -DSM=${ROUGE_NVPTX_SM}
-      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/nvptx-exec
-      -P ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mlir_gpu_exec.cmake)
-  set_tests_properties(mlir_rouge_nvptx_shift_clamp PROPERTIES
-    SKIP_REGULAR_EXPRESSION "no usable NVIDIA GPU")
+  # Ожидаемые значения считает САМ РАННЕР (по тексту ISA и по определению
+  # операции), а не наши реализации. Тот же селектор исполняет и AOT-ячейка
+  # compiler_nvptx_gpu_exec: если пути разойдутся, упадут обе ячейки.
+  #
+  #   shift_clamp  границы clamp у сдвигов (32/33 для .b32, 17 для .b16,
+  #                65 для .b64): добыто картой, см. README;
+  #   vadd         первое НАСТОЯЩЕЕ nvcc-ядро (float-арифметика, range guard,
+  #                block/grid id) — им фронтенд и проверяется;
+  #   cmp_signed   setp.lt/ge с .s32 против .u32 плюс selp.
+  function(rouge_nvptx_cell name kernel selector block shapes workdir)
+    add_test(NAME ${name}
+      COMMAND ${CMAKE_COMMAND}
+        -DROUGE_COMPILE=${CMAKE_CURRENT_SOURCE_DIR}/tools/rouge-compile/rouge-compile
+        -DROUGE_OPT=$<TARGET_FILE:rouge-opt>
+        -DPTX2MLIR=$<TARGET_FILE:rouge-ptx2mlir>
+        -DMLIR_OPT=${MLIR_OPT_EXE}
+        -DMLIR_TRANSLATE=${MLIR_TRANSLATE_EXE}
+        -DCLANG=${CLANG_EXECUTABLE}
+        -DRUNNER=$<TARGET_FILE:gpu_exec_rungpu>
+        -DKERNEL=${CMAKE_CURRENT_SOURCE_DIR}/../tests/kernels/${kernel}
+        -DSELECTOR=${selector}
+        -DBLOCK=${block}
+        -DSHAPES=${shapes}
+        -DSM=${ROUGE_NVPTX_SM}
+        -DWORK_DIR=${workdir}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mlir_gpu_exec.cmake)
+    set_tests_properties(${name} PROPERTIES
+      SKIP_REGULAR_EXPRESSION "no usable NVIDIA GPU")
+  endfunction()
+
+  rouge_nvptx_cell(mlir_rouge_nvptx_shift_clamp shift_clamp.ptx shift_clamp
+                   64 "0=64xi32,1=64xi32"
+                   ${CMAKE_CURRENT_BINARY_DIR}/nvptx-exec-shift)
+  # vadd: N=1024, blockDim=256, gridDim=4 (столько же, сколько в раннере).
+  rouge_nvptx_cell(mlir_rouge_nvptx_vadd vadd.ptx vadd
+                   256 "0=1024xf32,1=1024xf32,2=1024xf32"
+                   ${CMAKE_CURRENT_BINARY_DIR}/nvptx-exec-vadd)
+  rouge_nvptx_cell(mlir_rouge_nvptx_cmp_signed cmp_signed.ptx cmp_signed
+                   64 "0=256xi32,1=64xi32"
+                   ${CMAKE_CURRENT_BINARY_DIR}/nvptx-exec-cmp)
 
   # ---- тот же фазер, но ТРЕТЬИМ путём: на карте ---------------------------
   #
