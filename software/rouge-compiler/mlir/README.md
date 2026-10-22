@@ -416,6 +416,9 @@ PTX --rouge-ptx2mlir--> rouge --rouge-to-scf--> петли
     --mlir-opt-->                   стандартные конверсии в LLVM dialect
     --mlir-translate-->             LLVM IR
     --llc-->                        машина
+
+В сторону NVPTX:
+PTX --rouge-ptx2mlir--> rouge --rouge-to-gpu--> gpu --> (gpu-to-nvvm) --> NVPTX
 ```
 
 Цели: `cpu` (`x86_64-unknown-linux-gnu`) и `rvv`
