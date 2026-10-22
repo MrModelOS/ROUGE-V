@@ -442,14 +442,34 @@ PTX --rouge-ptx2mlir--> rouge --rouge-to-scf--> петли
     --mlir-translate-->             LLVM IR
     --llc-->                        машина
 
-В сторону NVPTX:
-PTX --rouge-ptx2mlir--> rouge --rouge-to-gpu--> gpu --> (gpu-to-nvvm) --> NVPTX
+В сторону NVPTX (та же команда, `--target nvptx`):
+PTX --rouge-ptx2mlir--> rouge --rouge-to-gpu--> gpu
+    --convert-gpu-to-nvvm--> LLVM dialect + NVVM (thread id, barrier)
+    --rouge-extract-kernels--> только device-часть (.ptx без хоста)
+    --mlir-translate--> LLVM IR --clang (NVPTX)--> .ptx
 ```
 
-Цели: `cpu` (`x86_64-unknown-linux-gnu`) и `rvv`
-(`riscv64-unknown-linux-gnu -mattr=+v,+m,+a,+f,+d,+c`). Флаги: `--grid`,
+Цели: `cpu` (`x86_64-unknown-linux-gnu`), `rvv`
+(`riscv64-unknown-linux-gnu -mattr=+v,+m,+a,+f,+d,+c`) и `nvptx`
+(`--sm sm_75|sm_80|...`, по умолчанию `sm_80`). Флаги: `--grid`,
 `--block`, `--shape I=<n>x<тип>`, `--emit-llvm` (остановиться на LLVM IR),
-`--keep-mlir` (сохранить промежуточные файлы), `--target`.
+`--keep-mlir` (сохранить промежуточные файлы), `--target`, `--sm`.
+
+**PTX ABI в NVPTX-цели.** Конверсия `gpu -> LLVM` идёт с
+`use-bare-ptr-memref-call-conv`: memref-аргументы ядра становятся обычными
+указателями (`.param .u64 .ptr .global`), а не 40-байтными дескрипторами
+memref. Поэтому один и тот же раннер (`gpu_exec_rungpu`, `fuzz_run_gpu`)
+грузит и .ptx от `ptx2ir`, и .ptx от контура. Обратная сторона: у
+bare-pointer ABI нет места для размеров, поэтому **memref обязан иметь
+статическую форму** — отсюда `--shape` у `--target nvptx`.
+
+**Общая память в NVPTX-цели.** `memref.alloc` в адресном пространстве 3
+опускается не в `malloc` (устройство его не вызывает — это была первая
+ошибка при запуске фазера на карте), а в `memref.global` в том же
+пространстве внутри `gpu.module`: LLVM-lowering делает из него
+`llvm.mlir.global addrspace(3)`, NVPTX-бэкенд — статический `.shared`
+массив на блок. Динамическая общая память (workgroup attribution) не
+подходит: раннер запускает ядро с нулевым dynamic shared memory.
 
 Замер на `test/vector_copy.ptx` (ядро копирования, индекс = thread id):
 
@@ -472,20 +492,27 @@ memref, но не может проверить указатель, которы
 `memref.alloc` внутри MLIR это выполняется, для внешнего указателя — это
 контракт вызывающего.
 
-**NVPTX-цель отложена честно.** Для неё нужен обратный lowering: диалект
-`rouge` (поток — это итерация цикла) -> `gpu` (поток — это аппаратная
-полоса). Пока его нет, GPU-путь остаётся AOT-шным (`ptx2ir`), и
-`rouge-compile` не притворяется, что умеет NVPTX.
+**Что дала NVPTX-цель.** Третий путь исполнения сразу нашёл расхождение,
+которого не видели два согласных: `shl`/`shr` при смещении больше ширины
+регистра. PTX ISA 9.7.9.8/9.7.9.9 говорит «shift amounts greater than the
+register width N are clamped to N», а интерпретатор и AOT-эмиттер оба брали
+смещение по модулю N — и совпадали друг с другом на неверном ответе
+(`shl.b32 1, 33` давало 2 вместо 0). Теперь clamp реализован во всех трёх
+путях, а границы закреплены ядром `tests/kernels/shift_clamp.ptx`: оно
+исполняется и AOT-ячейкой (`compiler_nvptx_gpu_exec`), и контуром
+(`mlir_rouge_nvptx_shift_clamp`), ожидаемые значения выведены из текста ISA.
 
 Чего ещё нет (следующие итерации, по порядку):
 
-1. **Циклы во фронтенде**: CFG с обратными рёбрами -> `scf.while`/`scf.for`
-   с переносом значений через границу итерации. Без этого настоящие ядра
-   nvcc не проходят.
-2. Общая память во фронтенде: 32-битные адреса общей памяти — своя
-   арифметика, свои правила.
-3. `prmt`/`bfi`/`bfe`, атомики.
-4. NVPTX-цель: обратный lowering `rouge` -> `gpu`.
+1. **Структура CFG**: ветки внутри тела цикла (`@%p bra` к точке слияния
+   внутри цикла) и значения, определённые в охраняемом блоке и
+   используемые после него (`scf.if` с результатами). Без этого настоящие
+   ядра nvcc (`int8_gemm`) не проходят — нужен структурайзер, а не заплатка.
+2. **Warp-операции и тензорные ядра** (`shfl`, `vote`, `mma`, `ldmatrix`):
+   фронтенд их пока не понимает и отказывает громко.
+3. Атомики `atom.cas` (нужен `cmpxchg`) и `red` с плавающей точкой в
+   NVPTX-цели: в диалекте они уже есть, но на карте через контур ещё не
+   проверялись.
 
 ## Сборка
 

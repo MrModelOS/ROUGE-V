@@ -55,6 +55,13 @@ void registerRougeToScfPass();
 std::unique_ptr<mlir::Pass> createRougeToGpuPass();
 void registerRougeToGpuPass();
 
+// !rouge-extract-kernels — after the gpu -> LLVM lowering this flattens the
+// gpu.modules into the top-level module and drops the host side, leaving a
+// device-only LLVM-dialect module: the input of mlir-translate + llc for the
+// NVPTX target.
+std::unique_ptr<mlir::Pass> createRougeExtractKernelsPass();
+void registerRougeExtractKernelsPass();
+
 
 }  // namespace rouge
 

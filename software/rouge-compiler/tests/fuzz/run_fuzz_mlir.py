@@ -19,10 +19,18 @@ PTX text.
 This is the CI component that catches the "silent" bugs — the ones that
 compile without errors and compute the wrong thing.
 
+With --mode gpu the same kernel goes through a THIRD path instead of the
+CPU binary: the rouge dialect -> the gpu dialect -> LLVM/NVVM -> PTX (via
+rouge-compile --target nvptx), and the .ptx runs on the real NVIDIA card.
+The comparison stays the same — element-wise against the interpreter — so
+the card is checked against the reference, not against our own lowering.
+
 usage: run_fuzz_mlir.py --ptx2mlir <exe> --rouge-opt <exe> --gen <exe>
                         --interp <exe> --mlir-opt <exe> --mlir-translate <exe>
                         --clang <exe> [--runtime <print_i32.o>] [--iters N]
                         [--work DIR] [--cases DIR]
+                        [--mode cpu|gpu --gpu <runner> --rouge-compile <path>
+                         --sm sm_75]
 """
 
 import argparse
@@ -154,6 +162,55 @@ def check_case(args, kern, in_bin, work):
     return True, ""
 
 
+def check_case_gpu(args, kern, in_bin, work):
+    """One kernel: the interpreter vs the MLIR->PTX contour on the card.
+
+    No harness main here: the PTX is the whole program. The shapes are the
+    fuzzer's (out = N*K_OUT, in = N), and they are REQUIRED — the bare-pointer
+    ABI the GPU contour uses needs a static memref shape.
+    """
+    ref_bin = os.path.join(work, "ref.bin")
+    got_bin = os.path.join(work, "got.bin")
+    ptx = os.path.join(work, "kernel_mlir.ptx")
+    if os.path.exists(got_bin):
+        os.remove(got_bin)
+
+    r = run([args.interp, kern, in_bin, ref_bin, str(N)])
+    if r.returncode != 0:
+        return False, "the interpreter failed: %s" % r.stderr.strip()
+    ref = open(ref_bin, "rb").read()
+
+    r = run([args.rouge_compile, kern, "--target", "nvptx",
+             "--sm", args.sm, "--block", str(N),
+             "--shape", "0=%dxi32" % OUT, "--shape", "1=%dxi32" % N,
+             "-o", ptx,
+             "--rouge-opt", args.rouge_opt, "--ptx2mlir", args.ptx2mlir,
+             "--mlir-opt", args.mlir_opt,
+             "--mlir-translate", args.mlir_translate,
+             "--clang", args.clang])
+    if r.returncode != 0:
+        return False, "the NVPTX contour failed: %s%s" % (r.stdout.strip(),
+                                                          r.stderr.strip())
+
+    r = run([args.gpu, ptx, in_bin, got_bin, str(N)])
+    if r.returncode != 0:
+        if "NO-DEVICE" in r.stdout or "SKIP-OLD-ARCH" in r.stdout:
+            return None, r.stdout.strip()
+        return False, "the GPU run failed: %s%s" % (r.stdout.strip(),
+                                                    r.stderr.strip())
+    got = open(got_bin, "rb").read()
+    if got == ref:
+        return True, ""
+    got_values = list(struct.unpack("<%di" % (len(got) // 4), got))
+    ref_values = list(struct.unpack("<%di" % (len(ref) // 4), ref))
+    for i in range(min(len(ref_values), len(got_values))):
+        if ref_values[i] != got_values[i]:
+            return False, ("first differing element at %d: ref=%d got=%d"
+                           % (i, ref_values[i], got_values[i]))
+    return False, ("the lengths differ: ref=%d got=%d"
+                   % (len(ref_values), len(got_values)))
+
+
 def replay(args):
     """Re-run every saved case. They must all still pass."""
     if not os.path.isdir(args.replay):
@@ -189,8 +246,18 @@ def main():
     ap.add_argument("--mlir-opt", required=True)
     ap.add_argument("--mlir-translate", required=True)
     ap.add_argument("--clang", required=True)
-    ap.add_argument("--runtime", required=True,
-                    help="the compiled print_i32 runtime")
+    ap.add_argument("--runtime", default="",
+                    help="the compiled print_i32 runtime (cpu mode)")
+    ap.add_argument("--mode", default="cpu", choices=["cpu", "gpu"],
+                    help="cpu: the lowered module runs on this host; "
+                         "gpu: the rouge dialect compiles to PTX and runs on "
+                         "the NVIDIA card")
+    ap.add_argument("--gpu", default="",
+                    help="the GPU runner (fuzz_run_gpu) for --mode gpu")
+    ap.add_argument("--rouge-compile", default="",
+                    help="the backend driver for --mode gpu")
+    ap.add_argument("--sm", default="sm_75",
+                    help="the NVPTX target architecture for --mode gpu")
     ap.add_argument("--iters", type=int, default=16)
     ap.add_argument("--template", default="chain",
                     choices=["chain", "phases", "demoted", "atomic", "loop", "dowhile"],
@@ -236,7 +303,14 @@ def main():
             failures += 1
             continue
 
-        ok, detail = check_case(args, kern, in_bin, args.work)
+        if args.mode == "gpu":
+            ok, detail = check_case_gpu(args, kern, in_bin, args.work)
+            if ok is None:
+                print("no NVIDIA card here — the GPU half of the fuzzer is "
+                      "skipped (%s)" % detail)
+                return 0
+        else:
+            ok, detail = check_case(args, kern, in_bin, args.work)
         if ok:
             if seed % 8 == 0:
                 print("seed %d: ok" % seed)
@@ -246,12 +320,19 @@ def main():
         os.makedirs(case, exist_ok=True)
         shutil.copy(kern, os.path.join(case, "kernel.ptx"))
         shutil.copy(in_bin, os.path.join(case, "in.bin"))
-        shutil.copy(os.path.join(args.work, "kernel_harness.mlir"),
-                    os.path.join(case, "kernel_harness.mlir"))
+        # In gpu mode there is no harness main: the .ptx is the whole
+        # program. Save it, it is what has to be reproduced.
+        extra = ("kernel_mlir.ptx" if args.mode == "gpu"
+                 else "kernel_harness.mlir")
+        if os.path.isfile(os.path.join(args.work, extra)):
+            shutil.copy(os.path.join(args.work, extra),
+                        os.path.join(case, extra))
         print("seed %d: MISMATCH — saved to %s" % (seed, case))
         print("   " + detail)
 
-    print("fuzz (MLIR): %d iterations, %d failures" % (args.iters, failures))
+    print("fuzz (MLIR%s): %d iterations, %d failures"
+          % (", on the card" if args.mode == "gpu" else "", args.iters,
+             failures))
     return 1 if failures else 0
 
 

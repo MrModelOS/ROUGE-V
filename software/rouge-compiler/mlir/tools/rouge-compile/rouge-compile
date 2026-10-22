@@ -18,14 +18,17 @@ The targets:
     cpu     x86-64
     rvv     riscv64 with the vector extension (+v): the point of the whole
             contour — the vectorised kernel becomes real RVV instructions
+    nvptx   NVIDIA PTX: our dialect is lowered BACK into the gpu dialect
+            (--rouge-to-gpu), the standard MLIR conversion takes the gpu
+            dialect to LLVM + NVVM intrinsics, the host half is dropped
+            (--rouge-extract-kernels) and LLVM's NVPTX backend emits the
+            .ptx. The kernel keeps the PTX ABI: memref arguments become bare
+            pointers, so the .ptx is loadable by the same code that loads
+            nvcc's output. The memrefs must have static shape for that.
 
-The NVPTX target is not here yet: it needs our dialect to be lowered BACK
-into the gpu dialect (the reverse of the SIMT lowering), and until that
-exists the honest answer is that the GPU path is still the AOT one (ptx2ir).
-
-usage: rouge-compile <kernel.ptx> --target cpu|rvv [-o out.s]
+usage: rouge-compile <kernel.ptx> --target cpu|rvv|nvptx [-o out.s]
                       [--grid N] [--block N] [--shape I=64xi32]
-                      [--emit-llvm] [--keep-mlir]
+                      [--sm sm_75] [--emit-llvm] [--keep-mlir]
 """
 
 import argparse
@@ -56,11 +59,95 @@ TARGETS = {
     "cpu": ["-mtriple=x86_64-unknown-linux-gnu"],
     "rvv": ["-mtriple=riscv64-unknown-linux-gnu",
             "-mattr=+v,+m,+a,+f,+d,+c"],
+    # nvptx is not llc here: the host LLVM ships without the NVPTX backend,
+    # clang does (it is the same backend, with the NVPTX target enabled).
+    "nvptx": [],
 }
+
+# The MLIR conversions for the NVPTX target. Two differences from the CPU
+# chain:
+#   * --convert-gpu-to-nvvm: the gpu dialect -> LLVM + NVVM intrinsics
+#     (thread ids, barriers). It also accepts memref arguments as bare
+#     pointers, which is what the PTX ABI passes;
+#   * --convert-func-to-llvm with the same option, so the kernel signature
+#     stays i64 pointers instead of memref descriptors.
+NVPTX_CONVERSIONS = [
+    "--convert-gpu-to-nvvm=use-bare-ptr-memref-call-conv=true",
+    "--convert-scf-to-cf",
+    "--convert-cf-to-llvm",
+    "--convert-arith-to-llvm",
+    "--convert-index-to-llvm",
+    "--expand-strided-metadata",
+    "--finalize-memref-to-llvm",
+    "--convert-math-to-llvm",
+    "--convert-func-to-llvm=use-bare-ptr-memref-call-conv=true",
+    "--reconcile-unrealized-casts",
+]
 
 
 def run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def compile_nvptx(args, work, dialect):
+    """The GPU contour: the rouge dialect -> the gpu dialect -> PTX.
+
+    Returns the process exit code.
+    """
+    gpu_mlir = os.path.join(work, "kernel_gpu.mlir")
+    llvm_mlir = os.path.join(work, "kernel_llvm.mlir")
+    device_mlir = os.path.join(work, "kernel_device.mlir")
+    llvm_ir = os.path.join(work, "kernel.ll")
+    ptx = os.path.join(work, "kernel.ptx")
+
+    # 2) The reverse lowering: the SIMT ops -> the gpu dialect, the kernel
+    # into a gpu.module, the launch into gpu.launch_func, the default memref
+    # space into the gpu global space.
+    r = run([args.rouge_opt, "--rouge-to-gpu", "--canonicalize", "--cse",
+             dialect, "-o", gpu_mlir])
+    if r.returncode != 0:
+        print("rouge-compile: --rouge-to-gpu refused the kernel:\n%s"
+              % r.stderr.strip())
+        return 1
+
+    # 3) The gpu dialect -> LLVM + NVVM. Bare pointers keep the PTX ABI.
+    r = run([args.mlir_opt] + NVPTX_CONVERSIONS + [gpu_mlir, "-o", llvm_mlir])
+    if r.returncode != 0:
+        print("rouge-compile: the gpu -> LLVM lowering failed:\n%s"
+              % r.stderr.strip())
+        return 1
+
+    # 4) A .ptx has no host half: keep the device functions only.
+    r = run([args.rouge_opt, "--rouge-extract-kernels", llvm_mlir, "-o",
+             device_mlir])
+    if r.returncode != 0:
+        print("rouge-compile: --rouge-extract-kernels failed:\n%s"
+              % r.stderr.strip())
+        return 1
+
+    r = run([args.mlir_translate, "--mlir-to-llvmir", device_mlir, "-o",
+             llvm_ir])
+    if r.returncode != 0:
+        print("rouge-compile: mlir-translate failed:\n%s" % r.stderr.strip())
+        return 1
+
+    if args.emit_llvm:
+        out = args.output or (os.path.splitext(args.input)[0] + ".ll")
+        shutil.copy(llvm_ir, out)
+        print("rouge-compile: the LLVM IR is in %s" % out)
+        return 0
+
+    # 5) LLVM's NVPTX backend through clang (the host llc has no NVPTX
+    # target compiled in; clang does).
+    r = run([args.clang, "--target=nvptx64-nvidia-cuda", "-march=" + args.sm,
+             "-O2", "-S", "-x", "ir", llvm_ir, "-o", ptx])
+    if r.returncode != 0:
+        print("rouge-compile: the NVPTX backend failed:\n%s" % r.stderr.strip())
+        return 1
+    out = args.output or (os.path.splitext(args.input)[0] + ".ptx")
+    shutil.copy(ptx, out)
+    print("rouge-compile: the nvptx PTX is in %s" % out)
+    return 0
 
 
 def main():
@@ -81,6 +168,10 @@ def main():
     ap.add_argument("--mlir-translate",
                     default=os.environ.get("MLIR_TRANSLATE", "mlir-translate"))
     ap.add_argument("--llc", default=os.environ.get("LLC", "llc"))
+    ap.add_argument("--clang", default=os.environ.get("CLANG", "clang"))
+    ap.add_argument("--sm", default="sm_75",
+                    help="the NVPTX target architecture (nvptx only); sm_75 "
+                         "is the oldest the tests run on")
     args = ap.parse_args()
 
     if not os.path.exists(args.input):
@@ -104,6 +195,9 @@ def main():
             print("rouge-compile: the front-end refused the kernel:\n%s"
                   % r.stderr.strip())
             return 1
+
+        if args.target == "nvptx":
+            return compile_nvptx(args, work, dialect)
 
         # 2) The dialect -> loops -> vector. The canonicaliser that follows
         # removes what the vectoriser leaves behind: the empty scalar tail

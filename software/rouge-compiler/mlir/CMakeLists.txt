@@ -20,6 +20,21 @@ endif()
 # Python нужен дифференциальному фазеру MLIR-контура.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
+# Архитектура PTX для GPU-ячеек контура (переопределяется
+# -DROUGE_NVPTX_SM=sm_80): sm_75 — минимум, под который собран контур.
+if(NOT DEFINED ROUGE_NVPTX_SM)
+  set(ROUGE_NVPTX_SM sm_75)
+endif()
+
+# Драйвер CUDA ищем ЗДЕСЬ ЖЕ: tests/ добавляется после mlir, и во время
+# конфигурации контура его переменных ещё нет. find_* кешируются, так что
+# tests/ потом переиспользует те же значения (имена те же).
+find_path(CUDA_DRIVER_INCLUDE_DIR cuda.h
+  PATHS /opt/cuda/targets/x86_64-linux/include /usr/local/cuda/include
+  NO_DEFAULT_PATH)
+find_library(CUDA_DRIVER_LIBRARY NAMES cuda
+  PATHS /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu)
+
 find_package(MLIR CONFIG QUIET)
 
 if(NOT MLIR_FOUND)
@@ -74,7 +89,8 @@ add_library(rouge-mlir-passes STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtToScf.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/UnitStrideToVector.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/RougeToScf.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/RougeToGpu.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/RougeToGpu.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/ExtractKernels.cpp)
 target_include_directories(rouge-mlir-passes PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${MLIR_INCLUDE_DIRS}
@@ -88,6 +104,8 @@ target_link_libraries(rouge-mlir-passes PUBLIC
   MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRMemRefDialect
+  MLIRGPUDialect
+  MLIRLLVMDialect
   MLIRSCFDialect
   MLIRVectorDialect)
 target_compile_options(rouge-mlir-passes PRIVATE ${LLVM_COMPILE_OPTIONS})
@@ -117,6 +135,8 @@ target_link_libraries(rouge-opt PRIVATE
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRGPUDialect
+  MLIRLLVMDialect
+  MLIRNVVMDialect
   MLIRVectorDialect
   MLIRTransforms
   rouge-mlir-dialect)
@@ -368,6 +388,109 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND
             --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir-dowhile
             --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
   set_tests_properties(compiler_mlir_fuzz_dowhile PROPERTIES TIMEOUT 900)
+
+  # ---- фиксированное ядро: граница clamp у сдвигов -----------------------
+  #
+  # Фазер берёт случайные сдвиги; здесь закреплены сами границы (32/33 для
+  # .b32, 17 для .b16, 65 для .b64). Ожидаемые значения в раннере выведены
+  # из текста ISA, а не из наших реализаций. Тот же селектор исполняет и
+  # AOT-ячейка compiler_nvptx_gpu_exec — если пути разойдутся, упадут оба.
+  add_test(NAME mlir_rouge_nvptx_shift_clamp
+    COMMAND ${CMAKE_COMMAND}
+      -DROUGE_COMPILE=${CMAKE_CURRENT_SOURCE_DIR}/tools/rouge-compile/rouge-compile
+      -DROUGE_OPT=$<TARGET_FILE:rouge-opt>
+      -DPTX2MLIR=$<TARGET_FILE:rouge-ptx2mlir>
+      -DMLIR_OPT=${MLIR_OPT_EXE}
+      -DMLIR_TRANSLATE=${MLIR_TRANSLATE_EXE}
+      -DCLANG=${CLANG_EXECUTABLE}
+      -DRUNNER=$<TARGET_FILE:gpu_exec_rungpu>
+      -DKERNEL=${CMAKE_CURRENT_SOURCE_DIR}/../tests/kernels/shift_clamp.ptx
+      -DSELECTOR=shift_clamp
+      -DBLOCK=64
+      -DSHAPES=0=64xi32,1=64xi32
+      -DSM=${ROUGE_NVPTX_SM}
+      -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/nvptx-exec
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mlir_gpu_exec.cmake)
+  set_tests_properties(mlir_rouge_nvptx_shift_clamp PROPERTIES
+    SKIP_REGULAR_EXPRESSION "no usable NVIDIA GPU")
+
+  # ---- тот же фазер, но ТРЕТЬИМ путём: на карте ---------------------------
+  #
+  # Контур: rouge-диалект -> gpu-диалект -> LLVM/NVVM -> PTX (rouge-compile
+  # --target nvptx) -> настоящая NVIDIA. Карта — арбитр: где наше
+  # представление о PTX расходится с железом, права у железа. Именно так
+  # нашлось, что "shift amounts greater than the register width N are clamped
+  # to N" — это clamp, а не modulo: интерпретатор и AOT брали modulo и
+  # СОГЛАШАЛИСЬ друг с другом на неверном ответе. Третий путь это вскрыл
+  # на первом же seed.
+  if(CUDA_DRIVER_INCLUDE_DIR AND CUDA_DRIVER_LIBRARY)
+    # Шаблон "chain": арифметическая цепочка на поток, без общей памяти.
+    add_test(NAME compiler_mlir_fuzz_gpu
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/run_fuzz_mlir.py
+              --mode gpu
+              --ptx2mlir $<TARGET_FILE:rouge-ptx2mlir>
+              --rouge-opt $<TARGET_FILE:rouge-opt>
+              --gen $<TARGET_FILE:fuzz_gen_kernel>
+              --interp $<TARGET_FILE:fuzz_run_interp>
+              --mlir-opt ${MLIR_OPT_EXE}
+              --mlir-translate ${MLIR_TRANSLATE_EXE}
+              --clang ${CLANG_EXECUTABLE}
+              --rouge-compile ${CMAKE_CURRENT_SOURCE_DIR}/tools/rouge-compile/rouge-compile
+              --gpu $<TARGET_FILE:fuzz_run_gpu>
+              --sm ${ROUGE_NVPTX_SM}
+              --iters 8
+              --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir-gpu
+              --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
+    set_tests_properties(compiler_mlir_fuzz_gpu PROPERTIES TIMEOUT 900
+      SKIP_REGULAR_EXPRESSION "no NVIDIA card")
+
+    # Шаблон "phases": общая память + барьер. Проверяет, что .shared в
+    # диалекте становится НАСТОЯЩЕЙ статической общей памятью, а не malloc
+    # (устройство malloc не вызывает) и не локальной.
+    add_test(NAME compiler_mlir_fuzz_gpu_phases
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/run_fuzz_mlir.py
+              --mode gpu
+              --ptx2mlir $<TARGET_FILE:rouge-ptx2mlir>
+              --rouge-opt $<TARGET_FILE:rouge-opt>
+              --gen $<TARGET_FILE:fuzz_gen_kernel>
+              --interp $<TARGET_FILE:fuzz_run_interp>
+              --mlir-opt ${MLIR_OPT_EXE}
+              --mlir-translate ${MLIR_TRANSLATE_EXE}
+              --clang ${CLANG_EXECUTABLE}
+              --rouge-compile ${CMAKE_CURRENT_SOURCE_DIR}/tools/rouge-compile/rouge-compile
+              --gpu $<TARGET_FILE:fuzz_run_gpu>
+              --sm ${ROUGE_NVPTX_SM}
+              --template phases
+              --iters 8
+              --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir-gpu-phases
+              --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
+    set_tests_properties(compiler_mlir_fuzz_gpu_phases PROPERTIES TIMEOUT 900
+      SKIP_REGULAR_EXPRESSION "no NVIDIA card")
+
+    # Шаблон "atomic": атомарный счётчик, общий на блок.
+    add_test(NAME compiler_mlir_fuzz_gpu_atomic
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/run_fuzz_mlir.py
+              --mode gpu
+              --ptx2mlir $<TARGET_FILE:rouge-ptx2mlir>
+              --rouge-opt $<TARGET_FILE:rouge-opt>
+              --gen $<TARGET_FILE:fuzz_gen_kernel>
+              --interp $<TARGET_FILE:fuzz_run_interp>
+              --mlir-opt ${MLIR_OPT_EXE}
+              --mlir-translate ${MLIR_TRANSLATE_EXE}
+              --clang ${CLANG_EXECUTABLE}
+              --rouge-compile ${CMAKE_CURRENT_SOURCE_DIR}/tools/rouge-compile/rouge-compile
+              --gpu $<TARGET_FILE:fuzz_run_gpu>
+              --sm ${ROUGE_NVPTX_SM}
+              --template atomic
+              --iters 8
+              --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir-gpu-atomic
+              --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
+    set_tests_properties(compiler_mlir_fuzz_gpu_atomic PROPERTIES TIMEOUT 900
+      SKIP_REGULAR_EXPRESSION "no NVIDIA card")
+  endif()
   # Каждый сохранённый провал — это ядро, которое когда-то нашло баг (так был
   # найден `prmt`, терявший маску байта). Оно повторяется на том же входе и
   # обязано проходить. Это регрессионный тест, а не «пример вывода»: падение
