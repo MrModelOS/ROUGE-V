@@ -269,6 +269,79 @@ std::string demotedKernel(uint64_t seed) {
   return p;
 }
 
+// The "atomic" template: a shared counter that every thread adds to with an
+// ATOMIC read-modify-write, and the final value is read back after a
+// barrier. The sum does not depend on the order of the atomic operations, so
+// the expected result is DETERMINISTIC even though the order is not — that is
+// exactly what makes this a test of the atomicity and not of the schedule.
+//
+//   out[0] = 0;                       // one thread, before the barrier
+//   barrier;
+//   v = in[tid] + seed;
+//   atom.add.u32 [out[0]], v;         // every thread
+//   barrier;
+//   out[1 + tid*4 + j] = out[0];      // every thread
+//
+// The counter lives in the OUTPUT buffer: a separate buffer would have to be
+// zero-initialised by the caller, and the harness allocates it with malloc
+// (uninitialised) — the sum would then depend on the garbage, not on the
+// atomicity. The first barrier is what makes the initialisation visible to
+// every thread.
+std::string atomicKernel(uint64_t seed) {
+  Rng rng(seed);
+  const unsigned k1 = 1 + rng.u32(7);
+  const unsigned k2 = 1 + rng.u32(101);
+  std::string p;
+  p += "// ROUGE-V differential fuzzer kernel (generated, do not edit).\n";
+  p += "// template=atomic seed=" + std::to_string(seed) + "\n";
+  p += ".version 8.0\n.target sm_75\n.address_size 64\n\n";
+  p += ".visible .entry fuzz_kernel(\n";
+  p += "    .param .u64 fuzz_kernel_param_0,\n";
+  p += "    .param .u64 fuzz_kernel_param_1,\n";
+  p += "    .param .u32 fuzz_kernel_param_2,\n";
+  p += "    .param .u32 fuzz_kernel_param_3\n";
+  p += ")\n{\n";
+  p += "    .reg .b32 %r<24>;\n";
+  p += "    .reg .b64 %rd<12>;\n";
+  p += "    .reg .pred %p<4>;\n\n";
+  p += "    ld.param.u64 %rd1, [fuzz_kernel_param_0];\n";
+  p += "    ld.param.u64 %rd2, [fuzz_kernel_param_1];\n";
+  p += "    ld.param.u32 %r1, [fuzz_kernel_param_2];\n";
+  p += "    ld.param.u32 %r2, [fuzz_kernel_param_3];\n";
+  p += "    cvta.to.global.u64 %rd3, %rd1;\n";
+  p += "    cvta.to.global.u64 %rd4, %rd2;\n";
+  p += "    mov.u32 %r3, %tid.x;\n";
+  // The counter is initialised by ONE thread: the others skip the store.
+  p += "    setp.eq.s32 %p1, %r3, 0;\n";
+  p += "    @%p1 bra $L_init_done;\n";
+  p += "    st.global.u32 [%rd3], 0;\n";
+  p += "$L_init_done:\n";
+  p += "    bar.sync 0;\n";
+  // The value every thread adds: in[tid] + seed, then a bit of arithmetic
+  // (so the value is not simply the input).
+  p += "    mul.wide.u32 %rd5, %r3, 4;\n";
+  p += "    add.s64 %rd5, %rd5, %rd4;\n";
+  p += "    ld.global.s32 %r4, [%rd5];\n";
+  p += "    add.s32 %r4, %r4, %r2;\n";
+  p += "    mad.lo.s32 %r4, %r4, " + std::to_string(k1) + ", " +
+       std::to_string(k2) + ";\n";
+  p += "    atom.add.u32 %r5, [%rd3], %r4;\n";
+  p += "    bar.sync 0;\n";
+  // The sum, written to out[tid*4 + j]. The counter IS out[0]: the thread 0
+  // writes the same value there in this phase, so the race on that slot is
+  // benign (both write the same bits) and all 256 slots end up written.
+  p += "    ld.global.u32 %r6, [%rd3];\n";
+  for (int j = 0; j < kOutPerThread; ++j) {
+    p += "    mul.lo.s32 %r7, %r3, " + std::to_string(kOutPerThread) + ";\n";
+    p += "    add.s32 %r7, %r7, " + std::to_string(j) + ";\n";
+    p += "    mul.wide.u32 %rd6, %r7, 4;\n";
+    p += "    add.s64 %rd6, %rd6, %rd3;\n";
+    p += "    st.global.u32 [%rd6], %r6;\n";
+  }
+  p += "    ret;\n}\n";
+  return p;
+}
+
 // The three files of one fuzz case: the PTX text, the input blob and the
 // metadata the driver reads.
 int writeOutputs(const std::string& ptx, const std::vector<int>& input,
@@ -328,7 +401,8 @@ int main(int argc, char** argv) {
       forcedOps = argv[++i];
     } else if (!strcmp(argv[i], "--template") && i + 1 < argc) {
       tpl = argv[++i];
-      if (tpl != "chain" && tpl != "phases" && tpl != "demoted") {
+      if (tpl != "chain" && tpl != "phases" && tpl != "demoted" &&
+          tpl != "atomic") {
         std::fprintf(stderr, "gen_kernel: unknown template '%s'\n",
                      tpl.c_str());
         return 2;
@@ -367,6 +441,8 @@ int main(int argc, char** argv) {
                                            outPath, inPath, metaPath);
   if (tpl == "demoted") return writeOutputs(demotedKernel(seed), input, seed,
                                             outPath, inPath, metaPath);
+  if (tpl == "atomic") return writeOutputs(atomicKernel(seed), input, seed,
+                                           outPath, inPath, metaPath);
 
   // Цепочка операций: одна на каждый «результат» (K регистров), плюс
   // несколько общих шагов.

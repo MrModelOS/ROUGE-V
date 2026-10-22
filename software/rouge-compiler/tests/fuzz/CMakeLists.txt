@@ -44,11 +44,31 @@ if(Python3_Interpreter_FOUND AND CLANG_EXECUTABLE)
             --gen $<TARGET_FILE:fuzz_gen_kernel>
             --interp $<TARGET_FILE:fuzz_run_interp>
             --host-runner ${CMAKE_CURRENT_SOURCE_DIR}/run_host.cpp
+            --runtime-lib $<TARGET_FILE:rouge-runtime>
             --mode host
             --iters 8
             --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work
             --cases ${CMAKE_CURRENT_SOURCE_DIR}/cases)
   set_tests_properties(compiler_ptx_fuzz PROPERTIES TIMEOUT 900)
+
+  # Тот же цикл, но на ядре с АТОМИКАМИ: общий счётчик, который все потоки
+  # увеличивают атомарно, и чтение результата после барьера. Проверяет
+  # атомарность в AOT-пути (интерпретатор — эталон).
+  add_test(NAME compiler_ptx_fuzz_atomic
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/run_fuzz.py
+            --ptx2ir $<TARGET_FILE:ptx2ir>
+            --clang ${CLANG_EXECUTABLE}
+            --gen $<TARGET_FILE:fuzz_gen_kernel>
+            --interp $<TARGET_FILE:fuzz_run_interp>
+            --host-runner ${CMAKE_CURRENT_SOURCE_DIR}/run_host.cpp
+            --runtime-lib $<TARGET_FILE:rouge-runtime>
+            --mode host
+            --template atomic
+            --iters 8
+            --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-atomic
+            --cases ${CMAKE_CURRENT_SOURCE_DIR}/cases)
+  set_tests_properties(compiler_ptx_fuzz_atomic PROPERTIES TIMEOUT 900)
 
   if(TARGET fuzz_run_gpu)
     add_test(NAME compiler_ptx_fuzz_gpu

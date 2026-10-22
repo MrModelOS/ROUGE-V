@@ -173,6 +173,22 @@ std::string predicateOf(const PtxInstruction &ins) {
   return ins.pred;
 }
 
+// True if the instruction WRITES a register (its first operand is the
+// destination). The stores, the reductions and the branches do not: their
+// first operand is an address or a label, and treating it as a destination
+// would make the analysis think that the address register is redefined
+// there (and then refuse a perfectly good kernel).
+bool writesRegister(const PtxInstruction &ins) {
+  const StringRef op = ins.op;
+  if (op.starts_with("st.") || op.starts_with("red.")) return false;
+  if (op == "bra" || op == "bra.uni" || op == "ret" || op == "exit") return false;
+  if (op == "bar.sync" || op == "barrier") return false;
+  if (op.starts_with("prefetch") || op.starts_with("membar") ||
+      op.starts_with("fence."))
+    return false;
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // The emitter
 // ---------------------------------------------------------------------------
@@ -1183,7 +1199,8 @@ LogicalResult PtxToRougeEmitter::emitBody() {
       std::set<std::string> definedInLoop;
       for (size_t k = i; k < back; ++k) {
         if (body[k].op == "bra") continue;
-        if (!body[k].args.empty()) definedInLoop.insert(regName(body[k].args[0]));
+        if (!body[k].args.empty() && writesRegister(body[k]))
+          definedInLoop.insert(regName(body[k].args[0]));
       }
       std::vector<std::string> carried;
       for (const std::string &r : definedInLoop)
@@ -1285,7 +1302,8 @@ LogicalResult PtxToRougeEmitter::emitBody() {
       // would have to carry them, and that is not implemented yet.
       std::set<std::string> defined;
       for (size_t k = i + 1; k < target; ++k)
-        if (!body[k].args.empty()) defined.insert(regName(body[k].args[0]));
+        if (!body[k].args.empty() && writesRegister(body[k]))
+          defined.insert(regName(body[k].args[0]));
       for (size_t k = target; k < body.size(); ++k) {
         for (const std::string &a : body[k].args) {
           std::string name = regName(a);

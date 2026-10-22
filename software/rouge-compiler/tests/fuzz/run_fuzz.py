@@ -42,12 +42,18 @@ def main():
     ap.add_argument("--interp", required=True)
     ap.add_argument("--gpu")
     ap.add_argument("--host-runner", help="run_host.cpp (the host half)")
+    ap.add_argument("--runtime-lib", default="",
+                    help="the host runtime (librouge-runtime.a): the kernel "
+                         "calls into it (bar.sync -> __rouge_syncthreads)")
     ap.add_argument("--cxx", default="c++")
     ap.add_argument("--mode", default="gpu", choices=["gpu", "host"])
     ap.add_argument("--iters", type=int, default=16)
     ap.add_argument("--work", default="fuzz-work")
     ap.add_argument("--cases", default="cases")
     ap.add_argument("--sm", default="sm_75")
+    ap.add_argument("--template", default="chain",
+                    choices=["chain", "phases", "demoted", "atomic"],
+                    help="the kernel shape (the generator's --template mode)")
     args = ap.parse_args()
 
     os.makedirs(args.work, exist_ok=True)
@@ -63,7 +69,8 @@ def main():
     skipped = 0
     for seed in range(1, args.iters + 1):
         r = run([args.gen, "--seed", str(seed), "--out", kern, "--input", in_bin,
-                 "--meta", os.path.join(args.work, "meta.txt")])
+                 "--meta", os.path.join(args.work, "meta.txt"),
+                 "--template", args.template])
         if r.returncode != 0:
             print("seed %d: generator failed: %s" % (seed, r.stderr.strip()))
             failures += 1
@@ -125,7 +132,11 @@ def main():
                 failures += 1
                 continue
             host_exe = os.path.join(args.work, "run_host")
-            r = run([args.cxx, "-O2", args.host_runner, host_obj, "-o", host_exe])
+            link_cmd = [args.cxx, "-O2", args.host_runner, host_obj, "-o", host_exe]
+            if args.runtime_lib:
+                link_cmd.append(args.runtime_lib)
+                link_cmd.append("-lpthread")
+            r = run(link_cmd)
             if r.returncode != 0:
                 print("seed %d: cannot link the host runner: %s"
                       % (seed, r.stderr.strip()))

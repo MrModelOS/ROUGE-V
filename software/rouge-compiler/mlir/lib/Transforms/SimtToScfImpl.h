@@ -175,6 +175,22 @@ struct SimtLoweringBase {
     return hasShared;
   }
 
+  // True if the op READS or WRITES memory. An allocation is not a read: it
+  // creates the memory, so it can be hoisted out of the phase loops (the
+  // allocation is per block, and it must dominate every phase).
+  static bool readsOrWritesMemory(Operation *op) {
+    if (op->getNumRegions() != 0) return true;
+    bool touches = false;
+    if (auto iface = dyn_cast<MemoryEffectOpInterface>(op)) {
+      SmallVector<MemoryEffects::EffectInstance> effects;
+      iface.getEffects(effects);
+      for (const MemoryEffects::EffectInstance &eff : effects)
+        if (isa<MemoryEffects::Read, MemoryEffects::Write>(eff.getEffect()))
+          touches = true;
+    }
+    return touches;
+  }
+
   // The kernel of a launch.
   static KernelOp findKernel(ModuleOp module, LaunchOp launch) {
     auto kernel = module.lookupSymbol<KernelOp>(
@@ -378,7 +394,16 @@ struct SimtLoweringBase {
       // induction variable, the block argument and the bounds of the loops
       // (see below).
       if (isa<ThreadIdOp, BlockIdOp, BlockDimOp, GridDimOp>(op)) continue;
-      if (dependsOnThread(op, 0))
+      // A MEMORY access stays in its phase. Hoisting it out of the phase
+      // loops would read the memory at the wrong time: another phase may
+      // have written it in between (an atomic add in an earlier phase, for
+      // example), and the hoisted read would then see the value from before
+      // the write — a silent wrong answer, not a crash. The parameter read
+      // is the exception: the parameter buffer is immutable.
+      const bool touchesMemory = readsOrWritesMemory(op);
+      const bool isParamRead = StringRef(op->getName().getStringRef())
+                                   .starts_with("ld.param.");
+      if (dependsOnThread(op, 0) || (touchesMemory && !isParamRead))
         dependentOps.push_back(op);
       else
         invariantOps.push_back(op);

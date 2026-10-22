@@ -305,6 +305,28 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND
             --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir-demoted
             --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
   set_tests_properties(compiler_mlir_fuzz_demoted PROPERTIES TIMEOUT 900)
+
+  # Шаблон "atomic": общий счётчик, который все потоки атомарно
+  # увеличивают, и чтение результата после барьера. Сумма не зависит от
+  # порядка атомарных операций, поэтому результат детерминирован — это
+  # проверка атомарности, а не расписания. Ячейка CI:
+  # compiler_mlir_fuzz_atomic.
+  add_test(NAME compiler_mlir_fuzz_atomic
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/run_fuzz_mlir.py
+            --ptx2mlir $<TARGET_FILE:rouge-ptx2mlir>
+            --rouge-opt $<TARGET_FILE:rouge-opt>
+            --gen $<TARGET_FILE:fuzz_gen_kernel>
+            --interp $<TARGET_FILE:fuzz_run_interp>
+            --mlir-opt ${MLIR_OPT_EXE}
+            --mlir-translate ${MLIR_TRANSLATE_EXE}
+            --clang ${CLANG_EXECUTABLE}
+            --runtime $<TARGET_FILE:mlir_print_i32>
+            --template atomic
+            --iters 8
+            --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir-atomic
+            --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
+  set_tests_properties(compiler_mlir_fuzz_atomic PROPERTIES TIMEOUT 900)
   # Каждый сохранённый провал — это ядро, которое когда-то нашло баг (так был
   # найден `prmt`, терявший маску байта). Оно повторяется на том же входе и
   # обязано проходить. Это регрессионный тест, а не «пример вывода»: падение

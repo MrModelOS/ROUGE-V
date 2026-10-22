@@ -1,0 +1,59 @@
+// ROUGE-V differential fuzzer kernel (generated, do not edit).
+// template=atomic seed=2
+.version 8.0
+.target sm_75
+.address_size 64
+
+.visible .entry fuzz_kernel(
+    .param .u64 fuzz_kernel_param_0,
+    .param .u64 fuzz_kernel_param_1,
+    .param .u32 fuzz_kernel_param_2,
+    .param .u32 fuzz_kernel_param_3
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<12>;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd1, [fuzz_kernel_param_0];
+    ld.param.u64 %rd2, [fuzz_kernel_param_1];
+    ld.param.u32 %r1, [fuzz_kernel_param_2];
+    ld.param.u32 %r2, [fuzz_kernel_param_3];
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+    mov.u32 %r3, %tid.x;
+    setp.eq.s32 %p1, %r3, 0;
+    @%p1 bra $L_init_done;
+    st.global.u32 [%rd3], 0;
+$L_init_done:
+    bar.sync 0;
+    mul.wide.u32 %rd5, %r3, 4;
+    add.s64 %rd5, %rd5, %rd4;
+    ld.global.s32 %r4, [%rd5];
+    add.s32 %r4, %r4, %r2;
+    mad.lo.s32 %r4, %r4, 6, 52;
+    atom.add.u32 %r5, [%rd3], %r4;
+    bar.sync 0;
+    ld.global.u32 %r6, [%rd3];
+    mul.lo.s32 %r7, %r3, 4;
+    add.s32 %r7, %r7, 0;
+    mul.wide.u32 %rd6, %r7, 4;
+    add.s64 %rd6, %rd6, %rd3;
+    st.global.u32 [%rd6], %r6;
+    mul.lo.s32 %r7, %r3, 4;
+    add.s32 %r7, %r7, 1;
+    mul.wide.u32 %rd6, %r7, 4;
+    add.s64 %rd6, %rd6, %rd3;
+    st.global.u32 [%rd6], %r6;
+    mul.lo.s32 %r7, %r3, 4;
+    add.s32 %r7, %r7, 2;
+    mul.wide.u32 %rd6, %r7, 4;
+    add.s64 %rd6, %rd6, %rd3;
+    st.global.u32 [%rd6], %r6;
+    mul.lo.s32 %r7, %r3, 4;
+    add.s32 %r7, %r7, 3;
+    mul.wide.u32 %rd6, %r7, 4;
+    add.s64 %rd6, %rd6, %rd3;
+    st.global.u32 [%rd6], %r6;
+    ret;
+}

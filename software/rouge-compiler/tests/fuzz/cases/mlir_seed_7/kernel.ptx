@@ -1,5 +1,5 @@
 // ROUGE-V differential fuzzer kernel (generated, do not edit).
-// seed=7
+// template=demoted seed=7
 .version 8.0
 .target sm_75
 .address_size 64
@@ -11,10 +11,9 @@
     .param .u32 fuzz_kernel_param_3
 )
 {
-    .reg .b32 %r<16>;
-    .reg .b64 %rd<8>;
-    .reg .f32 %f<4>;
-    .reg .pred %p<4>;
+    .shared .align 4 .b8 sdata[256];
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
 
     ld.param.u64 %rd1, [fuzz_kernel_param_0];
     ld.param.u64 %rd2, [fuzz_kernel_param_1];
@@ -22,71 +21,44 @@
     ld.param.u32 %r2, [fuzz_kernel_param_3];
     cvta.to.global.u64 %rd3, %rd1;
     cvta.to.global.u64 %rd4, %rd2;
-    mov.u32 %r3, %ctaid.x;
-    mov.u32 %r4, %ntid.x;
-    mul.wide.u32 %rd5, %r3, %r4;
     mov.u32 %r6, %tid.x;
-    cvt.u64.u32 %rd6, %r6;
-    add.s64 %rd5, %rd5, %rd6;
-    cvt.u32.u64 %r5, %rd5;
-    setp.ge.u32 %p1, %r5, %r1;
-    @%p1 bra $L_out;
-    mul.wide.u32 %rd7, %r5, 4;
-    add.s64 %rd4, %rd4, %rd7;
-    ld.global.s32 %r7, [%rd4];
-    mov.u32 %r8, %r2;
-    mov.s32 %r9, %r7;
-    mov.s32 %r10, %r7;
-    mov.s32 %r11, %r7;
-    mov.s32 %r12, %r7;
-    mov.u32 %r13, %r2;
-
-    add.s32 %r9, %r8, %r13;
-    sub.s32 %r10, %r7, %r13;
-    mul.lo.s32 %r11, %r7, %r13;
-    shl.b32 %r12, %r7, %r8;
-    shr.u32 %r9, %r7, %r13;
-    shr.s32 %r10, %r8, %r8;
-    and.b32 %r11, %r7, %r13;
-    or.b32 %r12, %r8, %r13;
-    xor.b32 %r9, %r7, %r8;
-    not.b32 %r10, %r8;
-    min.s32 %r11, %r8, %r13;
-    max.s32 %r12, %r8, %r7;
-    popc.b32 %r9, %r8;
-    clz.b32 %r10, %r7;
-    setp.lt.s32 %p2, %r7, %r8;
-    mov.s32 %r11, %r7;
-    @%p2 add.s32 %r11, %r11, %r8;
-    or.b32 %r15, %r8, 1;
-    div.s32 %r12, %r8, %r15;
-    or.b32 %r15, %r8, 1;
-    rem.s32 %r9, %r7, %r15;
-    dp4a.s32.s32 %r10, %r8, %r13, 0;
-    dp4a.u32.u32 %r11, %r7, %r13, 0;
-    prmt.b32 %r12, %r8, %r8, 32769;
-    bfi.b32 %r9, %r8, %r7, 27, 23;
-    bfe.s32 %r10, %r8, 13, 24;
-    mul.lo.s32 %r14, %r5, 4;
+    mul.wide.u32 %rd7, %r6, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.s32 %r7, [%rd8];
+    add.s32 %r7, %r7, %r2;
+    mov.u32 %r20, sdata;
+    mul.lo.s32 %r21, %r6, 4;
+    add.s32 %r22, %r20, %r21;
+    st.shared.s32 [%r22], %r7;
+    bar.sync 0;
+    sub.s32 %r8, %r1, %r6;
+    sub.s32 %r8, %r8, 1;
+    mul.lo.s32 %r23, %r8, 4;
+    add.s32 %r24, %r20, %r23;
+    ld.shared.s32 %r9, [%r24];
+    mad.lo.s32 %r10, %r9, 6, 28;
+    xor.b32 %r11, %r10, %r2;
+    mul.lo.s32 %r12, %r10, 3;
+    sub.s32 %r13, %r11, %r12;
+    mul.lo.s32 %r14, %r6, 4;
     add.s32 %r14, %r14, 0;
-    mul.wide.u32 %rd7, %r14, 4;
-    add.s64 %rd7, %rd7, %rd3;
-    st.global.s32 [%rd7], %r9;
-    mul.lo.s32 %r14, %r5, 4;
+    mul.wide.u32 %rd13, %r14, 4;
+    add.s64 %rd13, %rd13, %rd3;
+    st.global.s32 [%rd13], %r10;
+    mul.lo.s32 %r14, %r6, 4;
     add.s32 %r14, %r14, 1;
-    mul.wide.u32 %rd7, %r14, 4;
-    add.s64 %rd7, %rd7, %rd3;
-    st.global.s32 [%rd7], %r10;
-    mul.lo.s32 %r14, %r5, 4;
+    mul.wide.u32 %rd13, %r14, 4;
+    add.s64 %rd13, %rd13, %rd3;
+    st.global.s32 [%rd13], %r11;
+    mul.lo.s32 %r14, %r6, 4;
     add.s32 %r14, %r14, 2;
-    mul.wide.u32 %rd7, %r14, 4;
-    add.s64 %rd7, %rd7, %rd3;
-    st.global.s32 [%rd7], %r11;
-    mul.lo.s32 %r14, %r5, 4;
+    mul.wide.u32 %rd13, %r14, 4;
+    add.s64 %rd13, %rd13, %rd3;
+    st.global.s32 [%rd13], %r12;
+    mul.lo.s32 %r14, %r6, 4;
     add.s32 %r14, %r14, 3;
-    mul.wide.u32 %rd7, %r14, 4;
-    add.s64 %rd7, %rd7, %rd3;
-    st.global.s32 [%rd7], %r12;
-$L_out:
+    mul.wide.u32 %rd13, %r14, 4;
+    add.s64 %rd13, %rd13, %rd3;
+    st.global.s32 [%rd13], %r13;
     ret;
 }
