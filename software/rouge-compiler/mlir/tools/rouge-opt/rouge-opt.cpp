@@ -35,6 +35,7 @@ int main(int argc, char **argv) {
   // registerRougeTransformsPasses; это всплыло только при первой реальной
   // сборке контура).
   rouge::registerRougeSimtTransformsPasses();
+  rouge::registerRougeToGpuPass();
 
   // The generic clean-up passes the contour uses: the vectoriser leaves an
   // empty scalar tail (a trip count that is a multiple of the vector width)

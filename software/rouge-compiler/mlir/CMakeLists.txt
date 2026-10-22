@@ -73,7 +73,8 @@ add_library(rouge-mlir-passes STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtAccessReport.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/SimtToScf.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/UnitStrideToVector.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/RougeToScf.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/RougeToScf.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/RougeToGpu.cpp)
 target_include_directories(rouge-mlir-passes PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${MLIR_INCLUDE_DIRS}

@@ -48,6 +48,13 @@ void registerRougeUnitStrideToVectorPass();
 std::unique_ptr<mlir::Pass> createRougeToScfPass();
 void registerRougeToScfPass();
 
+// !rouge-to-gpu — the reverse lowering of our dialect onto the upstream
+// `gpu` dialect: the first step towards an NVPTX target. Renames the SIMT
+// ops (thread/block id, barrier, launch) onto their gpu counterparts; the
+// arithmetic, memref and scf ops are dialect-independent and stay as they are.
+std::unique_ptr<mlir::Pass> createRougeToGpuPass();
+void registerRougeToGpuPass();
+
 
 }  // namespace rouge
 
