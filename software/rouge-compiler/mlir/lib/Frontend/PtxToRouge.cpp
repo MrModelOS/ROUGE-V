@@ -231,6 +231,13 @@ private:
   DenseMap<size_t, MemAccess> access_;  // the instruction -> its access
   std::set<size_t> skip_;               // the instructions not emitted
 
+  // A loop-closing branch: the header -> the branch that jumps back to it.
+  struct BackEdge {
+    size_t index = 0;      // the branch itself
+    std::string predicate; // "" for an unconditional back edge
+  };
+  std::map<size_t, BackEdge> loopBack_;
+
   // The refusal: the message goes into the error and the result is failure.
   LogicalResult fail(const std::string &msg) {
     if (error_) *error_ = msg;
@@ -264,6 +271,18 @@ private:
   LogicalResult analyseAddresses();
   LogicalResult buildSignature();
   LogicalResult emitBody();
+  // Emit the instructions of [lo, hi) into the current insert block. A
+  // backward branch closes a loop, a forward conditional branch is a guard
+  // (an early exit) and everything else is one instruction. 'skips' marks the
+  // instructions the ENCLOSING loop owns (its condition's setp and its exit
+  // branch): they are not emitted where they stand, the loop builds them.
+  LogicalResult emitRange(size_t lo, size_t hi, const std::set<size_t> &skips);
+  // Emit the loop that starts at 'header' and is closed by the branch at
+  // 'back' (exclusive).
+  LogicalResult emitLoop(size_t header, size_t back);
+  // Is the register still read after 'from' before anything redefines it?
+  // (A read wins over a write: `add.s64 %rd, %rd, %r` reads before writing.)
+  bool liveAfter(const std::string &reg, size_t from) const;
   LogicalResult emitInstruction(const PtxInstruction &ins, size_t index);
   // A constant of an integer type.
   Value constInt(Type t, int64_t v);
@@ -455,6 +474,17 @@ bool PtxToRougeEmitter::promoteParamToAddress(const std::string &reg) {
 
 LogicalResult PtxToRougeEmitter::analyseAddresses() {
   MLIRContext *ctx = module_.getContext();
+
+  // Does the function have a back edge? A pointer ADVANCED inside a loop is
+  // the one form the recovered "base + index" structure cannot express, see
+  // the add branches below.
+  bool hasLoop = false;
+  for (size_t i = 0; i < fn_->body.size() && !hasLoop; ++i) {
+    const PtxInstruction &ins = fn_->body[i];
+    if (ins.op != "bra" || ins.args.empty()) continue;
+    auto it = fn_->labels.find(ins.args[0]);
+    if (it != fn_->labels.end() && (size_t)it->second <= i) hasLoop = true;
+  }
 
   // The parameters: their index by name.
   llvm::StringMap<int> paramIndex;
@@ -699,6 +729,27 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       if (ins.args.size() < 3) return fail("bad add.s64");
       const std::string a = regName(ins.args[1]);
       const std::string b = regName(ins.args[2]);
+      // A pointer that MOVES. `add.s64 %p, %p, 16` (nvcc advances a tile
+      // pointer on every iteration) cannot be folded into a constant byte
+      // offset: the offset changes per iteration, and the recovered
+      // memref[index] form would read the FIRST tile every time. The
+      // front-end produced exactly that for int8_gemm.ptx — the card answered
+      // CUDA_ERROR_ILLEGAL_ADDRESS, which is the good outcome; guessing is not.
+      {
+        auto dstIt = ptrValue_.find(regName(ins.args[0]));
+        const bool moves = dstIt != ptrValue_.end() &&
+                           dstIt->second.kind == PtrValue::Address &&
+                           (!dstIt->second.indexReg.empty() ||
+                            !dstIt->second.extraTerms.empty() ||
+                            dstIt->second.constBytes != 0);
+        if (hasLoop && moves && (regName(ins.args[0]) == a ||
+                                 regName(ins.args[0]) == b))
+          return fail("the address register '" + regName(ins.args[0]) +
+                      "' is advanced inside a loop ('" + op.str() +
+                      "'): a moving pointer is not expressible yet, and "
+                      "folding the step into a constant byte offset would "
+                      "read the first tile on every iteration");
+      }
       // A parameter used as the base of an address without cvta.
       if (pointerParams_.count(a)) promoteParamToAddress(a);
       if (pointerParams_.count(b)) promoteParamToAddress(b);
@@ -779,6 +830,21 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       if (ins.args.size() < 3) return fail("bad add.s32");
       const std::string a = regName(ins.args[1]);
       const std::string b = regName(ins.args[2]);
+      {
+        auto dstIt = ptrValue_.find(regName(ins.args[0]));
+        const bool moves = dstIt != ptrValue_.end() &&
+                           dstIt->second.kind == PtrValue::Address &&
+                           (!dstIt->second.indexReg.empty() ||
+                            !dstIt->second.extraTerms.empty() ||
+                            dstIt->second.constBytes != 0);
+        if (hasLoop && moves && (regName(ins.args[0]) == a ||
+                                 regName(ins.args[0]) == b))
+          return fail("the address register '" + regName(ins.args[0]) +
+                      "' is advanced inside a loop ('" + op.str() +
+                      "'): a moving pointer is not expressible yet, and "
+                      "folding the step into a constant byte offset would "
+                      "read the first tile on every iteration");
+      }
       auto ai = ptrValue_.find(a);
       auto bi = ptrValue_.find(b);
       PtrValue pv;
@@ -1279,19 +1345,21 @@ Value PtxToRougeEmitter::accessIndex(const MemAccess &acc) {
   return idx;
 }
 
-// The body of the kernel: the instructions, with the early exits turned into
-// scf.if and the backward branches turned into scf.while.
+// The body of the kernel.
+//
+// PTX is a flat CFG; MLIR is structured. Everything below is one structuriser:
+// a backward branch closes a loop, a forward conditional branch is a guard,
+// and a range of instructions is emitted into the current block. The same
+// routine runs at the top level and inside a loop body, which is why a guard
+// INSIDE a loop (the shape of nvcc's tiled kernels) needed no second
+// implementation.
 LogicalResult PtxToRougeEmitter::emitBody() {
   const auto &body = fn_->body;
   // Pre-scan: find the backward branches that close a loop. A "bra $L" (or
   // "@%p bra $L") with L's position < i is a back edge; L is the loop header.
   // The PREDICATED back edge is the do-while form nvcc emits: the condition
   // sits at the bottom of the body, and the loop continues while it holds.
-  struct BackEdge {
-    size_t index = 0;      // the branch itself
-    std::string predicate; // "" for an unconditional back edge
-  };
-  std::map<size_t, BackEdge> loopBack;
+  loopBack_.clear();
   for (size_t i = 0; i < body.size(); ++i) {
     const PtxInstruction &ins = body[i];
     if (ins.op != "bra") continue;
@@ -1303,215 +1371,371 @@ LogicalResult PtxToRougeEmitter::emitBody() {
       BackEdge be;
       be.index = i;
       be.predicate = ins.pred;
-      loopBack[target] = be;
+      loopBack_[target] = be;
     }
   }
+  return emitRange(0, body.size(), {});
+}
 
-  size_t i = 0;
-  while (i < body.size()) {
-    const PtxInstruction &ins = body[i];
+// Is the register still read after 'from' before anything redefines it?
+bool PtxToRougeEmitter::liveAfter(const std::string &reg, size_t from) const {
+  const auto &body = fn_->body;
+  for (size_t k = from; k < body.size(); ++k) {
+    const PtxInstruction &ins = body[k];
+    if (ins.args.empty()) continue;
+    // The operands after the destination are reads. A store's first operand is
+    // an address — a read too.
+    for (size_t a = 1; a < ins.args.size(); ++a)
+      if (regName(ins.args[a]) == reg) return true;
+    if (!ins.args[0].empty() && ins.args[0][0] == '[' &&
+        regName(ins.args[0]) == reg)
+      return true;
+    if (writesRegister(ins) && regName(ins.args[0]) == reg) return false;
+  }
+  return false;
+}
 
-    // A loop: a backward branch closes the region [header, back_edge].
-    if (loopBack.count(i)) {
-      const BackEdge be = loopBack[i];
-      size_t back = be.index;
-      // The condition of the loop. Two forms:
-      //   * the back edge is PREDICATED (the do-while form nvcc emits): the
-      //     loop continues while the predicate holds;
-      //   * the back edge is unconditional: the loop has a forward exit
-      //     branch, and the loop continues while its predicate does NOT hold.
-      size_t exitBranch = body.size();
-      std::string exitPred;
-      std::string condPred = be.predicate;
-      bool condInverted = false;
-      if (condPred.empty()) {
-        // Find the exit condition: a forward conditional branch inside
-        // [i, back] whose target is beyond 'back'.
-        for (size_t k = i; k < back; ++k) {
-          const PtxInstruction &cand = body[k];
-          if (cand.op == "bra" && !cand.pred.empty() && !cand.args.empty()) {
-            auto lit = fn_->labels.find(cand.args[0]);
-            if (lit != fn_->labels.end() && (size_t)lit->second > back) {
-              exitBranch = k;
-              exitPred = cand.pred;
-              break;
-            }
-          }
-        }
-        if (exitPred.empty())
-          return fail("a loop without an exit condition is not supported");
-        condPred = exitPred;
-        condInverted = true;
-      }
-
-      // The setp that defines the loop's predicate.
-      size_t setpIdx = body.size();
-      for (size_t k = i; k < back; ++k) {
-        if (body[k].op.rfind("setp", 0) == 0 && !body[k].args.empty() &&
-            regName(body[k].args[0]) == condPred) {
-          setpIdx = k;
-          break;
-        }
-      }
-      if (setpIdx == body.size())
-        return fail("the exit predicate of the loop is not a setp");
-
-      // Loop-carried registers: defined before 'i' and redefined inside
-      // [i, back-1].
-      std::set<std::string> definedBefore;
-      for (size_t k = 0; k < i; ++k)
-        if (!body[k].args.empty()) definedBefore.insert(regName(body[k].args[0]));
-      std::set<std::string> definedInLoop;
-      for (size_t k = i; k < back; ++k) {
-        if (body[k].op == "bra") continue;
-        if (!body[k].args.empty() && writesRegister(body[k]))
-          definedInLoop.insert(regName(body[k].args[0]));
-      }
-      std::vector<std::string> carried;
-      for (const std::string &r : definedInLoop)
-        if (definedBefore.count(r)) carried.push_back(r);
-      // (debug removed)
-
-      // Initial values for the carried registers.
-      SmallVector<Value> initVals;
-      for (const std::string &r : carried) {
-        Value v = valueOfReg(r);
-        if (!v) return fail("the loop-carried register '" + r +
-                            "' has no value before the loop");
-        initVals.push_back(v);
-      }
-
-      SmallVector<Type> carriedTypes;
-      for (const std::string &r : carried) carriedTypes.push_back(typeOfReg(r));
-
-      // A failure inside a region builder cannot be returned (the callback is
-      // void), and a swallowed failure used to leave an EMPTY body block:
-      // the module then failed verification with "'scf.while' op expects a
-      // non-empty block", which says nothing about the real cause. The flag
-      // carries the failure out.
-      bool bodyFailed = false;
-      auto beforeBuilder = [&](OpBuilder &b, Location loc, ValueRange args) {
-        ImplicitLocOpBuilder saved = std::move(builder_);
-        builder_ = ImplicitLocOpBuilder(loc_, b);
-        for (size_t c = 0; c < carried.size(); ++c)
-          regValue_[carried[c]] = args[c];
-        if (failed(emitInstruction(body[setpIdx], setpIdx))) {
-          bodyFailed = true;
-          builder_ = std::move(saved);
-          return;
-        }
-        Value p = valueOfReg(condPred);
-        if (!p) { bodyFailed = true; builder_ = std::move(saved); return; }
-        Value cond = p;
-        if (condInverted) {
-          // The exit branch: the loop continues while the predicate does NOT
-          // hold.
-          cond = builder_.create<arith::XOrIOp>(
-              p, builder_.create<arith::ConstantOp>(builder_.getBoolAttr(true)))
-              .getResult();
-        }
-        SmallVector<Value> condYield;
-        for (const std::string &r : carried) condYield.push_back(valueOfReg(r));
-        builder_.create<scf::ConditionOp>(cond, condYield);
-        builder_ = std::move(saved);
-      };
-
-      auto afterBuilder = [&](OpBuilder &b, Location loc, ValueRange args) {
-        ImplicitLocOpBuilder saved = std::move(builder_);
-        builder_ = ImplicitLocOpBuilder(loc_, b);
-        for (size_t c = 0; c < carried.size(); ++c)
-          regValue_[carried[c]] = args[c];
-        for (size_t k = i; k < back; ++k) {
-          if (k == exitBranch) continue;
-          if (k == setpIdx) continue;
-          if (failed(emitInstruction(body[k], k))) {
-            bodyFailed = true;
-            builder_ = std::move(saved);
-            return;
-          }
-        }
-        SmallVector<Value> bodyYield;
-        for (size_t c = 0; c < carried.size(); ++c) {
-          Value v = valueOfReg(carried[c]);
-          if (!v) v = args[c];
-          bodyYield.push_back(v);
-        }
-        builder_.create<scf::YieldOp>(bodyYield);
-        builder_ = std::move(saved);
-      };
-
-      auto whileOp = scf::WhileOp::create(builder_, carriedTypes, initVals,
-                                          beforeBuilder, afterBuilder);
-      if (bodyFailed)
-        return fail("the loop body is not understood" +
-                    std::string(error_ ? ": " + *error_ : ""));
-
-      // After the loop: update regValue_ with the results.
-      for (size_t c = 0; c < carried.size(); ++c)
-        regValue_[carried[c]] = whileOp.getResult(c);
-
-      i = back + 1;
+// Emit [lo, hi): loops, guards and instructions, in the order they stand.
+LogicalResult PtxToRougeEmitter::emitRange(size_t lo, size_t hi,
+                                           const std::set<size_t> &skips) {
+  const auto &body = fn_->body;
+  size_t i = lo;
+  while (i < hi) {
+    // An instruction the enclosing loop owns: built from the loop's header and
+    // its condition, not emitted where it stands.
+    if (skips.count(i)) {
+      ++i;
       continue;
     }
 
-    // An early exit: "@%p bra $L" — the threads that take the branch skip
-    // the block up to the label. This is the shape of every range guard.
+    // A loop: a backward branch closes the region [header, back_edge].
+    auto lb = loopBack_.find(i);
+    if (lb != loopBack_.end() && lb->second.index < hi) {
+      if (failed(emitLoop(i, lb->second.index))) return failure();
+      i = lb->second.index + 1;
+      continue;
+    }
+
+    const PtxInstruction &ins = body[i];
+
+    // A guard: "@%p bra L" — the threads that take the branch skip the block.
+    // This is the shape of every range guard and of nvcc's if/else.
     if (ins.op == "bra" && !ins.pred.empty()) {
       if (ins.args.empty()) return fail("bra without a target");
       auto it = fn_->labels.find(ins.args[0]);
       if (it == fn_->labels.end())
         return fail("unknown label '" + ins.args[0] + "'");
-      size_t target = (size_t)it->second;
-      if (target <= i)
-        return fail("only a forward branch is supported (the loop forms are "
-                    "not translated yet)");
-      if (target > body.size()) return fail("the label is out of range");
+      const size_t target = (size_t)it->second;
+      if (target <= i || target > hi)
+        return fail("the branch to '" + ins.args[0] + "' leaves the block: the "
+                    "front-end structures only the branches that reconverge "
+                    "inside it (a jump out of a loop is not supported)");
 
-      // The predicate.
       Value pred = operandValue(ins.pred, builder_.getI1Type());
       if (!pred) return fail("the predicate of the branch is not understood");
-      Value notPred =
-          builder_.create<arith::XOrIOp>(
-              pred,
-              builder_.create<arith::ConstantOp>(builder_.getBoolAttr(true)))
-              .getResult();
 
-      // The guarded block: the instructions up to the label.
-      SmallVector<Operation *> saved;
-      (void)saved;
-      // The values the block defines must not be used after it: the scf.if
-      // would have to carry them, and that is not implemented yet.
-      std::set<std::string> defined;
-      for (size_t k = i + 1; k < target; ++k)
-        if (!body[k].args.empty() && writesRegister(body[k]))
-          defined.insert(regName(body[k].args[0]));
-      for (size_t k = target; k < body.size(); ++k) {
-        for (const std::string &a : body[k].args) {
-          std::string name = regName(a);
-          if (defined.count(name))
-            return fail("a value defined inside a guarded block is used "
-                        "after it: the front-end does not carry values out "
-                        "of an early exit yet");
+      // Two shapes, and the difference is where the guarded block is:
+      //
+      //   @%p bra L;                  @%p bra L;
+      //   <fallthrough block>         bra E;      <- the else path goes to E
+      // L:                            L: <taken block>
+      //                               E:
+      //
+      // In the first the FALLTHROUGH block runs when the predicate does not
+      // hold; in the second the block after L is the taken path (nvcc's
+      // if/else: the else branch jumps straight over it).
+      size_t blockLo = i + 1;
+      size_t blockHi = target;
+      size_t resume = target;
+      bool guardTaken = false;
+      if (i + 1 < target && body[i + 1].op == "bra" &&
+          body[i + 1].pred.empty()) {
+        if (body[i + 1].args.empty())
+          return fail("bra without a target");
+        auto eit = fn_->labels.find(body[i + 1].args[0]);
+        if (eit == fn_->labels.end())
+          return fail("unknown label '" + body[i + 1].args[0] + "'");
+        const size_t e = (size_t)eit->second;
+        if (e < target)
+          return fail("a backward branch inside a guarded block is not "
+                      "supported");
+        if (target > i + 2)
+          return fail("unreachable code between an unconditional branch and "
+                      "its target is not supported");
+        blockLo = target;
+        blockHi = std::min(e, hi);
+        resume = blockHi;
+        guardTaken = true;
+      }
+
+      // The values the block defines and the code after it still reads. The
+      // scf.if carries them out; the block that does not run yields the value
+      // from BEFORE the guard — which is what makes the pre-value (`mov %rs7,
+      // %rs8` in front of `@%p4 bra L` in int8_gemm.ptx) matter: without it
+      // PTX leaves the register undefined and the front-end refuses to guess.
+      std::vector<std::string> carried;
+      std::vector<std::string> definedInBlock;
+      for (size_t k = blockLo; k < blockHi; ++k) {
+        if (skip_.count(k)) continue;
+        if (body[k].args.empty() || !writesRegister(body[k])) continue;
+        const std::string r = regName(body[k].args[0]);
+        if (r.empty()) continue;
+        if (std::find(definedInBlock.begin(), definedInBlock.end(), r) ==
+            definedInBlock.end())
+          definedInBlock.push_back(r);
+        if (std::find(carried.begin(), carried.end(), r) != carried.end())
+          continue;
+        // Live beyond the block. Scan to the end of the FUNCTION: inside a
+        // loop body the value is also consumed by the loop's own yield, which
+        // stands after the loop's range.
+        if (liveAfter(r, blockHi)) carried.push_back(r);
+      }
+      SmallVector<Type> types;
+      SmallVector<Value> outerVals;
+      for (const std::string &r : carried) {
+        Value v = valueOfReg(r);
+        if (!v)
+          return fail("the guarded block defines '" + r + "', the code after "
+                      "it reads it, and there is no value before the block: "
+                      "PTX leaves the register undefined there, the front-end "
+                      "will not invent one");
+        Type t = typeOfReg(r);
+        if (!t) return fail("the type of '" + r + "' is not known");
+        types.push_back(t);
+        outerVals.push_back(v);
+      }
+
+      Value cond = pred;
+      if (!guardTaken) {
+        cond = builder_.create<arith::XOrIOp>(
+            pred, builder_.create<arith::ConstantOp>(
+                      builder_.getBoolAttr(true)))
+                   .getResult();
+      }
+      auto ifOp = builder_.create<scf::IfOp>(TypeRange(types), cond,
+                                             /*withElseRegion=*/true);
+      {
+        OpBuilder::InsertionGuard guard(builder_);
+        builder_.setInsertionPointToStart(&ifOp.getThenRegion().front());
+        if (failed(emitRange(blockLo, blockHi, skips))) return failure();
+        SmallVector<Value> yields;
+        for (const std::string &r : carried) {
+          Value v = valueOfReg(r);
+          if (!v)
+            return fail("the guarded block does not define '" + r +
+                        "', the code after it reads it");
+          yields.push_back(v);
+        }
+        // Whether scf.if's builder left a terminator in the region depends on
+        // the overload (it does for a result-less if, it does not for one with
+        // result types), so ask the block itself. getTerminator() is not the
+        // way: it returns the LAST OPERATION even when that is not a
+        // terminator, and rewriting its operands silently corrupted the last
+        // instruction of the block.
+        Block &thenBlock = ifOp.getThenRegion().back();
+        if (!thenBlock.empty() && isa<scf::YieldOp>(&thenBlock.back()))
+          thenBlock.back().setOperands(yields);
+        else {
+          builder_.setInsertionPointToEnd(&thenBlock);
+          builder_.create<scf::YieldOp>(yields);
         }
       }
-
-      // The else region: the threads that take the branch skip the block.
-      // The builder adds the terminators of both regions, so nothing is
-      // added here.
-      auto ifOp = builder_.create<scf::IfOp>(notPred, /*withElseRegion=*/true);
-      OpBuilder::InsertionGuard guard(builder_);
-      builder_.setInsertionPointToStart(&ifOp.getThenRegion().front());
-      for (size_t k = i + 1; k < target; ++k) {
-        if (failed(emitInstruction(body[k], k))) return failure();
+      {
+        Block &elseBlock = ifOp.getElseRegion().back();
+        if (!elseBlock.empty() && isa<scf::YieldOp>(&elseBlock.back()))
+          elseBlock.back().setOperands(outerVals);
+        else {
+          builder_.setInsertionPointToEnd(&elseBlock);
+          builder_.create<scf::YieldOp>(outerVals);
+        }
       }
       builder_.setInsertionPointAfter(ifOp);
-      i = target;
+      for (size_t c = 0; c < carried.size(); ++c)
+        regValue_[carried[c]] = ifOp.getResult(c);
+      // A register the block defines and does NOT carry out has no value
+      // after the if: the path that skipped the block never wrote it. Keeping
+      // the stale SSA value would make it look defined (and the verifier later
+      // reports a dominance violation — block_reduce.ptx hit exactly that:
+      // the value loaded inside the first guard was used as a loop's init).
+      for (const std::string &r : definedInBlock)
+        if (std::find(carried.begin(), carried.end(), r) == carried.end())
+          regValue_.erase(r);
+      i = resume;
       continue;
+    }
+
+    // An unconditional branch. Inside a range only "to the end of the range"
+    // is understood: that is the last branch of an if/else block, and it says
+    // nothing more than "the block ends here". Anything else jumps over code,
+    // which the structuriser does not reorder.
+    if (ins.op == "bra") {
+      if (ins.args.empty()) return fail("bra without a target");
+      auto it = fn_->labels.find(ins.args[0]);
+      if (it == fn_->labels.end())
+        return fail("unknown label '" + ins.args[0] + "'");
+      if ((size_t)it->second == hi) return success();
+      return fail("an unconditional branch to '" + ins.args[0] +
+                  "' jumps over code: the front-end structures only branches "
+                  "that reconverge (a loop is closed by a branch to its own "
+                  "header)");
     }
 
     if (failed(emitInstruction(ins, i))) return failure();
     ++i;
   }
+  return success();
+}
+
+// A loop: scf.while over the registers the body changes.
+LogicalResult PtxToRougeEmitter::emitLoop(size_t header, size_t back) {
+  const auto &body = fn_->body;
+  const BackEdge be = loopBack_[header];
+
+  // The condition of the loop. Two forms:
+  //   * the back edge is PREDICATED (the do-while form nvcc emits): the loop
+  //     continues while the predicate holds;
+  //   * the back edge is unconditional: the loop has a forward exit branch,
+  //     and the loop continues while its predicate does NOT hold.
+  size_t exitBranch = body.size();
+  std::string exitPred;
+  std::string condPred = be.predicate;
+  bool condInverted = false;
+  if (condPred.empty()) {
+    // Find the exit condition: a forward conditional branch inside
+    // [header, back] whose target is beyond 'back'.
+    for (size_t k = header; k < back; ++k) {
+      const PtxInstruction &cand = body[k];
+      if (cand.op == "bra" && !cand.pred.empty() && !cand.args.empty()) {
+        auto lit = fn_->labels.find(cand.args[0]);
+        if (lit != fn_->labels.end() && (size_t)lit->second > back) {
+          exitBranch = k;
+          exitPred = cand.pred;
+          break;
+        }
+      }
+    }
+    if (exitPred.empty())
+      return fail("a loop without an exit condition is not supported");
+    condPred = exitPred;
+    condInverted = true;
+  }
+
+  // The setp that defines the loop's predicate.
+  size_t setpIdx = body.size();
+  for (size_t k = header; k < back; ++k) {
+    if (body[k].op.rfind("setp", 0) == 0 && !body[k].args.empty() &&
+        regName(body[k].args[0]) == condPred) {
+      setpIdx = k;
+      break;
+    }
+  }
+  if (setpIdx == body.size())
+    return fail("the exit predicate of the loop is not a setp");
+
+  // Loop-carried registers: defined before the loop and redefined inside it.
+  std::set<std::string> definedBefore;
+  for (size_t k = 0; k < header; ++k)
+    if (!body[k].args.empty()) definedBefore.insert(regName(body[k].args[0]));
+  std::set<std::string> definedInLoop;
+  for (size_t k = header; k < back; ++k) {
+    if (body[k].op == "bra") continue;
+    if (!body[k].args.empty() && writesRegister(body[k]))
+      definedInLoop.insert(regName(body[k].args[0]));
+  }
+  // A register redefined in the body is carried only if it has a value NOW.
+  // A register without one is either recomputed in the body (the address
+  // arithmetic, which is not emitted at all: it is part of the access) or it
+  // is genuinely undefined in the first iteration — and then reading it in
+  // the body fails loudly there, which is the honest report. Refusing a
+  // register that the body simply overwrites first would reject
+  // block_reduce.ptx: its loop re-does `cvta.to.shared` on every iteration.
+  std::vector<std::string> carried;
+  SmallVector<Value> initVals;
+  for (const std::string &r : definedInLoop) {
+    // The loop's own predicate is rebuilt by the condition every iteration:
+    // it is not an input.
+    if (r == condPred) continue;
+    if (!definedBefore.count(r)) continue;
+    Value v = valueOfReg(r);
+    if (!v) continue;
+    carried.push_back(r);
+    initVals.push_back(v);
+  }
+  SmallVector<Type> carriedTypes;
+  for (const std::string &r : carried) carriedTypes.push_back(typeOfReg(r));
+
+  // A failure inside a region builder cannot be returned (the callback is
+  // void), and a swallowed failure used to leave an EMPTY body block: the
+  // module then failed verification with "'scf.while' op expects a non-empty
+  // block", which says nothing about the real cause. The flag carries the
+  // failure out.
+  bool bodyFailed = false;
+  auto beforeBuilder = [&](OpBuilder &b, Location loc, ValueRange args) {
+    ImplicitLocOpBuilder saved = std::move(builder_);
+    builder_ = ImplicitLocOpBuilder(loc_, b);
+    for (size_t c = 0; c < carried.size(); ++c)
+      regValue_[carried[c]] = args[c];
+    if (failed(emitInstruction(body[setpIdx], setpIdx))) {
+      bodyFailed = true;
+      builder_ = std::move(saved);
+      return;
+    }
+    Value p = valueOfReg(condPred);
+    if (!p) {
+      bodyFailed = true;
+      builder_ = std::move(saved);
+      return;
+    }
+    Value cond = p;
+    if (condInverted) {
+      // The exit branch: the loop continues while the predicate does NOT hold.
+      cond = builder_.create<arith::XOrIOp>(
+          p, builder_.create<arith::ConstantOp>(builder_.getBoolAttr(true)))
+                 .getResult();
+    }
+    SmallVector<Value> condYield;
+    for (const std::string &r : carried) condYield.push_back(valueOfReg(r));
+    builder_.create<scf::ConditionOp>(cond, condYield);
+    builder_ = std::move(saved);
+  };
+
+  auto afterBuilder = [&](OpBuilder &b, Location loc, ValueRange args) {
+    ImplicitLocOpBuilder saved = std::move(builder_);
+    builder_ = ImplicitLocOpBuilder(loc_, b);
+    for (size_t c = 0; c < carried.size(); ++c)
+      regValue_[carried[c]] = args[c];
+    // The body is a RANGE like any other: guards inside it (nvcc's tiled
+    // kernels guard the loads per thread) are structured here, not dropped.
+    std::set<size_t> skips = {setpIdx, exitBranch};
+    if (failed(emitRange(header, back, skips))) {
+      bodyFailed = true;
+      builder_ = std::move(saved);
+      return;
+    }
+    SmallVector<Value> bodyYield;
+    for (size_t c = 0; c < carried.size(); ++c) {
+      Value v = valueOfReg(carried[c]);
+      if (!v) v = args[c];
+      bodyYield.push_back(v);
+    }
+    builder_.create<scf::YieldOp>(bodyYield);
+    builder_ = std::move(saved);
+  };
+
+  auto whileOp = scf::WhileOp::create(builder_, carriedTypes, initVals,
+                                      beforeBuilder, afterBuilder);
+  if (bodyFailed)
+    return fail("the loop body is not understood" +
+                std::string(error_ ? ": " + *error_ : ""));
+
+  // After the loop: update regValue_ with the results, and forget the
+  // registers that only the body defined — they are not defined after the
+  // loop (a trip count of zero never writes them).
+  for (size_t c = 0; c < carried.size(); ++c)
+    regValue_[carried[c]] = whileOp.getResult(c);
+  for (const std::string &r : definedInLoop)
+    if (std::find(carried.begin(), carried.end(), r) == carried.end())
+      regValue_.erase(r);
   return success();
 }
 

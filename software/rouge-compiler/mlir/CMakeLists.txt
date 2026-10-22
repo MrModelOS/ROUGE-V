@@ -399,7 +399,10 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND
   #                65 для .b64): добыто картой, см. README;
   #   vadd         первое НАСТОЯЩЕЕ nvcc-ядро (float-арифметика, range guard,
   #                block/grid id) — им фронтенд и проверяется;
-  #   cmp_signed   setp.lt/ge с .s32 против .u32 плюс selp.
+  #   cmp_signed   setp.lt/ge с .s32 против .u32 плюс selp;
+  #   block_reduce первое ядро с НАСТОЯЩИМ управляющим потоком: if/else nvcc,
+  #                цикл с прологом и хвостом, shared-память и bar.sync —
+  #                структурализатор, а не только арифметика.
   function(rouge_nvptx_cell name kernel selector block shapes workdir)
     add_test(NAME ${name}
       COMMAND ${CMAKE_COMMAND}
@@ -431,6 +434,24 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND
   rouge_nvptx_cell(mlir_rouge_nvptx_cmp_signed cmp_signed.ptx cmp_signed
                    64 "0=256xi32,1=64xi32"
                    ${CMAKE_CURRENT_BINARY_DIR}/nvptx-exec-cmp)
+  # block_reduce: N=2048, blockDim=256, gridDim=8: ровно конфигурация раннера.
+  rouge_nvptx_cell(mlir_rouge_nvptx_block_reduce block_reduce.ptx block_reduce
+                   256 "0=2048xf32,1=8xf32"
+                   ${CMAKE_CURRENT_BINARY_DIR}/nvptx-exec-block-reduce)
+
+  # А вот чего контур НЕ умеет — и обязан сказать это, а не выдать модуль,
+  # который считает не то. nvcc двигает указатель на тайл в конце итерации
+  # (`add.s64 %rd15, %rd15, 16`); восстановленная форма memref[индекс]
+  # статична, и шаг, свёрнутый в константу, читал бы ПЕРВЫЙ тайл каждую
+  # итерацию. Проверено картой: int8_gemm считался и получил
+  # CUDA_ERROR_ILLEGAL_ADDRESS. Ячейка держит отказ громким.
+  add_test(NAME mlir_ptx2mlir_moving_pointer
+    COMMAND $<TARGET_FILE:rouge-ptx2mlir>
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tests/kernels/cuda/int8_gemm.ptx
+            --block 16 --shape 0=5063xi8 --shape 1=3071xi8
+            --shape 2=2257xi32)
+  set_tests_properties(mlir_ptx2mlir_moving_pointer PROPERTIES
+    PASS_REGULAR_EXPRESSION "a moving pointer is not expressible yet")
 
   # ---- тот же фазер, но ТРЕТЬИМ путём: на карте ---------------------------
   #
