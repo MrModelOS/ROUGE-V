@@ -1058,12 +1058,143 @@ Value PtxToRougeEmitter::accessIndex(const MemAccess &acc) {
 }
 
 // The body of the kernel: the instructions, with the early exits turned into
-// scf.if.
+// scf.if and the backward branches turned into scf.while.
 LogicalResult PtxToRougeEmitter::emitBody() {
   const auto &body = fn_->body;
+  // Pre-scan: find the backward (unconditional) branches that close a loop.
+  // A "bra $L" with L's position < i is a back edge; L is the loop header.
+  std::map<size_t, size_t> loopBack;   // header index -> back-edge index
+  std::map<size_t, size_t> backHeader; // back-edge index -> header index
+  for (size_t i = 0; i < body.size(); ++i) {
+    const PtxInstruction &ins = body[i];
+    if (ins.op != "bra" || !ins.pred.empty()) continue;
+    if (ins.args.empty()) continue;
+    auto it = fn_->labels.find(ins.args[0]);
+    if (it == fn_->labels.end()) continue;
+    size_t target = (size_t)it->second;
+    if (target < i) {
+      loopBack[target] = i;
+      backHeader[i] = target;
+    }
+  }
+
   size_t i = 0;
   while (i < body.size()) {
     const PtxInstruction &ins = body[i];
+
+    // A loop: a backward branch closes the region [header, back_edge].
+    if (loopBack.count(i)) {
+      size_t back = loopBack[i];
+      // Find the exit condition: a forward conditional branch inside
+      // [i, back] whose target is beyond 'back'.
+      size_t exitBranch = body.size();
+      std::string exitPred;
+      for (size_t k = i; k < back; ++k) {
+        const PtxInstruction &cand = body[k];
+        if (cand.op == "bra" && !cand.pred.empty() && !cand.args.empty()) {
+          auto lit = fn_->labels.find(cand.args[0]);
+          if (lit != fn_->labels.end() && (size_t)lit->second > back) {
+            exitBranch = k;
+            exitPred = cand.pred;
+            break;
+          }
+        }
+      }
+      if (exitPred.empty())
+        return fail("a loop without an exit condition is not supported");
+
+      // The setp that defines the exit predicate.
+      size_t setpIdx = body.size();
+      for (size_t k = i; k < back; ++k) {
+        if (body[k].op.rfind("setp", 0) == 0 && !body[k].args.empty() &&
+            regName(body[k].args[0]) == exitPred) {
+          setpIdx = k;
+          break;
+        }
+      }
+      if (setpIdx == body.size())
+        return fail("the exit predicate of the loop is not a setp");
+
+      // Loop-carried registers: defined before 'i' and redefined inside
+      // [i, back-1].
+      std::set<std::string> definedBefore;
+      for (size_t k = 0; k < i; ++k)
+        if (!body[k].args.empty()) definedBefore.insert(regName(body[k].args[0]));
+      std::set<std::string> definedInLoop;
+      for (size_t k = i; k < back; ++k) {
+        if (body[k].op == "bra") continue;
+        if (!body[k].args.empty()) definedInLoop.insert(regName(body[k].args[0]));
+      }
+      std::vector<std::string> carried;
+      for (const std::string &r : definedInLoop)
+        if (definedBefore.count(r)) carried.push_back(r);
+      // (debug removed)
+
+      // Initial values for the carried registers.
+      SmallVector<Value> initVals;
+      for (const std::string &r : carried) {
+        Value v = valueOfReg(r);
+        if (!v) return fail("the loop-carried register '" + r +
+                            "' has no value before the loop");
+        initVals.push_back(v);
+      }
+
+      SmallVector<Type> carriedTypes;
+      for (const std::string &r : carried) carriedTypes.push_back(typeOfReg(r));
+
+      auto beforeBuilder = [&](OpBuilder &b, Location loc, ValueRange args) {
+        ImplicitLocOpBuilder saved = std::move(builder_);
+        builder_ = ImplicitLocOpBuilder(loc_, b);
+        for (size_t c = 0; c < carried.size(); ++c)
+          regValue_[carried[c]] = args[c];
+        if (failed(emitInstruction(body[setpIdx], setpIdx))) {
+          builder_ = std::move(saved);
+          return;
+        }
+        Value p = valueOfReg(exitPred);
+        if (!p) { builder_ = std::move(saved); return; }
+        Value notP = builder_.create<arith::XOrIOp>(
+            p, builder_.create<arith::ConstantOp>(builder_.getBoolAttr(true)))
+            .getResult();
+        SmallVector<Value> condYield;
+        for (const std::string &r : carried) condYield.push_back(valueOfReg(r));
+        builder_.create<scf::ConditionOp>(notP, condYield);
+        builder_ = std::move(saved);
+      };
+
+      auto afterBuilder = [&](OpBuilder &b, Location loc, ValueRange args) {
+        ImplicitLocOpBuilder saved = std::move(builder_);
+        builder_ = ImplicitLocOpBuilder(loc_, b);
+        for (size_t c = 0; c < carried.size(); ++c)
+          regValue_[carried[c]] = args[c];
+        for (size_t k = i; k < back; ++k) {
+          if (k == exitBranch) continue;
+          if (k == setpIdx) continue;
+          if (failed(emitInstruction(body[k], k))) {
+            builder_ = std::move(saved);
+            return;
+          }
+        }
+        SmallVector<Value> bodyYield;
+        for (size_t c = 0; c < carried.size(); ++c) {
+          Value v = valueOfReg(carried[c]);
+          if (!v) v = args[c];
+          bodyYield.push_back(v);
+        }
+        builder_.create<scf::YieldOp>(bodyYield);
+        builder_ = std::move(saved);
+      };
+
+      auto whileOp = scf::WhileOp::create(builder_, carriedTypes, initVals,
+                                          beforeBuilder, afterBuilder);
+
+      // After the loop: update regValue_ with the results.
+      for (size_t c = 0; c < carried.size(); ++c)
+        regValue_[carried[c]] = whileOp.getResult(c);
+
+      i = back + 1;
+      continue;
+    }
 
     // An early exit: "@%p bra $L" — the threads that take the branch skip
     // the block up to the label. This is the shape of every range guard.

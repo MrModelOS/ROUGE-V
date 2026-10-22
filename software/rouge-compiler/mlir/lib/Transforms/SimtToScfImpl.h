@@ -145,6 +145,15 @@ struct SimtLoweringBase {
     return found;
   }
 
+  // A kernel that already contains a loop (scf.while) cannot be phase-
+  // decomposed by this pass: the barrier split assumes a flat instruction
+  // stream. Refuse gracefully instead of crashing.
+  static bool hasNestedLoop(Operation *kernel) {
+    bool found = false;
+    kernel->walk([&](scf::WhileOp op) { found = true; });
+    return found;
+  }
+
   // The kernels that use SHARED memory (a memref with a non-default memory
   // space) are refused: the per-block copy of the shared memory would be
   // lost silently, and the accesses would read the wrong memory.
@@ -274,6 +283,13 @@ struct SimtLoweringBase {
                        "every thread of the scope must reach the same "
                        "instance of the barrier, so the result would be "
                        "undefined");
+      return failure();
+    }
+
+    if (hasNestedLoop(kernel)) {
+      kernel.emitError("a kernel containing a loop (scf.while) is not "
+                       "supported by this pass yet — the SIMT-to-SCF phase "
+                       "decomposition assumes a flat instruction stream");
       return failure();
     }
 
