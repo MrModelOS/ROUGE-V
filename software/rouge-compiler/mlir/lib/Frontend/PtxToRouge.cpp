@@ -906,6 +906,66 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       access_[i] = acc;
       continue;
     }
+    // Atomics: atom.* / red.* — the same address recovery as a load/store,
+    // plus a value operand (and, for cas, a compare and a new value).
+    if ((op.starts_with("atom.") || op.starts_with("red.")) &&
+        op.find(".param.") == StringRef::npos) {
+      const bool hasDst = op.starts_with("atom.");
+      const size_t addrArg = hasDst ? 1 : 0;
+      if (ins.args.size() < addrArg + 1) return fail("bad atomic");
+      std::string bracketed = stripBrackets(ins.args[addrArg]);
+      std::string addr = bracketed;
+      long long imm = 0;
+      bool hasImm = false;
+      size_t pos = bracketed.find('+');
+      size_t neg = bracketed.find('-', 1);
+      if (pos != std::string::npos) {
+        addr = bracketed.substr(0, pos);
+        std::string tok = bracketed.substr(pos + 1);
+        while (!tok.empty() && std::isspace((unsigned char)tok.front())) tok.erase(tok.begin());
+        while (!tok.empty() && std::isspace((unsigned char)tok.back())) tok.pop_back();
+        while (!addr.empty() && std::isspace((unsigned char)addr.back())) addr.pop_back();
+        char *end = nullptr;
+        long long v = strtoll(tok.c_str(), &end, 10);
+        if (end && *end == '\\0' && !tok.empty()) { imm = v; hasImm = true; }
+      } else if (neg != std::string::npos) {
+        addr = bracketed.substr(0, neg);
+        std::string tok = bracketed.substr(neg + 1);
+        while (!tok.empty() && std::isspace((unsigned char)tok.front())) tok.erase(tok.begin());
+        while (!tok.empty() && std::isspace((unsigned char)tok.back())) tok.pop_back();
+        while (!addr.empty() && std::isspace((unsigned char)addr.back())) addr.pop_back();
+        char *end = nullptr;
+        long long v = strtoll(tok.c_str(), &end, 10);
+        if (end && *end == '\\0' && !tok.empty()) { imm = -v; hasImm = true; }
+      }
+      while (!addr.empty() && std::isspace((unsigned char)addr.front())) addr.erase(addr.begin());
+      while (!addr.empty() && std::isspace((unsigned char)addr.back())) addr.pop_back();
+      const std::string reg = regName(addr);
+      auto it = ptrValue_.find(reg);
+      if (it == ptrValue_.end() || it->second.kind != PtrValue::Address)
+        return fail("the address of the atomic '" + ins.args[addrArg] +
+                    "' is not understood");
+      MemAccess acc;
+      acc.valid = true;
+      acc.paramIndex = it->second.addrParam;
+      acc.sharedIndex = it->second.addrShared;
+      acc.indexReg = it->second.indexReg;
+      acc.scale = it->second.scale;
+      acc.extraTerms = it->second.extraTerms;
+      acc.constBytes = it->second.constBytes + (hasImm ? imm : 0);
+      acc.isGlobal = it->second.isGlobal;
+      acc.elemType = typeFromSuffix(typeSuffix(op), ctx);
+      if (!acc.elemType)
+        return fail("the element type of the atomic '" + op.str() + "' is not known");
+      acc.elemBytes = bytesOf(acc.elemType);
+      if (!acc.indexReg.empty()) {
+        auto it2 = ptrValue_.find(acc.indexReg);
+        if (it2 != ptrValue_.end() && it2->second.isThreadId)
+          acc.indexIsThreadId = true;
+      }
+      access_[i] = acc;
+      continue;
+    }
   }
   return success();
 }
@@ -1427,6 +1487,39 @@ LogicalResult PtxToRougeEmitter::emitInstruction(const PtxInstruction &ins,
     if (op.starts_with("ld.")) {
       Value v = builder_.create<memref::LoadOp>(elem, base, ValueRange{idx});
       regValue_[dst] = v;
+      return success();
+    }
+    // Atomics: atom.* / red.* -> memref.atomic_rmw.
+    if (op.starts_with("atom.") || op.starts_with("red.")) {
+      const bool hasDst = op.starts_with("atom.");
+      if (op.find(".cas.") != std::string::npos)
+        return fail("atom.cas is not supported in the MLIR frontend yet");
+      const size_t valArg = hasDst ? 2 : 1;
+      if (ins.args.size() < valArg + 1) return fail("bad atomic");
+      arith::AtomicRMWKind kind;
+      const bool isMin = op.find(".min.") != std::string::npos;
+      const bool isMax = op.find(".max.") != std::string::npos;
+      const bool isExch = op.find(".exch.") != std::string::npos;
+      const bool isFloat = elem.isF32() || elem.isF64();
+      const bool isUnsigned = op.find(".u32") != std::string::npos ||
+                              op.find(".u64") != std::string::npos;
+      if (isExch) kind = arith::AtomicRMWKind::assign;
+      else if (op.find(".add.") != std::string::npos)
+        kind = isFloat ? arith::AtomicRMWKind::addf : arith::AtomicRMWKind::addi;
+      else if (isMin)
+        kind = isFloat ? arith::AtomicRMWKind::minimumf
+                       : (isUnsigned ? arith::AtomicRMWKind::minu
+                                     : arith::AtomicRMWKind::mins);
+      else if (isMax)
+        kind = isFloat ? arith::AtomicRMWKind::maximumf
+                       : (isUnsigned ? arith::AtomicRMWKind::maxu
+                                     : arith::AtomicRMWKind::maxs);
+      else return fail("unsupported atomic kind '" + op.str() + "'");
+      Value val = operandValue(ins.args[valArg], elem);
+      if (!val) return fail("the value of the atomic is not understood");
+      auto rmw = builder_.create<memref::AtomicRMWOp>(
+          elem, kind, val, base, ValueRange{idx});
+      if (hasDst) regValue_[dst] = rmw.getResult();
       return success();
     }
     // A store.
