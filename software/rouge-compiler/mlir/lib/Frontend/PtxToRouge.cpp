@@ -35,6 +35,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <cstdio>
 
 using namespace mlir;
 
@@ -55,12 +56,21 @@ struct PtrValue {
   bool isThreadId = false;
   // ParamPtr: the value of a kernel parameter (a pointer).
   int paramIndex = -1;
-  // Address / Offset: base + index * scale.
+  // Address / Offset: base + index * scale, plus a chain of extra byte-offset
+  // terms (the nvcc "demoted shared memory" form: mov.u32 %r, sym; add.s32
+  // chains) and a constant byte offset (the "[reg+imm]" access form).
   int addrParam = -1;      // the kernel parameter the address is based on
   int addrShared = -1;     // the shared variable the address is based on
   std::string indexReg;    // the register with the element index ("" = none)
   int scale = 1;           // the byte scale of the index
+  // Extra byte-offset terms: (register, scale). Each must satisfy
+  // scale == elemBytes at the access, otherwise the access is refused.
+  std::vector<std::pair<std::string, int>> extraTerms;
+  // A constant byte offset (from "[reg+imm]" or from "add reg, reg, imm").
+  long long constBytes = 0;
   bool isGlobal = true;    // global or shared
+  // True when the (primary) index register is the thread id.
+  // (kept above for clarity; field declared earlier)
 };
 
 // A memory access, recovered from the address arithmetic.
@@ -72,6 +82,8 @@ struct MemAccess {
   int sharedIndex = -1;
   std::string indexReg;
   int scale = 1;
+  std::vector<std::pair<std::string, int>> extraTerms;
+  long long constBytes = 0;
   bool isGlobal = true;
   Type elemType;
   int elemBytes = 4;
@@ -436,6 +448,25 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       continue;
     }
 
+    // mov.u32 %r, <shared symbol> -> a 32-bit shared address (nvcc's
+    // "demoted" form: it never goes through cvta; the symbol IS the base).
+    if (op.starts_with("mov.") && ins.args.size() >= 2) {
+      std::string src = regName(ins.args[1]);
+      // Strip brackets, if any.
+      if (!src.empty() && src.front() == '[' && src.back() == ']')
+        src = src.substr(1, src.size() - 2);
+      auto sit = sharedIndex.find(src);
+      if (sit != sharedIndex.end()) {
+        PtrValue pv;
+        pv.kind = PtrValue::Address;
+        pv.isGlobal = false;
+        pv.addrShared = sit->second;
+        ptrValue_[regName(ins.args[0])] = pv;
+        skip_.insert(i);
+        continue;
+      }
+    }
+
     // cvta.to.global.u64 %rd, %src -> the register holds an address.
     if (op.starts_with("cvta.")) {
       if (ins.args.size() < 2) return fail("bad cvta");
@@ -484,9 +515,45 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       pv.kind = PtrValue::Offset;
       pv.indexReg = idx;
       pv.scale = (int)scale;
+      auto it = ptrValue_.find(idx);
+      if (it != ptrValue_.end() && it->second.kind == PtrValue::Offset)
+        pv.constBytes = it->second.constBytes;
       ptrValue_[regName(ins.args[0])] = pv;
       skip_.insert(i);
       continue;
+    }
+
+    // mul.lo.* %r, %index, %scale -> a 32-bit offset (nvcc's demoted form
+    // computes byte offsets with mul.lo.s32 instead of mul.wide.u64).
+    if (op.starts_with("mul.lo.")) {
+      if (ins.args.size() < 3) return fail("bad mul.lo");
+      const std::string idx = regName(ins.args[1]);
+      const std::string &scaleTok = ins.args[2];
+      bool isImm = !scaleTok.empty() && (std::isdigit((unsigned char)scaleTok[0]) ||
+                                         scaleTok[0] == '-');
+      if (isImm) {
+        long scale = strtol(scaleTok.c_str(), nullptr, 10);
+        PtrValue pv;
+        pv.kind = PtrValue::Offset;
+        pv.indexReg = idx;
+        int baseScale = 1;
+        auto it = ptrValue_.find(idx);
+        long long baseConst = 0;
+        if (it != ptrValue_.end() && it->second.kind == PtrValue::Offset) {
+          baseScale = it->second.scale;
+          baseConst = it->second.constBytes;
+        }
+        pv.scale = baseScale * (int)scale;
+        // constBytes stays in the source's domain: mul.lo does not change
+        // the unit (it scales the index, not the byte offset).
+        pv.constBytes = baseConst;
+        ptrValue_[regName(ins.args[0])] = pv;
+        // Do NOT skip: mul.lo is also used for ordinary arithmetic, and the
+        // recovered access uses the source register, not this result. Skipping
+        // would leave regValue_ unset for the ordinary uses.
+        continue;
+      }
+      // Non-constant scale: fall through to the ordinary-value path.
     }
 
     // add.s64 %rd, %a, %b -> the base plus the offset.
@@ -497,19 +564,162 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       auto ai = ptrValue_.find(a);
       auto bi = ptrValue_.find(b);
       PtrValue pv;
+      bool ok = false;
       if (ai != ptrValue_.end() && ai->second.kind == PtrValue::Address &&
           bi != ptrValue_.end() && bi->second.kind == PtrValue::Offset) {
         pv = ai->second;
-        pv.indexReg = bi->second.indexReg;
-        pv.scale = bi->second.scale;
+        // Accumulate the offset term instead of replacing the previous one.
+        const PtrValue &o = bi->second;
+        if (pv.indexReg.empty() && pv.extraTerms.empty()) {
+          pv.indexReg = o.indexReg;
+          pv.scale = o.scale;
+        } else if (!o.indexReg.empty()) {
+          pv.extraTerms.push_back({o.indexReg, o.scale});
+        }
+        pv.extraTerms.insert(pv.extraTerms.end(), o.extraTerms.begin(),
+                            o.extraTerms.end());
+        pv.constBytes += o.constBytes;
+        ok = true;
       } else if (bi != ptrValue_.end() && bi->second.kind == PtrValue::Address &&
                  ai != ptrValue_.end() && ai->second.kind == PtrValue::Offset) {
         pv = bi->second;
-        pv.indexReg = ai->second.indexReg;
-        pv.scale = ai->second.scale;
-      } else {
+        const PtrValue &o = ai->second;
+        if (pv.indexReg.empty() && pv.extraTerms.empty()) {
+          pv.indexReg = o.indexReg;
+          pv.scale = o.scale;
+        } else if (!o.indexReg.empty()) {
+          pv.extraTerms.push_back({o.indexReg, o.scale});
+        }
+        pv.extraTerms.insert(pv.extraTerms.end(), o.extraTerms.begin(),
+                            o.extraTerms.end());
+        pv.constBytes += o.constBytes;
+        ok = true;
+      } else if (ai != ptrValue_.end() && ai->second.kind == PtrValue::Address) {
+        // Address + a constant immediate.
+        const std::string &tok = ins.args[2];
+        bool numeric = !tok.empty() &&
+                       (std::isdigit((unsigned char)tok[0]) || tok[0] == '-');
+        if (numeric) {
+          pv = ai->second;
+          char *end = nullptr;
+          long long imm = strtoll(tok.c_str(), &end, 10);
+          if (end && *end == '\0') {
+            pv.constBytes += imm;
+            ok = true;
+          }
+        }
+      } else if (bi != ptrValue_.end() && bi->second.kind == PtrValue::Address) {
+        const std::string &tok = ins.args[1];
+        bool numeric = !tok.empty() &&
+                       (std::isdigit((unsigned char)tok[0]) || tok[0] == '-');
+        if (numeric) {
+          pv = bi->second;
+          char *end = nullptr;
+          long long imm = strtoll(tok.c_str(), &end, 10);
+          if (end && *end == '\0') {
+            pv.constBytes += imm;
+            ok = true;
+          }
+        }
+      }
+      if (!ok) {
         // A plain 64-bit addition: an ordinary value.
         continue;
+      }
+      ptrValue_[regName(ins.args[0])] = pv;
+      skip_.insert(i);
+      continue;
+    }
+
+    // add.s32 / add.u32 %r, %a, %b -> base plus offset (nvcc's 32-bit
+    // demoted form). Mirrors the 64-bit case, including the accumulation of
+    // extra byte-offset terms and constant byte offsets.
+    if (op == "add.s32" || op == "add.u32") {
+      if (ins.args.size() < 3) return fail("bad add.s32");
+      const std::string a = regName(ins.args[1]);
+      const std::string b = regName(ins.args[2]);
+      auto ai = ptrValue_.find(a);
+      auto bi = ptrValue_.find(b);
+      PtrValue pv;
+      bool ok = false;
+      // Address + Offset
+      if (ai != ptrValue_.end() && ai->second.kind == PtrValue::Address &&
+          bi != ptrValue_.end() && bi->second.kind == PtrValue::Offset) {
+        pv = ai->second;
+        const PtrValue &o = bi->second;
+        if (pv.indexReg.empty() && pv.extraTerms.empty()) {
+          pv.indexReg = o.indexReg;
+          pv.scale = o.scale;
+        } else if (!o.indexReg.empty()) {
+          pv.extraTerms.push_back({o.indexReg, o.scale});
+        }
+        pv.extraTerms.insert(pv.extraTerms.end(), o.extraTerms.begin(),
+                            o.extraTerms.end());
+        pv.constBytes += o.constBytes;
+        ok = true;
+      } else if (bi != ptrValue_.end() && bi->second.kind == PtrValue::Address &&
+                 ai != ptrValue_.end() && ai->second.kind == PtrValue::Offset) {
+        pv = bi->second;
+        const PtrValue &o = ai->second;
+        if (pv.indexReg.empty() && pv.extraTerms.empty()) {
+          pv.indexReg = o.indexReg;
+          pv.scale = o.scale;
+        } else if (!o.indexReg.empty()) {
+          pv.extraTerms.push_back({o.indexReg, o.scale});
+        }
+        pv.extraTerms.insert(pv.extraTerms.end(), o.extraTerms.begin(),
+                            o.extraTerms.end());
+        pv.constBytes += o.constBytes;
+        ok = true;
+      } else if (ai != ptrValue_.end() && ai->second.kind == PtrValue::Address) {
+        const std::string &tok = ins.args[2];
+        bool numeric = !tok.empty() &&
+                       (std::isdigit((unsigned char)tok[0]) || tok[0] == '-');
+        if (numeric) {
+          pv = ai->second;
+          char *end = nullptr;
+          long long imm = strtoll(tok.c_str(), &end, 10);
+          if (end && *end == '\0') {
+            pv.constBytes += imm;
+            ok = true;
+          }
+        }
+      } else if (bi != ptrValue_.end() && bi->second.kind == PtrValue::Address) {
+        const std::string &tok = ins.args[1];
+        bool numeric = !tok.empty() &&
+                       (std::isdigit((unsigned char)tok[0]) || tok[0] == '-');
+        if (numeric) {
+          pv = bi->second;
+          char *end = nullptr;
+          long long imm = strtoll(tok.c_str(), &end, 10);
+          if (end && *end == '\0') {
+            pv.constBytes += imm;
+            ok = true;
+          }
+        }
+      }
+      if (!ok) {
+        // A plain 32-bit addition: an ordinary value.
+        continue;
+      }
+      pv.kind = (ai != ptrValue_.end() && (ai->second.kind == PtrValue::Address ||
+                  (bi != ptrValue_.end() && bi->second.kind == PtrValue::Address)))
+                ? PtrValue::Address : PtrValue::Offset;
+      // Preserve address-ness: if either side was an Address, the result is.
+      if ((ai != ptrValue_.end() && ai->second.kind == PtrValue::Address) ||
+          (bi != ptrValue_.end() && bi->second.kind == PtrValue::Address))
+        pv.kind = PtrValue::Address;
+      else
+        pv.kind = PtrValue::Offset;
+      // Preserve addrParam/addrShared/isGlobal from the address side if present.
+      if (ai != ptrValue_.end() && ai->second.kind == PtrValue::Address) {
+        pv.addrParam = ai->second.addrParam;
+        pv.addrShared = ai->second.addrShared;
+        pv.isGlobal = ai->second.isGlobal;
+      } else if (bi != ptrValue_.end() && bi->second.kind == PtrValue::Address) {
+        pv.addrParam = bi->second.addrParam;
+        pv.addrShared = bi->second.addrShared;
+        pv.isGlobal = bi->second.isGlobal;
       }
       ptrValue_[regName(ins.args[0])] = pv;
       skip_.insert(i);
@@ -526,17 +736,34 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       pv.kind = PtrValue::Offset;
       pv.indexReg = regName(ins.args[0]);
       pv.scale = 1;
-      if (it != ptrValue_.end() && it->second.kind == PtrValue::Offset)
+      if (it != ptrValue_.end() && it->second.kind == PtrValue::Offset) {
         pv.scale = it->second.scale;
+        pv.extraTerms = it->second.extraTerms;
+        pv.constBytes = it->second.constBytes;
+        pv.isThreadId = it->second.isThreadId;
+      } else if (it != ptrValue_.end() && it->second.kind == PtrValue::Address) {
+        // A conversion of an address: keep it as an address (the base is
+        // preserved; the index candidate is the destination register).
+        pv.kind = PtrValue::Address;
+        pv.addrParam = it->second.addrParam;
+        pv.addrShared = it->second.addrShared;
+        pv.isGlobal = it->second.isGlobal;
+        pv.indexReg = it->second.indexReg;
+        pv.scale = it->second.scale;
+        pv.extraTerms = it->second.extraTerms;
+        pv.constBytes = it->second.constBytes;
+        pv.isThreadId = it->second.isThreadId;
+      }
       ptrValue_[regName(ins.args[0])] = pv;
       continue;
     }
 
-    // A move of the thread id: the value IS the thread id, and the
-    // vectoriser recognises it as such (a unit-stride access).
+    // A move of the thread id (x dimension only): the value IS the thread id,
+    // and the vectoriser recognises it as such (a unit-stride access).
     if (op.starts_with("mov.") && ins.args.size() > 1) {
       std::string src = regName(ins.args[1]);
-      if (src.rfind("tid.", 0) == 0 || src == "tid") {
+      bool isTidX = (src == "tid" || src == "tid.x");
+      if (isTidX) {
         PtrValue pv;
         pv.kind = PtrValue::Offset;
         pv.indexReg = regName(ins.args[0]);
@@ -566,8 +793,38 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
     // A memory access: the address register must be understood.
     if (op.starts_with("ld.") && op.find(".param.") == StringRef::npos) {
       if (ins.args.size() < 2) return fail("bad load");
-      const std::string addr = regName(stripBrackets(ins.args[1]));
-      auto it = ptrValue_.find(addr);
+      // The access may carry a constant byte offset: "[reg+imm]" or "[reg-imm]".
+      std::string bracketed = stripBrackets(ins.args[1]);
+      std::string addr = bracketed;
+      long long imm = 0;
+      bool hasImm = false;
+      size_t pos = bracketed.find('+');
+      size_t neg = bracketed.find('-', 1);
+      if (pos != std::string::npos) {
+        addr = bracketed.substr(0, pos);
+        std::string tok = bracketed.substr(pos + 1);
+        // trim
+        while (!tok.empty() && std::isspace((unsigned char)tok.front())) tok.erase(tok.begin());
+        while (!tok.empty() && std::isspace((unsigned char)tok.back())) tok.pop_back();
+        while (!addr.empty() && std::isspace((unsigned char)addr.back())) addr.pop_back();
+        char *end = nullptr;
+        long long v = strtoll(tok.c_str(), &end, 10);
+        if (end && *end == '\0' && !tok.empty()) { imm = v; hasImm = true; }
+      } else if (neg != std::string::npos) {
+        addr = bracketed.substr(0, neg);
+        std::string tok = bracketed.substr(neg + 1);
+        while (!tok.empty() && std::isspace((unsigned char)tok.front())) tok.erase(tok.begin());
+        while (!tok.empty() && std::isspace((unsigned char)tok.back())) tok.pop_back();
+        while (!addr.empty() && std::isspace((unsigned char)addr.back())) addr.pop_back();
+        char *end = nullptr;
+        long long v = strtoll(tok.c_str(), &end, 10);
+        if (end && *end == '\0' && !tok.empty()) { imm = -v; hasImm = true; }
+      }
+      // trim addr
+      while (!addr.empty() && std::isspace((unsigned char)addr.front())) addr.erase(addr.begin());
+      while (!addr.empty() && std::isspace((unsigned char)addr.back())) addr.pop_back();
+      const std::string reg = regName(addr);
+      auto it = ptrValue_.find(reg);
       if (it == ptrValue_.end() || it->second.kind != PtrValue::Address)
         return fail("the address of the load '" + ins.args[1] +
                     "' is not understood: the front-end recovers only "
@@ -578,14 +835,16 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       acc.sharedIndex = it->second.addrShared;
       acc.indexReg = it->second.indexReg;
       acc.scale = it->second.scale;
+      acc.extraTerms = it->second.extraTerms;
+      acc.constBytes = it->second.constBytes + (hasImm ? imm : 0);
       acc.isGlobal = it->second.isGlobal;
       acc.elemType = typeFromSuffix(typeSuffix(op), ctx);
       if (!acc.elemType)
         return fail("the element type of the load '" + op.str() + "' is not known");
       acc.elemBytes = bytesOf(acc.elemType);
       if (!acc.indexReg.empty()) {
-        auto it = ptrValue_.find(acc.indexReg);
-        if (it != ptrValue_.end() && it->second.isThreadId)
+        auto it2 = ptrValue_.find(acc.indexReg);
+        if (it2 != ptrValue_.end() && it2->second.isThreadId)
           acc.indexIsThreadId = true;
       }
       access_[i] = acc;
@@ -593,8 +852,35 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
     }
     if (op.starts_with("st.") && op.find(".param.") == StringRef::npos) {
       if (ins.args.size() < 2) return fail("bad store");
-      const std::string addr = regName(stripBrackets(ins.args[0]));
-      auto it = ptrValue_.find(addr);
+      std::string bracketed = stripBrackets(ins.args[0]);
+      std::string addr = bracketed;
+      long long imm = 0;
+      bool hasImm = false;
+      size_t pos = bracketed.find('+');
+      size_t neg = bracketed.find('-', 1);
+      if (pos != std::string::npos) {
+        addr = bracketed.substr(0, pos);
+        std::string tok = bracketed.substr(pos + 1);
+        while (!tok.empty() && std::isspace((unsigned char)tok.front())) tok.erase(tok.begin());
+        while (!tok.empty() && std::isspace((unsigned char)tok.back())) tok.pop_back();
+        while (!addr.empty() && std::isspace((unsigned char)addr.back())) addr.pop_back();
+        char *end = nullptr;
+        long long v = strtoll(tok.c_str(), &end, 10);
+        if (end && *end == '\0' && !tok.empty()) { imm = v; hasImm = true; }
+      } else if (neg != std::string::npos) {
+        addr = bracketed.substr(0, neg);
+        std::string tok = bracketed.substr(neg + 1);
+        while (!tok.empty() && std::isspace((unsigned char)tok.front())) tok.erase(tok.begin());
+        while (!tok.empty() && std::isspace((unsigned char)tok.back())) tok.pop_back();
+        while (!addr.empty() && std::isspace((unsigned char)addr.back())) addr.pop_back();
+        char *end = nullptr;
+        long long v = strtoll(tok.c_str(), &end, 10);
+        if (end && *end == '\0' && !tok.empty()) { imm = -v; hasImm = true; }
+      }
+      while (!addr.empty() && std::isspace((unsigned char)addr.front())) addr.erase(addr.begin());
+      while (!addr.empty() && std::isspace((unsigned char)addr.back())) addr.pop_back();
+      const std::string reg = regName(addr);
+      auto it = ptrValue_.find(reg);
       if (it == ptrValue_.end() || it->second.kind != PtrValue::Address)
         return fail("the address of the store '" + ins.args[0] +
                     "' is not understood: the front-end recovers only "
@@ -605,14 +891,16 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       acc.sharedIndex = it->second.addrShared;
       acc.indexReg = it->second.indexReg;
       acc.scale = it->second.scale;
+      acc.extraTerms = it->second.extraTerms;
+      acc.constBytes = it->second.constBytes + (hasImm ? imm : 0);
       acc.isGlobal = it->second.isGlobal;
       acc.elemType = typeFromSuffix(typeSuffix(op), ctx);
       if (!acc.elemType)
         return fail("the element type of the store '" + op.str() + "' is not known");
       acc.elemBytes = bytesOf(acc.elemType);
       if (!acc.indexReg.empty()) {
-        auto it = ptrValue_.find(acc.indexReg);
-        if (it != ptrValue_.end() && it->second.isThreadId)
+        auto it2 = ptrValue_.find(acc.indexReg);
+        if (it2 != ptrValue_.end() && it2->second.isThreadId)
           acc.indexIsThreadId = true;
       }
       access_[i] = acc;
@@ -658,32 +946,39 @@ Value PtxToRougeEmitter::operandValue(StringRef tok, Type type) {
     }
     return {};
   }
-  // A special register (%tid.x, %ctaid.x, %ntid.x, %nctaid.x).
+  // A special register (%tid.x/.y/.z, %ctaid.x/.y/.z, ...).
   std::string name = regName(tok);
-  if (name.size() > 2 && name.compare(name.size() - 2, 2, ".x") == 0)
-    name = name.substr(0, name.size() - 2);
+  rouge::Dimension dim = rouge::Dimension::x;
+  if (name.size() > 2 && name[name.size()-2] == '.') {
+    char suf = name.back();
+    if (suf == 'x' || suf == 'y' || suf == 'z') {
+      if (suf == 'y') dim = rouge::Dimension::y;
+      else if (suf == 'z') dim = rouge::Dimension::z;
+      name = name.substr(0, name.size() - 2);
+    }
+  }
   if (name == "tid") {
     auto op = builder_.create<rouge::ThreadIdOp>(
         loc_, builder_.getIndexType(),
-        rouge::DimensionAttr::get(module_.getContext(), rouge::Dimension::x));
+        rouge::DimensionAttr::get(module_.getContext(), dim));
     return op.getResult();
   }
   if (name == "ctaid") {
     auto op = builder_.create<rouge::BlockIdOp>(
         loc_, builder_.getIndexType(),
-        rouge::DimensionAttr::get(module_.getContext(), rouge::Dimension::x));
+        rouge::DimensionAttr::get(module_.getContext(), dim));
     return op.getResult();
   }
   if (name == "ntid") {
     auto op = builder_.create<rouge::BlockDimOp>(
         loc_, builder_.getIndexType(),
-        rouge::DimensionAttr::get(module_.getContext(), rouge::Dimension::x));
+        rouge::DimensionAttr::get(module_.getContext(), dim));
     return op.getResult();
   }
   if (name == "nctaid") {
     auto op = builder_.create<rouge::GridDimOp>(
         loc_, builder_.getIndexType(),
-        rouge::DimensionAttr::get(module_.getContext(), rouge::Dimension::x));
+        rouge::DimensionAttr::get(module_.getContext(), dim));
     return op.getResult();
   }
   // An ordinary register.
@@ -692,35 +987,74 @@ Value PtxToRougeEmitter::operandValue(StringRef tok, Type type) {
 
 // The index of an access, in elements.
 Value PtxToRougeEmitter::accessIndex(const MemAccess &acc) {
-  // The index is the thread id: keep it that way (the vectoriser
-  // recognises "the thread id + a constant" as a unit-stride access).
-  if (acc.indexIsThreadId) {
-    auto op = builder_.create<rouge::ThreadIdOp>(
+  MLIRContext *ctx = module_.getContext();
+  const int eb = acc.elemBytes;
+  // Thread id fast path: keep the bare thread id (or thread id + a constant)
+  // so the vectoriser recognises a unit-stride access.
+  if (acc.indexIsThreadId && acc.extraTerms.empty()) {
+    if (acc.scale != eb) return {};
+    auto tid = builder_.create<rouge::ThreadIdOp>(
         loc_, builder_.getIndexType(),
-        rouge::DimensionAttr::get(module_.getContext(), rouge::Dimension::x));
-    return op.getResult();
+        rouge::DimensionAttr::get(ctx, rouge::Dimension::x));
+    Value idx = tid.getResult();
+    if (acc.constBytes != 0) {
+      if (acc.constBytes % eb != 0) return {};
+      long long c = acc.constBytes / eb;
+      Value cv = builder_.create<arith::ConstantIndexOp>(loc_, c);
+      idx = builder_.create<arith::AddIOp>(idx, cv).getResult();
+    }
+    return idx;
   }
-  Value raw;
-  if (!acc.indexReg.empty()) raw = valueOfReg(acc.indexReg);
-  if (!raw) {
-    // No index: the first element.
-    auto intTy = dyn_cast<IntegerType>(acc.elemType);
-    if (intTy)
-      raw = builder_.create<arith::ConstantOp>(
-          loc_, builder_.getIntegerAttr(intTy, 0));
+
+  // Build the primary term.
+  Value idx;
+  if (acc.indexIsThreadId) {
+    auto tid = builder_.create<rouge::ThreadIdOp>(
+        loc_, builder_.getIndexType(),
+        rouge::DimensionAttr::get(ctx, rouge::Dimension::x));
+    idx = tid.getResult();
+    if (acc.scale != eb) return {};
+  } else if (!acc.indexReg.empty()) {
+    Value raw = valueOfReg(acc.indexReg);
+    if (!raw) return {};
+    if (acc.scale != eb) return {};
+    if (raw.getType().isIndex()) idx = raw;
+    else if (auto intTy = dyn_cast<IntegerType>(raw.getType())) {
+      if (intTy.getWidth() == 1) return {};
+      idx = builder_.create<arith::IndexCastOp>(builder_.getIndexType(), raw)
+                .getResult();
+    } else return {};
+  } else {
+    idx = builder_.create<arith::ConstantIndexOp>(loc_, 0);
   }
-  if (!raw) return {};
-  // The scale must be exactly the element size: the front-end does not
-  // divide (a division would break the vectoriser, which needs the index to
-  // be "the thread plus a constant").
-  if (acc.scale != acc.elemBytes) return {};
-  // The index: an integer -> an index.
-  if (raw.getType().isIndex()) return raw;
-  if (auto intTy = dyn_cast<IntegerType>(raw.getType())) {
-    if (intTy.getWidth() == 1) return {};
-    return builder_.create<arith::IndexCastOp>(builder_.getIndexType(), raw);
+  if (!idx) return {};
+
+  // Extra byte-offset terms.
+  for (const auto &t : acc.extraTerms) {
+    const std::string &reg = t.first;
+    int scale = t.second;
+    if (scale != eb) return {};
+    Value raw = valueOfReg(reg);
+    if (!raw) return {};
+    Value v;
+    if (raw.getType().isIndex()) v = raw;
+    else if (auto intTy = dyn_cast<IntegerType>(raw.getType())) {
+      if (intTy.getWidth() == 1) return {};
+      v = builder_.create<arith::IndexCastOp>(builder_.getIndexType(), raw)
+              .getResult();
+    } else return {};
+    idx = builder_.create<arith::AddIOp>(idx, v).getResult();
   }
-  return {};
+
+  // Constant byte offset.
+  if (acc.constBytes != 0) {
+    if (acc.constBytes % eb != 0) return {};
+    long long c = acc.constBytes / eb;
+    Value cv = builder_.create<arith::ConstantIndexOp>(loc_, c);
+    idx = builder_.create<arith::AddIOp>(idx, cv).getResult();
+  }
+
+  return idx;
 }
 
 // The body of the kernel: the instructions, with the early exits turned into

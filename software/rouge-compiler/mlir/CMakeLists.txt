@@ -285,6 +285,25 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND
             --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
   set_tests_properties(compiler_mlir_fuzz_phases PROPERTIES TIMEOUT 900)
 
+  # Тот же фазер, но на ядре, где общая память адресуется «как у nvcc»:
+  # mov.u32 %r, <shared symbol>, цепочки add.s32 и доступы [reg+imm]. Это
+  # проверяет восстановление демотированной адресной арифметики фронтендом.
+  add_test(NAME compiler_mlir_fuzz_demoted
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/run_fuzz_mlir.py
+            --ptx2mlir $<TARGET_FILE:rouge-ptx2mlir>
+            --rouge-opt $<TARGET_FILE:rouge-opt>
+            --gen $<TARGET_FILE:fuzz_gen_kernel>
+            --interp $<TARGET_FILE:fuzz_run_interp>
+            --mlir-opt ${MLIR_OPT_EXE}
+            --mlir-translate ${MLIR_TRANSLATE_EXE}
+            --clang ${CLANG_EXECUTABLE}
+            --runtime $<TARGET_FILE:mlir_print_i32>
+            --template demoted
+            --iters 8
+            --work ${CMAKE_CURRENT_BINARY_DIR}/fuzz-work-mlir-demoted
+            --cases ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fuzz/cases)
+  set_tests_properties(compiler_mlir_fuzz_demoted PROPERTIES TIMEOUT 900)
   # Каждый сохранённый провал — это ядро, которое когда-то нашло баг (так был
   # найден `prmt`, терявший маску байта). Оно повторяется на том же входе и
   # обязано проходить. Это регрессионный тест, а не «пример вывода»: падение

@@ -204,6 +204,71 @@ std::string phasesKernel(uint64_t seed) {
   return p;
 }
 
+// The "demoted" template: the same shape as "phases", but the shared-memory
+// addresses are built the way nvcc actually emits them — a 32-bit
+// "mov.u32 %r, <shared symbol>" base, chained "add.s32", and "[reg+imm]"
+// accesses — instead of "cvta.shared.u64" + "add.s64". This exercises the
+// front-end's demoted-shared address recovery.
+std::string demotedKernel(uint64_t seed) {
+  Rng rng(seed);
+  const unsigned k1 = 1 + rng.u32(7);
+  const unsigned k2 = 1 + rng.u32(101);
+  std::string p;
+  p += "// ROUGE-V differential fuzzer kernel (generated, do not edit).\n";
+  p += "// template=demoted seed=" + std::to_string(seed) + "\n";
+  p += ".version 8.0\n.target sm_75\n.address_size 64\n\n";
+  p += ".visible .entry fuzz_kernel(\n";
+  p += "    .param .u64 fuzz_kernel_param_0,\n";
+  p += "    .param .u64 fuzz_kernel_param_1,\n";
+  p += "    .param .u32 fuzz_kernel_param_2,\n";
+  p += "    .param .u32 fuzz_kernel_param_3\n";
+  p += ")\n{\n";
+  p += "    .shared .align 4 .b8 sdata[256];\n";
+  p += "    .reg .b32 %r<32>;\n";
+  p += "    .reg .b64 %rd<16>;\n\n";
+  p += "    ld.param.u64 %rd1, [fuzz_kernel_param_0];\n";
+  p += "    ld.param.u64 %rd2, [fuzz_kernel_param_1];\n";
+  p += "    ld.param.u32 %r1, [fuzz_kernel_param_2];\n";
+  p += "    ld.param.u32 %r2, [fuzz_kernel_param_3];\n";
+  p += "    cvta.to.global.u64 %rd3, %rd1;\n";
+  p += "    cvta.to.global.u64 %rd4, %rd2;\n";
+  p += "    mov.u32 %r6, %tid.x;\n";
+  p += "    mul.wide.u32 %rd7, %r6, 4;\n";
+  // The first phase: the shared memory is filled by the thread with the
+  // same index (demoted shared addressing).
+  p += "    add.s64 %rd8, %rd4, %rd7;\n";
+  p += "    ld.global.s32 %r7, [%rd8];\n";
+  p += "    add.s32 %r7, %r7, %r2;\n";
+  p += "    mov.u32 %r20, sdata;\n";
+  p += "    mul.lo.s32 %r21, %r6, 4;\n";
+  p += "    add.s32 %r22, %r20, %r21;\n";
+  p += "    st.shared.s32 [%r22], %r7;\n";
+  p += "    bar.sync 0;\n";
+  // The second phase: a DIFFERENT thread reads every element (n-1-tid),
+  // with one access using the "[reg+imm]" form.
+  p += "    sub.s32 %r8, %r1, %r6;\n";
+  p += "    sub.s32 %r8, %r8, 1;\n";
+  p += "    mul.lo.s32 %r23, %r8, 4;\n";
+  p += "    add.s32 %r24, %r20, %r23;\n";
+  p += "    ld.shared.s32 %r9, [%r24];\n";
+  p += "    mad.lo.s32 %r10, %r9, " + std::to_string(k1) + ", " +
+       std::to_string(k2) + ";\n";
+  p += "    xor.b32 %r11, %r10, %r2;\n";
+  p += "    mul.lo.s32 %r12, %r10, 3;\n";
+  p += "    sub.s32 %r13, %r11, %r12;\n";
+  const char* vals[4] = {"%r10", "%r11", "%r12", "%r13"};
+  for (int j = 0; j < kOutPerThread; ++j) {
+    p += "    mul.lo.s32 %r14, %r6, " +
+         std::to_string(kOutPerThread) + ";\n";
+    p += "    add.s32 %r14, %r14, " + std::to_string(j) + ";\n";
+    p += "    mul.wide.u32 %rd13, %r14, 4;\n";
+    p += "    add.s64 %rd13, %rd13, %rd3;\n";
+    p += "    st.global.s32 [%rd13], " + std::string(vals[j]) + ";\n";
+  }
+  p += "    ret;\n}\n";
+  return p;
+}
+
 // The three files of one fuzz case: the PTX text, the input blob and the
 // metadata the driver reads.
 int writeOutputs(const std::string& ptx, const std::vector<int>& input,
@@ -263,7 +328,7 @@ int main(int argc, char** argv) {
       forcedOps = argv[++i];
     } else if (!strcmp(argv[i], "--template") && i + 1 < argc) {
       tpl = argv[++i];
-      if (tpl != "chain" && tpl != "phases") {
+      if (tpl != "chain" && tpl != "phases" && tpl != "demoted") {
         std::fprintf(stderr, "gen_kernel: unknown template '%s'\n",
                      tpl.c_str());
         return 2;
@@ -300,6 +365,8 @@ int main(int argc, char** argv) {
   // генератор цепочки операций здесь не участвует.
   if (tpl == "phases") return writeOutputs(phasesKernel(seed), input, seed,
                                            outPath, inPath, metaPath);
+  if (tpl == "demoted") return writeOutputs(demotedKernel(seed), input, seed,
+                                            outPath, inPath, metaPath);
 
   // Цепочка операций: одна на каждый «результат» (K регистров), плюс
   // несколько общих шагов.
