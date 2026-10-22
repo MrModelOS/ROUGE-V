@@ -42,7 +42,9 @@ software/rouge-compiler/tests/real_nvcc.ptx
 internal/
 
 # Случайная папка в корне (переехала в software/rouge-compiler/tests/kernels)
-kernels/
+# Якорь в начале обязателен: без него правило накрывает и вложенные
+# tests/kernels/, где лежат канонические ядра (они в репозитории).
+/kernels/
 
 # Pitch & publishing (not part of the project)
 pitch/

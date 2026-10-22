@@ -1378,14 +1378,28 @@ int run_thread_step(const PtxFunction& fn, const std::vector<uint8_t>& blob,
         else if (op.rfind("xor.", 0) == 0) r = a ^ b;
         else if (unary) r = ~a;
         else {
-          // PTX shift amounts are taken modulo the operand width.
-          const unsigned sh =
-              static_cast<unsigned>(b & (bits == 64 ? 63ull : 31ull));
-          if (op.rfind("shl.", 0) == 0) r = a << sh;
-          else if (is_signed_int_type(op))
-            r = (bits == 64) ? sar64(a, sh) : sar32(static_cast<uint32_t>(a), sh);
-          else
-            r = (bits == 64) ? (a >> sh) : (static_cast<uint32_t>(a) >> sh);
+          // PTX ISA 9.7.9.8/9.7.9.9: "shift amounts greater than the register
+          // width N are clamped to N" — NOT taken modulo N. shl.b32 1, 33 is
+          // 0, not 2; shr.s32 -16, 33 is -1, not -8. The hardware agrees (the
+          // shift_probe kernel in the fuzz corpus pins this down). The amount
+          // is a 32-bit value regardless of the instruction's width.
+          const uint64_t raw = static_cast<uint32_t>(b);
+          if (raw >= static_cast<uint64_t>(bits)) {
+            if (op.rfind("shl.", 0) == 0) r = 0;
+            else if (!is_signed_int_type(op)) r = 0;
+            else if (bits == 64) r = (static_cast<int64_t>(a) < 0) ? ~0ull : 0ull;
+            else r = (static_cast<int32_t>(static_cast<uint32_t>(a)) < 0)
+                         ? 0xffffffffull
+                         : 0ull;
+          } else {
+            const unsigned sh = static_cast<unsigned>(raw);
+            if (op.rfind("shl.", 0) == 0) r = a << sh;
+            else if (is_signed_int_type(op))
+              r = (bits == 64) ? sar64(a, sh)
+                               : sar32(static_cast<uint32_t>(a), sh);
+            else
+              r = (bits == 64) ? (a >> sh) : (static_cast<uint32_t>(a) >> sh);
+          }
         }
         st.setreg(A[0], width_mask(r, bits));
         st.pc = next_pc;

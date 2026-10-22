@@ -997,13 +997,21 @@ Value PtxToRougeEmitter::constInt(Type t, int64_t v) {
 // The value of an operand: a register, an immediate or a special register.
 Value PtxToRougeEmitter::operandValue(StringRef tok, Type type) {
   if (tok.empty()) return {};
-  // A number?
+  // A number? A leading '-' is part of the literal: `mov.s32 %r, -16` is
+  // what nvcc emits for a negative constant, and refusing it would refuse a
+  // kernel for no good reason. A lone sign is not a number (see below).
   bool numeric = true;
   for (char c : tok)
     if (!std::isdigit((unsigned char)c) && c != '-' && c != '+') numeric = false;
-  if (numeric && !tok.empty() && tok[0] != '-') {
+  if (numeric && !tok.empty() &&
+      tok.find_first_of("0123456789") != StringRef::npos) {
+    // The sign is handled here: StringRef::getAsInteger does not take one.
+    const bool negative = tok[0] == '-';
+    StringRef digits = tok;
+    if (negative || tok[0] == '+') digits = digits.drop_front();
     APInt value(64, 0);
-    if (!tok.getAsInteger(10, value)) {
+    if (!digits.getAsInteger(10, value)) {
+      if (negative) value = -value;
       if (auto intTy = dyn_cast<IntegerType>(type))
         return builder_.create<arith::ConstantOp>(
             builder_.getIntegerAttr(intTy, value.trunc(intTy.getWidth())));
@@ -1689,16 +1697,45 @@ LogicalResult PtxToRougeEmitter::emitInstruction(const PtxInstruction &ins,
     }
     if (o.rfind("shl.", 0) == 0 || o.rfind("shr.", 0) == 0) {
       Type t = typeOfReg(dst);
+      auto intTy = dyn_cast<IntegerType>(t);
+      if (!intTy) return fail("a shift of a non-integer is not supported");
+      const unsigned bits = intTy.getWidth();
       Value a = operandValue(ins.args[1], t);
       Value b = operandValue(ins.args[2], t);
       if (!a || !b) return fail("the shift is not understood ('" + op.str() + "')");
-      Value v;
-      if (o.rfind("shl.", 0) == 0)
-        v = builder_.create<arith::ShLIOp>(a, b).getResult();
-      else if (o.find(".u") != std::string::npos)
-        v = builder_.create<arith::ShRUIOp>(a, b).getResult();
-      else
-        v = builder_.create<arith::ShRSIOp>(a, b).getResult();
+      // PTX ISA 9.7.9.8/9.7.9.9: "shift amounts greater than the register
+      // width N are clamped to N". arith.shli/shrui/shrai are POISON from N
+      // on (they lower to LLVM's shifts), so the clamp is explicit here:
+      // shift by (b & (N-1)), which is always legal, and select the
+      // saturated result when b >= N (0 for shl/shr.u, the sign fill for
+      // shr.s). The amount is a .u32 value regardless of the width.
+      if (b.getType() != t) {
+        auto bTy = dyn_cast<IntegerType>(b.getType());
+        if (!bTy) return fail("the shift amount is not an integer");
+        b = bTy.getWidth() < bits
+                ? builder_.create<arith::ExtUIOp>(loc_, t, b).getResult()
+                : builder_.create<arith::TruncIOp>(loc_, t, b).getResult();
+      }
+      auto iconst = [&](uint64_t v) -> Value {
+        return builder_.create<arith::ConstantOp>(
+            loc_, builder_.getIntegerAttr(intTy, v));
+      };
+      const bool isShl = o.rfind("shl.", 0) == 0;
+      const bool isSigned = !isShl && o.find(".s") != std::string::npos;
+      Value sh = builder_.create<arith::AndIOp>(loc_, b, iconst(bits - 1));
+      Value raw = isShl ? builder_
+                              .create<arith::ShLIOp>(loc_, a, sh)
+                              .getResult()
+                  : isSigned
+                      ? builder_.create<arith::ShRSIOp>(loc_, a, sh).getResult()
+                      : builder_.create<arith::ShRUIOp>(loc_, a, sh).getResult();
+      Value big = builder_.create<arith::CmpIOp>(
+          loc_, arith::CmpIPredicate::uge, b, iconst(bits));
+      Value sat = isSigned
+                      ? builder_.create<arith::ShRSIOp>(loc_, a, iconst(bits - 1))
+                            .getResult()
+                      : iconst(0);
+      Value v = builder_.create<arith::SelectOp>(loc_, big, sat, raw);
       store(v);
       return success();
     }

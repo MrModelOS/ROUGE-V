@@ -1,0 +1,111 @@
+// ROUGE-V test kernel: oversized shift amounts.
+//
+// PTX ISA 9.7.9.8 (shl) / 9.7.9.9 (shr): "Shift amounts greater than the
+// register width N are clamped to N." The clause is easy to misread as
+// "taken modulo N": the two readings differ exactly at the boundary, and both
+// of our implementations used to take the amount modulo the width — they
+// agreed with each other and were both wrong. This kernel is the third
+// opinion: the hardware. The expected values in the runner come from the
+// clamp rule, not from either implementation.
+//
+// Semantics (N = the width of the destination):
+//   shl.b32   1, 33           -> 0                       (mod 32 would be 2)
+//   shl.b32   1, 32           -> 0                       (mod 32 would be 1)
+//   shl.b32   1, 31           -> 0x80000000              (in range)
+//   shr.u32   0x80000000, 33  -> 0                       (mod 32 -> 0x40000000)
+//   shr.s32   -16, 33         -> -1                      (mod 32 -> -8)
+//   shr.s32   -16, 36         -> -1                      (in both readings)
+//   shl.b16   1, 17           -> 0                       (N = 16; mod -> 2)
+//   shl.b64   1, 65           -> 0                       (mod 64 -> 2)
+//   shr.s64   -16, 65         -> -1                      (mod 64 -> -8)
+//   shl.b32   1, %r(33)       -> 0                       (amount from a register)
+//
+// out[0..9] is written by thread 0 only; the rest of the grid does nothing.
+// Every access is 32-bit: the front-end's memref model has one element type
+// per buffer, so the 64-bit results are narrowed for the store.
+
+.version 8.0
+.target sm_75
+.address_size 64
+
+.visible .entry shift_clamp(
+    .param .u64 shift_clamp_param_0,
+    .param .u64 shift_clamp_param_1,
+    .param .u32 shift_clamp_param_2,
+    .param .u32 shift_clamp_param_3
+)
+{
+    .reg .b32 %r<14>;
+    .reg .b64 %rd<6>;
+    .reg .b16 %rs<4>;
+    .reg .pred %p<2>;
+
+    ld.param.u64 %rd1, [shift_clamp_param_0];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    setp.ne.u32 %p1, %r1, 0;
+    @%p1 bra L_done;
+
+    // 0: shl.b32 1, 33
+    mov.u32 %r2, 1;
+    shl.b32 %r3, %r2, 33;
+    st.global.u32 [%rd1], %r3;
+
+    // 1: shl.b32 1, 32
+    shl.b32 %r4, %r2, 32;
+    add.u64 %rd2, %rd1, 4;
+    st.global.u32 [%rd2], %r4;
+
+    // 2: shl.b32 1, 31
+    shl.b32 %r5, %r2, 31;
+    add.u64 %rd2, %rd1, 8;
+    st.global.u32 [%rd2], %r5;
+
+    // 3: shr.u32 0x80000000, 33
+    mov.u32 %r6, 0x80000000;
+    shr.u32 %r7, %r6, 33;
+    add.u64 %rd2, %rd1, 12;
+    st.global.u32 [%rd2], %r7;
+
+    // 4: shr.s32 -16, 33
+    mov.s32 %r8, -16;
+    shr.s32 %r9, %r8, 33;
+    add.u64 %rd2, %rd1, 16;
+    st.global.u32 [%rd2], %r9;
+
+    // 5: shr.s32 -16, 36
+    shr.s32 %r10, %r8, 36;
+    add.u64 %rd2, %rd1, 20;
+    st.global.u32 [%rd2], %r10;
+
+    // 6: shl.b16 1, 17
+    mov.u16 %rs1, 1;
+    shl.b16 %rs2, %rs1, 17;
+    cvt.u32.u16 %r11, %rs2;
+    add.u64 %rd2, %rd1, 24;
+    st.global.u32 [%rd2], %r11;
+
+    // 7: shl.b64 1, 65 (the low half of the result, for the 32-bit buffer)
+    mov.u64 %rd3, 1;
+    shl.b64 %rd4, %rd3, 65;
+    cvt.u32.u64 %r12, %rd4;
+    add.u64 %rd2, %rd1, 28;
+    st.global.u32 [%rd2], %r12;
+
+    // 8: shr.s64 -16, 65 (the low half of the result)
+    mov.s64 %rd3, -16;
+    shr.s64 %rd5, %rd3, 65;
+    cvt.u32.u64 %r13, %rd5;
+    add.u64 %rd2, %rd1, 32;
+    st.global.u32 [%rd2], %r13;
+
+    // 9: shl.b32 1, %r(33) — the amount comes from a register, not a literal
+    mov.u32 %r2, 33;
+    mov.u32 %r3, 1;
+    shl.b32 %r4, %r3, %r2;
+    add.u64 %rd2, %rd1, 36;
+    st.global.u32 [%rd2], %r4;
+
+L_done:
+    ret;
+}

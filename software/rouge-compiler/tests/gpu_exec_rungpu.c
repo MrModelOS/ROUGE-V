@@ -493,6 +493,69 @@ static int test_int8_gemm(CUmodule mod) {
 
 
 // ---------------------------------------------------------------------------
+// kernel: shift_clamp -- oversized shift amounts.
+//
+// PTX ISA 9.7.9.8/9.7.9.9: "Shift amounts greater than the register width N
+// are clamped to N" — not taken modulo N. The expected values are computed
+// here from that rule, so this is the ISA text against the hardware, not one
+// of our implementations against the other: both of ours used to take the
+// amount modulo the width and therefore agreed on the wrong answer.
+// ---------------------------------------------------------------------------
+static int test_shift_clamp(CUmodule mod) {
+  const int N = 64;
+  CUfunction fn;
+  CK(cuModuleGetFunction(&fn, mod, "shift_clamp"));
+
+  unsigned* hout = (unsigned*)calloc(16, sizeof(unsigned));
+  unsigned* hin = (unsigned*)calloc((size_t)N, sizeof(unsigned));
+  CUdeviceptr dOut, dIn;
+  CK(cuMemAlloc(&dOut, 16 * sizeof(unsigned)));
+  CK(cuMemAlloc(&dIn, (size_t)N * sizeof(unsigned)));
+  CK(cuMemcpyHtoD(dIn, hin, (size_t)N * sizeof(unsigned)));
+  CK(cuMemcpyHtoD(dOut, hout, 16 * sizeof(unsigned)));
+
+  unsigned nn = (unsigned)N, seed = 12345u;
+  void* args[] = {&dOut, &dIn, &nn, &seed};
+  CK(cuLaunchKernel(fn, 1, 1, 1, (unsigned)N, 1, 1, 0, 0, args, 0));
+  CUresult r = cuCtxSynchronize();
+  if (r != CUDA_SUCCESS) {
+    printf("  MISMATCH: launch/sync failed: %s (%s)\n", cuerr(r), cuerrstr(r));
+    return 3;
+  }
+  CK(cuMemcpyDtoH(hout, dOut, 16 * sizeof(unsigned)));
+
+  // The ISA rule, applied by hand: shift by min(b, N); beyond the width the
+  // result is 0 (shl, shr.u) or the sign fill (shr.s). The two 64-bit results
+  // land at the even/odd word pairs 8/9 and 10/11.
+  unsigned want[10];
+  for (int k = 0; k < 10; ++k) want[k] = 0u;
+  want[2] = 0x80000000u;  // shl.b32 1, 31 (in range)
+  want[4] = 0xffffffffu;  // shr.s32 -16, 33
+  want[5] = 0xffffffffu;  // shr.s32 -16, 36
+  want[8] = 0xffffffffu;  // shr.s64 -16, 65, low half
+  int bad = 0, first = -1;
+  for (int k = 0; k < 10; ++k) {
+    if (hout[k] != want[k]) {
+      if (first < 0) first = k;
+      ++bad;
+      printf("  out[%d]: got 0x%08x, the ISA says 0x%08x\n", k, hout[k], want[k]);
+    }
+  }
+  if (!bad) {
+    printf("  OK: oversized shift amounts are clamped, as the ISA says\n");
+  } else {
+    printf("  MISMATCH: %d of 10 words wrong, first at out[%d]\n", bad, first);
+  }
+  cuMemFree(dOut);
+  cuMemFree(dIn);
+  cuModuleUnload(mod);
+  free(hin);
+  free(hout);
+  return bad ? 1 : 0;
+}
+
+
+// ---------------------------------------------------------------------------
 // kernel: cmp_signed -- signed vs unsigned comparisons.
 //
 // The expected values come from the PTX ISA itself (setp.lt.s32 is SIGNED),
@@ -1463,6 +1526,12 @@ int main(int argc, char** argv) {
     printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
     if (rc && g_exit_code == 0) g_exit_code = rc;
   }
+  if (all || strcmp(kname, "shift_clamp") == 0) {
+    printf("== shift_clamp ==\n");
+    rc = test_shift_clamp(mod);
+    printf("   => %s\n\n", rc == 0 ? "OK" : (rc == 3 ? "DEVICE FAULT" : "MISMATCH"));
+    if (rc && g_exit_code == 0) g_exit_code = rc;
+  }
   if (all || strcmp(kname, "cmp_signed") == 0) {
     printf("== cmp_signed ==\n");
     rc = test_cmp_signed(mod);
@@ -1582,7 +1651,7 @@ int main(int argc, char** argv) {
       strcmp(kname, "shfl_pred") && strcmp(kname, "vote_pred") &&
       strcmp(kname, "shfl_pred_all") && strcmp(kname, "foreign_vadd") &&
       strcmp(kname, "matrixmul16") && strcmp(kname, "int8_gemm") &&
-      strcmp(kname, "cmp_signed") &&
+      strcmp(kname, "cmp_signed") && strcmp(kname, "shift_clamp") &&
       strcmp(kname, "prmt_dp4a") &&
       strcmp(kname, "ldmatrix_sm75") &&
       strcmp(kname, "fp16_reduceB") && strcmp(kname, "gemm_tileB") &&

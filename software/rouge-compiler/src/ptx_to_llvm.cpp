@@ -2213,21 +2213,75 @@ class LlvmGen {
     return fail("unsupported PTX op '" + ins.op + "' @ " + std::to_string(idx));
   }
 
-  // PTX takes the shift amount modulo the operand width, while LLVM's shift is
-  // poison as soon as the amount reaches the width. Keep the two in step: a
-  // literal amount is folded here, a computed one is masked.
-  std::string shift_amount(const std::string& tok, const std::string& val,
-                           const std::string& ty, int bits) {
-    const long long mask = bits >= 64 ? 63 : bits >= 32 ? 31 : 15;
-    if (is_numeric(tok)) {
-      const unsigned long long raw = std::strtoull(tok.c_str(), nullptr, 10);
-      return std::to_string(static_cast<long long>(
-          raw & static_cast<unsigned long long>(mask)));
+  // PTX ISA 9.7.9.8/9.7.9.9: "shift amounts greater than the register width N
+  // are clamped to N" — NOT taken modulo N. LLVM's shl/shr is POISON from N
+  // on, so the clamp has to be explicit:
+  //
+  //   sh     = b & (N-1)          // always a legal LLVM shift amount
+  //   raw    = shl/ashr/lshr a, sh
+  //   big    = b >= N             // b is a .u32 value, whatever the width
+  //   result = big ? <saturated> : raw
+  //
+  // where <saturated> is 0 for shl and shr.u, and the sign fill (a >> (N-1)
+  // arithmetic) for shr.s. A literal amount is folded here.
+  //
+  // The probe that pins this down (a hand-written kernel run on the card)
+  // is tests/kernels/shift_clamp.ptx: shl.b32 1, 33 is 0 on the hardware,
+  // shl.b32 1, 32 is 0, shr.s32 -16, 33 is -1. Our interpreter and this
+  // emitter both used to take the amount modulo 32, so the two AGREED and
+  // were both wrong — the reason the third path exists.
+  bool emit_shift(const std::string &op, const std::string &ty,
+                  const std::string &a, const std::string &bTok,
+                  const std::string &b, const std::string &r, int bits) {
+    const bool arith = is_signed_int_type(op);
+    const char *ll = op.rfind("shl.", 0) == 0 ? "shl" : arith ? "ashr" : "lshr";
+    if (is_numeric(bTok)) {
+      const unsigned long long raw = std::strtoull(bTok.c_str(), nullptr, 10);
+      if (raw >= static_cast<unsigned long long>(bits)) {
+        if (arith)
+          line("  " + r + " = ashr " + ty + " " + a + ", " +
+               std::to_string(bits - 1));
+        else
+          // Zero, in a form the IR accepts (there is no constant op here).
+          line("  " + r + " = and " + ty + " " + a + ", 0");
+        return true;
+      }
+      line("  " + r + " = " + ll + " " + ty + " " + a + ", " +
+           std::to_string(raw));
+      return true;
     }
-    if (!is_reg(tok) || reg_type(tok) != ty) return val;
-    const std::string m = fresh("%sh");
-    line("  " + m + " = and " + ty + " " + val + ", " + std::to_string(mask));
-    return m;
+    // The amount is a 32-bit value: bring it to the operand width for the
+    // compare, and to i32 for the "is it >= N" test.
+    const std::string bty = reg_type(bTok);
+    std::string b32 = b;
+    if (bty == "i64") {
+      b32 = fresh("%shb");
+      line("  " + b32 + " = trunc i64 " + b + " to i32");
+    } else if (bty != "i32") {
+      b32 = fresh("%shb");
+      line("  " + b32 + " = zext " + bty + " " + b + " to i32");
+    }
+    std::string bWide = b32;
+    if (ty != "i32") {
+      bWide = fresh("%shw");
+      line("  " + bWide + " = zext i32 " + b32 + " to " + ty);
+    }
+    const std::string sh = fresh("%sh");
+    line("  " + sh + " = and " + ty + " " + bWide + ", " +
+         std::to_string(bits - 1));
+    const std::string raw = fresh("%rs");
+    line("  " + raw + " = " + ll + " " + ty + " " + a + ", " + sh);
+    const std::string big = fresh("%big");
+    line("  " + big + " = icmp uge i32 " + b32 + ", " + std::to_string(bits));
+    std::string sat = "0";
+    if (arith) {
+      sat = fresh("%sat");
+      line("  " + sat + " = ashr " + ty + " " + a + ", " +
+           std::to_string(bits - 1));
+    }
+    line("  " + r + " = select i1 " + big + ", " + ty + " " + sat + ", " + ty +
+         " " + raw);
+    return true;
   }
 
   // and.* / or.* / xor.* / not.* / shl.* / shr.* on 16-, 32- and 64-bit types.
@@ -2246,14 +2300,16 @@ class LlvmGen {
       line("  " + r + " = xor " + ty + " " + a + ", -1");
     } else {
       std::string b = operand(A[2]);
-      if (op.rfind("shl.", 0) == 0 || op.rfind("shr.", 0) == 0)
-        b = shift_amount(A[2], b, ty, reg_bits(A[0]));
+      if (op.rfind("shl.", 0) == 0 || op.rfind("shr.", 0) == 0) {
+        if (!emit_shift(op, ty, a, A[2], b, r, reg_bits(A[0]))) return false;
+        store_reg(A[0], r);
+        return true;
+      }
       // shr.s* is an arithmetic shift, shr.u* (and the bitwise shr.b*) a
       // logical one.
       const char* ll = op.rfind("and.", 0) == 0    ? "and"
                        : op.rfind("or.", 0) == 0   ? "or"
                        : op.rfind("xor.", 0) == 0  ? "xor"
-                       : op.rfind("shl.", 0) == 0  ? "shl"
                        : is_signed_int_type(op)    ? "ashr"
                                                    : "lshr";
       line("  " + r + " = " + ll + " " + ty + " " + a + ", " + b);

@@ -512,7 +512,7 @@ if(CLANG_EXECUTABLE AND CUDA_DRIVER_INCLUDE_DIR AND CUDA_DRIVER_LIBRARY)
       -DRUNNER=$<TARGET_FILE:gpu_exec_rungpu>
       -DKERNEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/kernels
       -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/gpu-exec
-      "-DCELLS=vadd.vadd,prmt_dp4a.prmt_dp4a,cmp_signed.cmp_signed,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2,shfl_reduce.shfl_reduce,atom_cas.atom_cas,shfl_pred.shfl_pred,vote_pred.vote_pred,shfl_pred_all.shfl_pred_all,ldmatrix_tile.ldmatrix_sm75@ldmatrix_sm75"
+      "-DCELLS=vadd.vadd,prmt_dp4a.prmt_dp4a,cmp_signed.cmp_signed,shift_clamp.shift_clamp,block_reduce.block_reduce,fp16_reduce.fp16_reduce,fp16_reduce.fp16_reduceB,gemm_tile.gemm_tile,gemm_tile.gemm_tileB,gemm_tile.gemm_tile2,shfl_reduce.shfl_reduce,atom_cas.atom_cas,shfl_pred.shfl_pred,vote_pred.vote_pred,shfl_pred_all.shfl_pred_all,ldmatrix_tile.ldmatrix_sm75@ldmatrix_sm75"
       -DSM=sm_75
       -P ${CMAKE_CURRENT_SOURCE_DIR}/gpu_exec.cmake)
   set_tests_properties(compiler_nvptx_gpu_exec PROPERTIES
