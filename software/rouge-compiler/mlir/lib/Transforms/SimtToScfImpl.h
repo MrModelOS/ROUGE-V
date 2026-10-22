@@ -286,7 +286,13 @@ struct SimtLoweringBase {
       return failure();
     }
 
-    if (hasNestedLoop(kernel)) {
+    // A kernel that already contains a loop (scf.while) cannot be phase-
+    // decomposed by this pass: the phase split assumes a flat instruction
+    // stream, and the remapping of the SIMT ops inside the loop's nested
+    // region is not implemented. Refuse gracefully instead of crashing.
+    bool hasNested = false;
+    kernel.getBody().walk([&](scf::WhileOp) { hasNested = true; });
+    if (hasNested) {
       kernel.emitError("a kernel containing a loop (scf.while) is not "
                        "supported by this pass yet — the SIMT-to-SCF phase "
                        "decomposition assumes a flat instruction stream");
@@ -469,7 +475,7 @@ struct SimtLoweringBase {
     // the op in the old kernel, which is erased at the end (a dangling
     // reference, and a crash much later).
     SmallVector<Operation *> threadIdOps, blockIdOps, blockDimOps, gridDimOps;
-    for (Operation *op : ops) {
+    kernel.getBody().walk([&](Operation *op) {
       if (isa<ThreadIdOp>(op))
         threadIdOps.push_back(op);
       else if (isa<BlockIdOp>(op))
@@ -478,7 +484,7 @@ struct SimtLoweringBase {
         blockDimOps.push_back(op);
       else if (isa<GridDimOp>(op))
         gridDimOps.push_back(op);
-    }
+    });
 
     Value threadBound = castToIndex(builder, loc, threadCount);
     Value c0 = arith::ConstantIndexOp::create(builder, 0);
