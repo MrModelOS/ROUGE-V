@@ -27,6 +27,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <algorithm>
@@ -250,6 +251,14 @@ private:
     return it->second;
   }
 
+  // A parameter register used as a pointer: the kind becomes Address, and
+  // the parameter is marked as a pointer in the kernel's signature. Returns
+  // true if the register was a parameter register.
+  bool promoteParamToAddress(const std::string &reg);
+  // The parameter registers that are the base of an address WITHOUT a cvta
+  // (see analyseAddresses: only a register that reaches a dereference).
+  llvm::StringSet<> pointerParams_;
+
   LogicalResult emitKernel(const PtxFunction &fn);
   LogicalResult inferTypes();
   LogicalResult analyseAddresses();
@@ -377,6 +386,12 @@ LogicalResult PtxToRougeEmitter::inferTypes() {
         else if (it->second == 32) t = IntegerType::get(ctx, 32);
         else t = IntegerType::get(ctx, 64);
       }
+    } else if (op.starts_with("mul.wide.") || op.starts_with("mad.wide.")) {
+      // The suffix names the SOURCES (32-bit), the result is 64-bit. Taking
+      // the suffix as the result type made a later redefinition of the same
+      // register a 32-bit one, and an `add.s64` that used it became an
+      // addi(i64, i32) — vadd.ptx found this.
+      t = IntegerType::get(ctx, 64);
     } else if (op.starts_with("cvt.")) {
       t = typeFromSuffix(cvtDestSuffix(op), ctx);
     } else if (op.starts_with("mov.")) {
@@ -427,6 +442,17 @@ LogicalResult PtxToRougeEmitter::inferTypes() {
 
 // The address analysis: what each register holds (a pointer, an address, an
 // offset) and what every memory instruction accesses.
+bool PtxToRougeEmitter::promoteParamToAddress(const std::string &reg) {
+  auto it = ptrValue_.find(reg);
+  if (it == ptrValue_.end() || it->second.kind != PtrValue::ParamPtr)
+    return false;
+  it->second.kind = PtrValue::Address;
+  it->second.addrParam = it->second.paramIndex;
+  it->second.isGlobal = true;
+  paramIsPointer_[std::to_string(it->second.paramIndex)] = true;
+  return true;
+}
+
 LogicalResult PtxToRougeEmitter::analyseAddresses() {
   MLIRContext *ctx = module_.getContext();
 
@@ -439,6 +465,100 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
   llvm::StringMap<int> sharedIndex;
   for (size_t i = 0; i < fn_->sharedVars.size(); ++i)
     sharedIndex[fn_->sharedVars[i].name] = (int)i;
+
+  // A parameter used as a pointer WITHOUT a cvta. nvcc normally emits
+  // `cvta.to.global.u64` before touching a pointer parameter, but the ISA
+  // does not require it: a generic address works for global memory, and
+  // `atom.global.cas.b32 %r, [%p + %off]` is legal PTX (the atom_cas test
+  // kernel is written that way). A .u64 parameter is promoted to a pointer
+  // only when a register DERIVED FROM IT is dereferenced, so a scalar of the
+  // same width is never mistaken for one.
+  {
+    llvm::StringSet<> deref;      // registers read as `[reg]`, `[reg + n]`
+    llvm::StringSet<> param64;    // registers holding a .u64 parameter
+    for (const PtxInstruction &ins : fn_->body) {
+      if (StringRef(ins.op).starts_with("ld.param.") && ins.args.size() >= 2 &&
+          typeSuffix(ins.op) == "u64")
+        param64.insert(regName(ins.args[0]));
+      for (const std::string &arg : ins.args) {
+        if (arg.size() < 2 || arg.front() != '[') continue;
+        std::string inner = stripBrackets(arg);
+        const size_t cut = inner.find_first_of("+-");
+        if (cut != std::string::npos) inner = inner.substr(0, cut);
+        inner = regName(inner);
+        if (!inner.empty()) deref.insert(inner);
+      }
+    }
+    // Walk the additions backwards from the dereferences: the base of an
+    // address is the register the chain starts at.
+    llvm::StringSet<> addressLike = deref;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (const PtxInstruction &ins : fn_->body) {
+        if (ins.op != "add.s64" && ins.op != "add.u64") continue;
+        if (ins.args.size() < 3) continue;
+        const std::string dst = regName(ins.args[0]);
+        if (!addressLike.count(dst)) continue;
+        for (int k = 1; k <= 2; ++k) {
+          const std::string src = regName(ins.args[k]);
+          if (param64.count(src)) pointerParams_.insert(src);
+          if (!addressLike.count(src)) {
+            addressLike.insert(src);
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+
+  // The constants a register holds, by definition point. nvcc materialises
+  // the scale of an offset with `mov.u32 %rN, imm` and then uses the
+  // REGISTER in `mul.wide %rd, %idx, %rN` (`gemm_tile.ptx` does exactly
+  // that), so the analysis has to know the value of the register at the
+  // point of the multiplication, not just literal immediates.
+  struct ConstDef {
+    size_t at;
+    bool isConst;
+    long long value;
+  };
+  std::map<std::string, std::vector<ConstDef>> constDefs;
+  auto parseImm = [](const std::string &tok, long long &v) {
+    if (tok.empty()) return false;
+    if (!(std::isdigit((unsigned char)tok[0]) || tok[0] == '-' || tok[0] == '+'))
+      return false;
+    char *end = nullptr;
+    v = strtoll(tok.c_str(), &end, 0);
+    return end && *end == '\0';
+  };
+  for (size_t i = 0; i < fn_->body.size(); ++i) {
+    const PtxInstruction &ins = fn_->body[i];
+    if (ins.args.empty()) continue;
+    // A store's first operand is an address, not a destination register.
+    if (ins.args[0].empty() || ins.args[0][0] == '[' || ins.args[0][0] == '$')
+      continue;
+    const std::string d = regName(ins.args[0]);
+    if (d.empty()) continue;
+    const bool isMov = ins.op == "mov.u32" || ins.op == "mov.s32" ||
+                       ins.op == "mov.b32" || ins.op == "mov.u64" ||
+                       ins.op == "mov.s64" || ins.op == "mov.b64";
+    long long v = 0;
+    const bool isConst =
+        isMov && ins.args.size() >= 2 && parseImm(ins.args[1], v);
+    constDefs[d].push_back(ConstDef{i, isConst, v});
+  }
+  auto constantAt = [&](const std::string &r, size_t at, long long &out) {
+    auto it = constDefs.find(r);
+    if (it == constDefs.end()) return false;
+    const std::vector<ConstDef> &defs = it->second;
+    for (auto rit = defs.rbegin(); rit != defs.rend(); ++rit) {
+      if (rit->at >= at) continue;
+      if (!rit->isConst) return false;
+      out = rit->value;
+      return true;
+    }
+    return false;
+  };
 
   for (size_t i = 0; i < fn_->body.size(); ++i) {
     const PtxInstruction &ins = fn_->body[i];
@@ -517,10 +637,11 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       const std::string idx = regName(ins.args[1]);
       long scale = 1;
       const std::string &scaleTok = ins.args[2];
-      bool isImm = !scaleTok.empty() && (std::isdigit((unsigned char)scaleTok[0]) ||
-                                        scaleTok[0] == '-');
+      long long scaleVal = 0;
+      bool isImm = parseImm(scaleTok, scaleVal) ||
+                   constantAt(regName(scaleTok), i, scaleVal);
       if (isImm) {
-        scale = strtol(scaleTok.c_str(), nullptr, 10);
+        scale = (long)scaleVal;
       } else {
         // The scale is not a constant: this is not an address offset but an
         // ordinary 64-bit value (a global index, for example). It is emitted
@@ -545,10 +666,11 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       if (ins.args.size() < 3) return fail("bad mul.lo");
       const std::string idx = regName(ins.args[1]);
       const std::string &scaleTok = ins.args[2];
-      bool isImm = !scaleTok.empty() && (std::isdigit((unsigned char)scaleTok[0]) ||
-                                         scaleTok[0] == '-');
+      long long scaleVal = 0;
+      bool isImm = parseImm(scaleTok, scaleVal) ||
+                   constantAt(regName(scaleTok), i, scaleVal);
       if (isImm) {
-        long scale = strtol(scaleTok.c_str(), nullptr, 10);
+        long scale = (long)scaleVal;
         PtrValue pv;
         pv.kind = PtrValue::Offset;
         pv.indexReg = idx;
@@ -577,6 +699,9 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       if (ins.args.size() < 3) return fail("bad add.s64");
       const std::string a = regName(ins.args[1]);
       const std::string b = regName(ins.args[2]);
+      // A parameter used as the base of an address without cvta.
+      if (pointerParams_.count(a)) promoteParamToAddress(a);
+      if (pointerParams_.count(b)) promoteParamToAddress(b);
       auto ai = ptrValue_.find(a);
       auto bi = ptrValue_.find(b);
       PtrValue pv;
@@ -840,6 +965,9 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       while (!addr.empty() && std::isspace((unsigned char)addr.front())) addr.erase(addr.begin());
       while (!addr.empty() && std::isspace((unsigned char)addr.back())) addr.pop_back();
       const std::string reg = regName(addr);
+      // A parameter dereferenced directly (`ld.global [%rd1]`) is a pointer:
+      // nothing else can be dereferenced.
+      promoteParamToAddress(reg);
       auto it = ptrValue_.find(reg);
       if (it == ptrValue_.end() || it->second.kind != PtrValue::Address)
         return fail("the address of the load '" + ins.args[1] +
@@ -896,6 +1024,7 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       while (!addr.empty() && std::isspace((unsigned char)addr.front())) addr.erase(addr.begin());
       while (!addr.empty() && std::isspace((unsigned char)addr.back())) addr.pop_back();
       const std::string reg = regName(addr);
+      promoteParamToAddress(reg);
       auto it = ptrValue_.find(reg);
       if (it == ptrValue_.end() || it->second.kind != PtrValue::Address)
         return fail("the address of the store '" + ins.args[0] +
@@ -957,6 +1086,7 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       while (!addr.empty() && std::isspace((unsigned char)addr.front())) addr.erase(addr.begin());
       while (!addr.empty() && std::isspace((unsigned char)addr.back())) addr.pop_back();
       const std::string reg = regName(addr);
+      promoteParamToAddress(reg);
       auto it = ptrValue_.find(reg);
       if (it == ptrValue_.end() || it->second.kind != PtrValue::Address)
         return fail("the address of the atomic '" + ins.args[addrArg] +
@@ -1015,9 +1145,12 @@ Value PtxToRougeEmitter::operandValue(StringRef tok, Type type) {
       if (auto intTy = dyn_cast<IntegerType>(type))
         return builder_.create<arith::ConstantOp>(
             builder_.getIntegerAttr(intTy, value.trunc(intTy.getWidth())));
-      if (isa<Float32Type>(type) || isa<Float64Type>(type))
-        return builder_.create<arith::ConstantOp>(
-            builder_.getFloatAttr(type, value.getSExtValue()));
+      // A float register: `mov.u16 %h, 0` is how nvcc zeroes an f16
+      // accumulator (the .b16 register is viewed as f16 by the arithmetic),
+      // so the constant is materialised in the register's own type.
+      if (isa<FloatType>(type))
+        return builder_.create<arith::ConstantOp>(builder_.getFloatAttr(
+            type, (double)value.getSExtValue()));
     }
     return {};
   }
@@ -1090,24 +1223,39 @@ Value PtxToRougeEmitter::accessIndex(const MemAccess &acc) {
     return idx;
   }
 
+  // A term of the address: the register's index in ELEMENTS. A byte scale
+  // that is a whole number of elements is a stride, not an error: the block
+  // index of a tiled kernel is exactly that (`gemm_tile.ptx`: the block
+  // offset is blockId*512 bytes of f16, i.e. blockId*256 elements, and the
+  // thread's own offset is tlinear*2 bytes).
+  auto toIndex = [&](Value raw) -> Value {
+    if (!raw) return {};
+    if (raw.getType().isIndex()) return raw;
+    if (auto intTy = dyn_cast<IntegerType>(raw.getType())) {
+      if (intTy.getWidth() == 1) return {};
+      return builder_.create<arith::IndexCastOp>(builder_.getIndexType(), raw)
+          .getResult();
+    }
+    return {};
+  };
+  auto scaled = [&](Value raw, int scale) -> Value {
+    Value v = toIndex(raw);
+    if (!v) return {};
+    if (scale == eb) return v;
+    if (scale % eb != 0) return {};
+    Value c = builder_.create<arith::ConstantIndexOp>(loc_, scale / eb);
+    return builder_.create<arith::MulIOp>(v, c).getResult();
+  };
+
   // Build the primary term.
   Value idx;
   if (acc.indexIsThreadId) {
     auto tid = builder_.create<rouge::ThreadIdOp>(
         loc_, builder_.getIndexType(),
         rouge::DimensionAttr::get(ctx, rouge::Dimension::x));
-    idx = tid.getResult();
-    if (acc.scale != eb) return {};
+    idx = scaled(tid.getResult(), acc.scale);
   } else if (!acc.indexReg.empty()) {
-    Value raw = valueOfReg(acc.indexReg);
-    if (!raw) return {};
-    if (acc.scale != eb) return {};
-    if (raw.getType().isIndex()) idx = raw;
-    else if (auto intTy = dyn_cast<IntegerType>(raw.getType())) {
-      if (intTy.getWidth() == 1) return {};
-      idx = builder_.create<arith::IndexCastOp>(builder_.getIndexType(), raw)
-                .getResult();
-    } else return {};
+    idx = scaled(valueOfReg(acc.indexReg), acc.scale);
   } else {
     idx = builder_.create<arith::ConstantIndexOp>(loc_, 0);
   }
@@ -1115,18 +1263,8 @@ Value PtxToRougeEmitter::accessIndex(const MemAccess &acc) {
 
   // Extra byte-offset terms.
   for (const auto &t : acc.extraTerms) {
-    const std::string &reg = t.first;
-    int scale = t.second;
-    if (scale != eb) return {};
-    Value raw = valueOfReg(reg);
-    if (!raw) return {};
-    Value v;
-    if (raw.getType().isIndex()) v = raw;
-    else if (auto intTy = dyn_cast<IntegerType>(raw.getType())) {
-      if (intTy.getWidth() == 1) return {};
-      v = builder_.create<arith::IndexCastOp>(builder_.getIndexType(), raw)
-              .getResult();
-    } else return {};
+    Value v = scaled(valueOfReg(t.first), t.second);
+    if (!v) return {};
     idx = builder_.create<arith::AddIOp>(idx, v).getResult();
   }
 
@@ -1246,17 +1384,24 @@ LogicalResult PtxToRougeEmitter::emitBody() {
       SmallVector<Type> carriedTypes;
       for (const std::string &r : carried) carriedTypes.push_back(typeOfReg(r));
 
+      // A failure inside a region builder cannot be returned (the callback is
+      // void), and a swallowed failure used to leave an EMPTY body block:
+      // the module then failed verification with "'scf.while' op expects a
+      // non-empty block", which says nothing about the real cause. The flag
+      // carries the failure out.
+      bool bodyFailed = false;
       auto beforeBuilder = [&](OpBuilder &b, Location loc, ValueRange args) {
         ImplicitLocOpBuilder saved = std::move(builder_);
         builder_ = ImplicitLocOpBuilder(loc_, b);
         for (size_t c = 0; c < carried.size(); ++c)
           regValue_[carried[c]] = args[c];
         if (failed(emitInstruction(body[setpIdx], setpIdx))) {
+          bodyFailed = true;
           builder_ = std::move(saved);
           return;
         }
         Value p = valueOfReg(condPred);
-        if (!p) { builder_ = std::move(saved); return; }
+        if (!p) { bodyFailed = true; builder_ = std::move(saved); return; }
         Value cond = p;
         if (condInverted) {
           // The exit branch: the loop continues while the predicate does NOT
@@ -1280,6 +1425,7 @@ LogicalResult PtxToRougeEmitter::emitBody() {
           if (k == exitBranch) continue;
           if (k == setpIdx) continue;
           if (failed(emitInstruction(body[k], k))) {
+            bodyFailed = true;
             builder_ = std::move(saved);
             return;
           }
@@ -1296,6 +1442,9 @@ LogicalResult PtxToRougeEmitter::emitBody() {
 
       auto whileOp = scf::WhileOp::create(builder_, carriedTypes, initVals,
                                           beforeBuilder, afterBuilder);
+      if (bodyFailed)
+        return fail("the loop body is not understood" +
+                    std::string(error_ ? ": " + *error_ : ""));
 
       // After the loop: update regValue_ with the results.
       for (size_t c = 0; c < carried.size(); ++c)
@@ -1449,6 +1598,26 @@ LogicalResult PtxToRougeEmitter::emitInstruction(const PtxInstruction &ins,
     return success();
   }
 
+  // A select: selp.type d, a, b, p -> p ? a : b. Both sources have the
+  // destination's type (the predicate is the fourth operand).
+  if (op.starts_with("selp.") || op == "selp") {
+    if (ins.args.size() < 4) return fail("bad selp");
+    Type t = typeOfReg(dst);
+    Value a = operandValue(ins.args[1], t);
+    Value b = operandValue(ins.args[2], t);
+    Value p = operandValue(ins.args[3], IntegerType::get(module_.getContext(), 1));
+    if (!a || !b || !p)
+      return fail("the operands of the select are not understood ('" + op.str() +
+                  "')");
+    if (a.getType() != b.getType())
+      return fail("the select mixes the types " +
+                  std::string(a.getType() == t ? "of the destination" : "other") +
+                  " ('" + op.str() + "')");
+    Value v = builder_.create<arith::SelectOp>(p, a, b).getResult();
+    store(v);
+    return success();
+  }
+
   // A conversion.
   if (op.starts_with("cvt.")) {
     if (ins.args.size() < 2) return fail("bad cvt");
@@ -1473,12 +1642,27 @@ LogicalResult PtxToRougeEmitter::emitInstruction(const PtxInstruction &ins,
       } else {
         res = v;
       }
-    } else if (isa<Float32Type>(v.getType()) && isa<Float32Type>(dstType)) {
-      res = v;
-    } else if (isa<IntegerType>(v.getType()) && isa<Float32Type>(dstType)) {
-      res = builder_.create<arith::SIToFPOp>(dstType, v).getResult();
-    } else if (isa<Float32Type>(v.getType()) && isa<IntegerType>(dstType)) {
-      res = builder_.create<arith::FPToSIOp>(dstType, v).getResult();
+    } else if (isa<FloatType>(v.getType()) && isa<FloatType>(dstType)) {
+      // The float-to-float conversions: cvt.f32.f16 (the f16 dot product
+      // widens its accumulator, gemm_tile.ptx) and cvt.f16.f32.
+      const unsigned sw = cast<FloatType>(v.getType()).getWidth();
+      const unsigned dw = cast<FloatType>(dstType).getWidth();
+      if (sw < dw)
+        res = builder_.create<arith::ExtFOp>(dstType, v).getResult();
+      else if (sw > dw)
+        res = builder_.create<arith::TruncFOp>(dstType, v).getResult();
+      else
+        res = v;
+    } else if (isa<IntegerType>(v.getType()) && isa<FloatType>(dstType)) {
+      const bool isUnsigned = op.find(".u") != StringRef::npos;
+      res = isUnsigned
+                ? builder_.create<arith::UIToFPOp>(dstType, v).getResult()
+                : builder_.create<arith::SIToFPOp>(dstType, v).getResult();
+    } else if (isa<FloatType>(v.getType()) && isa<IntegerType>(dstType)) {
+      const bool isUnsigned = op.find(".u") != StringRef::npos;
+      res = isUnsigned
+                ? builder_.create<arith::FPToUIOp>(dstType, v).getResult()
+                : builder_.create<arith::FPToSIOp>(dstType, v).getResult();
     } else {
       return fail("the conversion '" + op.str() + "' is not supported");
     }
@@ -1529,10 +1713,17 @@ LogicalResult PtxToRougeEmitter::emitInstruction(const PtxInstruction &ins,
     }
     if (!base) return fail("the base of the access is not known");
     Value idx = accessIndex(acc);
-    if (!idx)
-      return fail("the index of the access is not understood: the front-end "
-                  "recovers only param + index*element size (the scale is "
-                  "not the element size)");
+    if (!idx) {
+      // Name the shape of the address: "not understood" alone does not say
+      // WHICH term is wrong.
+      std::string shape = "index '" + acc.indexReg + "' scale " +
+                          std::to_string(acc.scale);
+      for (const auto &t : acc.extraTerms)
+        shape += ", + '" + t.first + "' scale " + std::to_string(t.second);
+      return fail("the index of the access is not understood (" + shape +
+                  ", element size " + std::to_string(acc.elemBytes) +
+                  "): the front-end recovers only param + index*element size");
+    }
     Type elem = acc.elemType;
     if (op.starts_with("ld.")) {
       Value v = builder_.create<memref::LoadOp>(elem, base, ValueRange{idx});
@@ -1593,26 +1784,37 @@ LogicalResult PtxToRougeEmitter::emitInstruction(const PtxInstruction &ins,
       return builder_.create<OpTy>(a, b).getResult();
     };
 
-    if (o.rfind("add.", 0) == 0) {
-      Value v = bin(arith::AddIOp{});
-      if (!v) return fail("the addition is not understood ('" + op.str() + "')");
+    // The float and the integer forms are different arith ops: an
+    // arith.addi on f32 does not verify, and silently treating add.f32 as an
+    // integer addition is exactly the sort of mistranslation the front-end
+    // must not make. vadd.ptx (the first real nvcc-shaped kernel through the
+    // front-end) exercises them.
+    if (o.rfind("add.", 0) == 0 || o.rfind("sub.", 0) == 0) {
+      const bool isAdd = o.rfind("add.", 0) == 0;
+      Type t = typeOfReg(dst);
+      Value v;
+      if (isa<FloatType>(t)) {
+        v = isAdd ? bin(arith::AddFOp{}) : bin(arith::SubFOp{});
+      } else {
+        v = isAdd ? bin(arith::AddIOp{}) : bin(arith::SubIOp{});
+      }
+      if (!v) return fail("the addition/subtraction is not understood ('" +
+                          op.str() + "')");
       store(v);
       return success();
     }
-    if (o.rfind("sub.", 0) == 0) {
-      Value v = bin(arith::SubIOp{});
-      if (!v) return fail("the subtraction is not understood ('" + op.str() + "')");
-      store(v);
-      return success();
-    }
-    if (o.rfind("mul.lo.", 0) == 0 || o.rfind("mul.wide.", 0) == 0) {
+    if (o.rfind("mul.hi.", 0) == 0)
+      return fail("mul.hi is not supported by the MLIR front-end yet");
+    if (o.rfind("mul.", 0) == 0) {
       if (ins.args.size() < 3) return fail("bad mul");
       Type t = typeOfReg(dst);
       Value a = operandValue(ins.args[1], t);
       Value b = operandValue(ins.args[2], t);
       if (!a || !b) return fail("the multiplication is not understood ('" + op.str() + "')");
       Value v;
-      if (o.rfind("mul.wide.", 0) == 0) {
+      if (isa<FloatType>(t)) {
+        v = builder_.create<arith::MulFOp>(a, b).getResult();
+      } else if (o.rfind("mul.wide.", 0) == 0) {
         // The wide multiplication: 32x32 -> 64.
         Type i64 = IntegerType::get(module_.getContext(), 64);
         Value a64 = builder_.create<arith::ExtUIOp>(i64, a).getResult();
@@ -1630,7 +1832,9 @@ LogicalResult PtxToRougeEmitter::emitInstruction(const PtxInstruction &ins,
       Value b = operandValue(ins.args[2], t);
       if (!a || !b) return fail("the division is not understood ('" + op.str() + "')");
       Value v;
-      if (o.find(".u") != std::string::npos)
+      if (isa<FloatType>(t))
+        v = builder_.create<arith::DivFOp>(a, b).getResult();
+      else if (o.find(".u") != std::string::npos)
         v = builder_.create<arith::DivUIOp>(a, b).getResult();
       else
         v = builder_.create<arith::DivSIOp>(a, b).getResult();
@@ -1643,7 +1847,9 @@ LogicalResult PtxToRougeEmitter::emitInstruction(const PtxInstruction &ins,
       Value b = operandValue(ins.args[2], t);
       if (!a || !b) return fail("the remainder is not understood ('" + op.str() + "')");
       Value v;
-      if (o.find(".u") != std::string::npos)
+      if (isa<FloatType>(t))
+        v = builder_.create<arith::RemFOp>(a, b).getResult();
+      else if (o.find(".u") != std::string::npos)
         v = builder_.create<arith::RemUIOp>(a, b).getResult();
       else
         v = builder_.create<arith::RemSIOp>(a, b).getResult();
@@ -1655,6 +1861,9 @@ LogicalResult PtxToRougeEmitter::emitInstruction(const PtxInstruction &ins,
       Value a = operandValue(ins.args[1], t);
       Value b = operandValue(ins.args[2], t);
       if (!a || !b) return fail("the min/max is not understood ('" + op.str() + "')");
+      if (isa<FloatType>(t))
+        return fail("min/max of a float is not supported by the MLIR "
+                    "front-end yet");
       bool isMax = o.rfind("max.", 0) == 0;
       bool isUnsigned = o.find(".u") != std::string::npos;
       Value v;
