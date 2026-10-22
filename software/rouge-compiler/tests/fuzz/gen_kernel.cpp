@@ -405,6 +405,65 @@ std::string loopKernel(uint64_t seed) {
   return p;
 }
 
+// The "dowhile" template: the same counted loop, but with the condition at
+// the BOTTOM of the body and a PREDICATED back edge ("@%p bra $L") — the
+// form nvcc emits. The loop continues while the predicate holds.
+//
+//   acc = 0; k = 0;
+//   do { acc += in[k] + tid; k++; } while (k < n);
+//
+// The frontend has to build the scf.while's condition from the loop-carried
+// values (the counter), not from the values at the loop's entry.
+std::string dowhileKernel(uint64_t seed) {
+  Rng rng(seed);
+  const unsigned k1 = 1 + rng.u32(7);
+  const unsigned k2 = 1 + rng.u32(101);
+  std::string p;
+  p += "// ROUGE-V differential fuzzer kernel (generated, do not edit).\n";
+  p += "// template=dowhile seed=" + std::to_string(seed) + "\n";
+  p += ".version 8.0\n.target sm_75\n.address_size 64\n\n";
+  p += ".visible .entry fuzz_kernel(\n";
+  p += "    .param .u64 fuzz_kernel_param_0,\n";
+  p += "    .param .u64 fuzz_kernel_param_1,\n";
+  p += "    .param .u32 fuzz_kernel_param_2,\n";
+  p += "    .param .u32 fuzz_kernel_param_3\n";
+  p += ")\n{\n";
+  p += "    .reg .b32 %r<20>;\n";
+  p += "    .reg .b64 %rd<10>;\n";
+  p += "    .reg .pred %p<4>;\n\n";
+  p += "    ld.param.u64 %rd1, [fuzz_kernel_param_0];\n";
+  p += "    ld.param.u64 %rd2, [fuzz_kernel_param_1];\n";
+  p += "    ld.param.u32 %r1, [fuzz_kernel_param_2];\n";
+  p += "    ld.param.u32 %r2, [fuzz_kernel_param_3];\n";
+  p += "    cvta.to.global.u64 %rd3, %rd1;\n";
+  p += "    cvta.to.global.u64 %rd4, %rd2;\n";
+  p += "    mov.u32 %r3, %tid.x;\n";
+  p += "    mov.u32 %r4, 0;\n";   // the accumulator
+  p += "    mov.u32 %r5, 0;\n";   // the induction variable
+  p += "$L_loop:\n";
+  p += "    mul.wide.u32 %rd5, %r5, 4;\n";
+  p += "    add.s64 %rd5, %rd5, %rd4;\n";
+  p += "    ld.global.s32 %r6, [%rd5];\n";
+  p += "    mad.lo.s32 %r6, %r6, " + std::to_string(k1) + ", " +
+       std::to_string(k2) + ";\n";
+  p += "    add.s32 %r4, %r4, %r6;\n";
+  p += "    add.s32 %r4, %r4, %r3;\n";
+  p += "    add.s32 %r5, %r5, 1;\n";
+  p += "    setp.lt.s32 %p1, %r5, %r1;\n";
+  p += "    @%p1 bra $L_loop;\n";
+  p += "$L_loop_done:\n";
+  for (int j = 0; j < kOutPerThread; ++j) {
+    p += "    mul.lo.s32 %r7, %r3, " + std::to_string(kOutPerThread) + ";\n";
+    p += "    add.s32 %r7, %r7, " + std::to_string(j) + ";\n";
+    p += "    mul.wide.u32 %rd6, %r7, 4;\n";
+    p += "    add.s64 %rd6, %rd6, %rd3;\n";
+    p += "    add.s32 %r4, %r4, " + std::to_string(j) + ";\n";
+    p += "    st.global.s32 [%rd6], %r4;\n";
+  }
+  p += "    ret;\n}\n";
+  return p;
+}
+
 // The three files of one fuzz case: the PTX text, the input blob and the
 // metadata the driver reads.
 int writeOutputs(const std::string& ptx, const std::vector<int>& input,
@@ -465,7 +524,7 @@ int main(int argc, char** argv) {
     } else if (!strcmp(argv[i], "--template") && i + 1 < argc) {
       tpl = argv[++i];
       if (tpl != "chain" && tpl != "phases" && tpl != "demoted" &&
-          tpl != "atomic" && tpl != "loop") {
+          tpl != "atomic" && tpl != "loop" && tpl != "dowhile") {
         std::fprintf(stderr, "gen_kernel: unknown template '%s'\n",
                      tpl.c_str());
         return 2;
@@ -508,6 +567,8 @@ int main(int argc, char** argv) {
                                            outPath, inPath, metaPath);
   if (tpl == "loop") return writeOutputs(loopKernel(seed), input, seed,
                                          outPath, inPath, metaPath);
+  if (tpl == "dowhile") return writeOutputs(dowhileKernel(seed), input, seed,
+                                            outPath, inPath, metaPath);
 
   // Цепочка операций: одна на каждый «результат» (K регистров), плюс
   // несколько общих шагов.

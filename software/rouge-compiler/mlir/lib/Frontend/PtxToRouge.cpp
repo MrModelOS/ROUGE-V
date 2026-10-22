@@ -1137,20 +1137,27 @@ Value PtxToRougeEmitter::accessIndex(const MemAccess &acc) {
 // scf.if and the backward branches turned into scf.while.
 LogicalResult PtxToRougeEmitter::emitBody() {
   const auto &body = fn_->body;
-  // Pre-scan: find the backward (unconditional) branches that close a loop.
-  // A "bra $L" with L's position < i is a back edge; L is the loop header.
-  std::map<size_t, size_t> loopBack;   // header index -> back-edge index
-  std::map<size_t, size_t> backHeader; // back-edge index -> header index
+  // Pre-scan: find the backward branches that close a loop. A "bra $L" (or
+  // "@%p bra $L") with L's position < i is a back edge; L is the loop header.
+  // The PREDICATED back edge is the do-while form nvcc emits: the condition
+  // sits at the bottom of the body, and the loop continues while it holds.
+  struct BackEdge {
+    size_t index = 0;      // the branch itself
+    std::string predicate; // "" for an unconditional back edge
+  };
+  std::map<size_t, BackEdge> loopBack;
   for (size_t i = 0; i < body.size(); ++i) {
     const PtxInstruction &ins = body[i];
-    if (ins.op != "bra" || !ins.pred.empty()) continue;
+    if (ins.op != "bra") continue;
     if (ins.args.empty()) continue;
     auto it = fn_->labels.find(ins.args[0]);
     if (it == fn_->labels.end()) continue;
     size_t target = (size_t)it->second;
     if (target < i) {
-      loopBack[target] = i;
-      backHeader[i] = target;
+      BackEdge be;
+      be.index = i;
+      be.predicate = ins.pred;
+      loopBack[target] = be;
     }
   }
 
@@ -1160,30 +1167,42 @@ LogicalResult PtxToRougeEmitter::emitBody() {
 
     // A loop: a backward branch closes the region [header, back_edge].
     if (loopBack.count(i)) {
-      size_t back = loopBack[i];
-      // Find the exit condition: a forward conditional branch inside
-      // [i, back] whose target is beyond 'back'.
+      const BackEdge be = loopBack[i];
+      size_t back = be.index;
+      // The condition of the loop. Two forms:
+      //   * the back edge is PREDICATED (the do-while form nvcc emits): the
+      //     loop continues while the predicate holds;
+      //   * the back edge is unconditional: the loop has a forward exit
+      //     branch, and the loop continues while its predicate does NOT hold.
       size_t exitBranch = body.size();
       std::string exitPred;
-      for (size_t k = i; k < back; ++k) {
-        const PtxInstruction &cand = body[k];
-        if (cand.op == "bra" && !cand.pred.empty() && !cand.args.empty()) {
-          auto lit = fn_->labels.find(cand.args[0]);
-          if (lit != fn_->labels.end() && (size_t)lit->second > back) {
-            exitBranch = k;
-            exitPred = cand.pred;
-            break;
+      std::string condPred = be.predicate;
+      bool condInverted = false;
+      if (condPred.empty()) {
+        // Find the exit condition: a forward conditional branch inside
+        // [i, back] whose target is beyond 'back'.
+        for (size_t k = i; k < back; ++k) {
+          const PtxInstruction &cand = body[k];
+          if (cand.op == "bra" && !cand.pred.empty() && !cand.args.empty()) {
+            auto lit = fn_->labels.find(cand.args[0]);
+            if (lit != fn_->labels.end() && (size_t)lit->second > back) {
+              exitBranch = k;
+              exitPred = cand.pred;
+              break;
+            }
           }
         }
+        if (exitPred.empty())
+          return fail("a loop without an exit condition is not supported");
+        condPred = exitPred;
+        condInverted = true;
       }
-      if (exitPred.empty())
-        return fail("a loop without an exit condition is not supported");
 
-      // The setp that defines the exit predicate.
+      // The setp that defines the loop's predicate.
       size_t setpIdx = body.size();
       for (size_t k = i; k < back; ++k) {
         if (body[k].op.rfind("setp", 0) == 0 && !body[k].args.empty() &&
-            regName(body[k].args[0]) == exitPred) {
+            regName(body[k].args[0]) == condPred) {
           setpIdx = k;
           break;
         }
@@ -1228,14 +1247,19 @@ LogicalResult PtxToRougeEmitter::emitBody() {
           builder_ = std::move(saved);
           return;
         }
-        Value p = valueOfReg(exitPred);
+        Value p = valueOfReg(condPred);
         if (!p) { builder_ = std::move(saved); return; }
-        Value notP = builder_.create<arith::XOrIOp>(
-            p, builder_.create<arith::ConstantOp>(builder_.getBoolAttr(true)))
-            .getResult();
+        Value cond = p;
+        if (condInverted) {
+          // The exit branch: the loop continues while the predicate does NOT
+          // hold.
+          cond = builder_.create<arith::XOrIOp>(
+              p, builder_.create<arith::ConstantOp>(builder_.getBoolAttr(true)))
+              .getResult();
+        }
         SmallVector<Value> condYield;
         for (const std::string &r : carried) condYield.push_back(valueOfReg(r));
-        builder_.create<scf::ConditionOp>(notP, condYield);
+        builder_.create<scf::ConditionOp>(cond, condYield);
         builder_ = std::move(saved);
       };
 
