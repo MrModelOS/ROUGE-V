@@ -451,7 +451,12 @@ if(MLIR_OPT_EXE AND MLIR_TRANSLATE_EXE AND CLANG_EXECUTABLE AND
             --block 16 --shape 0=5063xi8 --shape 1=3071xi8
             --shape 2=2257xi32)
   set_tests_properties(mlir_ptx2mlir_moving_pointer PROPERTIES
-    PASS_REGULAR_EXPRESSION "a moving pointer is not expressible yet")
+    # int8_gemm now TRANSLATES (a moving pointer is no longer refused — the
+    # offset is a loop-carried SSA value). The card-side result is still wrong
+    # (CUDA_ERROR_ILLEGAL_ADDRESS) because the B-pointer update is entangled
+    # with register reuse; that is the next bug to fix. This test only guards
+    # against a regression back to a loud refusal.
+    FAIL_REGULAR_EXPRESSION "REFUSED")
 
   # ---- тот же фазер, но ТРЕТЬИМ путём: на карте ---------------------------
   #

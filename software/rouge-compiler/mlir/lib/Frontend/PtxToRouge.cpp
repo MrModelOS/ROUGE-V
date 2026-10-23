@@ -72,6 +72,18 @@ struct PtrValue {
   bool isGlobal = true;    // global or shared
   // True when the (primary) index register is the thread id.
   // (kept above for clarity; field declared earlier)
+  // A MOVING pointer: `add.s64 %p, %p, 16` inside a loop. The offset cannot be
+  // a constant (it changes per iteration), so it is not part of the static
+  // structure at all: the register's own SSA value IS the byte offset, and
+  // the loop carries it like any other value. indexReg/extraTerms/constBytes
+  // are empty in this form — everything is in the value.
+  bool dynamic = false;
+  // The byte scales of the register contributions to the dynamic offset and
+  // the constant steps. The access needs them to divide by the element size
+  // EXACTLY (a contribution that is not a whole number of elements would make
+  // memref[index] read the wrong element, so it is refused).
+  std::vector<int> dynScales;
+  std::vector<long long> dynConsts;
 };
 
 // A memory access, recovered from the address arithmetic.
@@ -88,6 +100,10 @@ struct MemAccess {
   bool isGlobal = true;
   Type elemType;
   int elemBytes = 4;
+  // A moving pointer: the register whose SSA value is the byte offset.
+  std::string dynReg;
+  std::vector<int> dynScales;
+  std::vector<long long> dynConsts;
 };
 
 // ---------------------------------------------------------------------------
@@ -238,6 +254,25 @@ private:
   };
   std::map<size_t, BackEdge> loopBack_;
 
+  // A definition of a MOVING pointer's offset (see PtrValue::dynamic).
+  // `rebase` throws the previous offset away (`cvta %p, sym` inside a loop, or
+  // `%p = base + %off`); the others add to it (`%p = %p + 16`).
+  struct DynInit {
+    bool rebase = false;
+    std::string src;    // the register added ("" = an immediate)
+    long long imm = 0;
+    int scale = 1;      // bytes per unit of `src`
+    bool subtract = false;
+  };
+  // The registers whose offset is a value, and where each definition of it
+  // is. Filled by the address analysis, consumed by emitInstruction.
+  llvm::StringSet<> dynAddr_;
+  // Registers whose SSA value is needed because it feeds a moving pointer's
+  // offset (e.g. the step scale register). Their defining instruction must be
+  // emitted instead of skipped.
+  std::set<std::string> neededValue_;
+  std::map<size_t, DynInit> dynInit_;
+
   // The refusal: the message goes into the error and the result is failure.
   LogicalResult fail(const std::string &msg) {
     if (error_) *error_ = msg;
@@ -256,6 +291,60 @@ private:
     auto it = regValue_.find(name);
     if (it == regValue_.end()) return {};
     return it->second;
+  }
+
+  // Extend a value to i64 (bytes domain), used for moving-pointer offsets.
+  // Returns null if the value has no SSA representation yet.
+  Value extendToI64(Value v) {
+    if (!v) return {};
+    Type t = v.getType();
+    if (t.isIndex())
+      return builder_.create<arith::IndexCastOp>(builder_.getI64Type(), v)
+          .getResult();
+    if (t == builder_.getI64Type()) return v;
+    if (auto it2 = dyn_cast<IntegerType>(t); it2 && it2.getWidth() < 64)
+      return builder_.create<arith::ExtUIOp>(builder_.getI64Type(), v)
+          .getResult();
+    return {};
+  }
+
+  // Multiply an i64 byte-offset value by a constant scale.
+  Value scaleValue(Value v, int scale) {
+    if (!v || scale == 1) return v;
+    return builder_
+        .create<arith::MulIOp>(
+            v, builder_.create<arith::ConstantOp>(
+                   IntegerAttr::get(builder_.getI64Type(), scale)))
+        .getResult();
+  }
+
+  // Materialize a static Address's byte offset as an i64 SSA value: sum of
+  // (indexReg * scale) + extraTerms + constBytes. Used when a statically
+  // recovered address starts moving inside a loop and its current offset has
+  // to become a loop-carried value.
+  Value materializeOffset(const PtrValue &pv) {
+    Value off = builder_.create<arith::ConstantOp>(
+        IntegerAttr::get(builder_.getI64Type(), 0));
+    auto addTerm = [&](Value v, int scale) {
+      if (!v) return false;
+      v = extendToI64(v);
+      if (!v) return false;
+      if (scale != 1)
+        v = scaleValue(v, scale);
+      off = builder_.create<arith::AddIOp>(off, v).getResult();
+      return true;
+    };
+    if (!pv.indexReg.empty()) {
+      if (!addTerm(valueOfReg(pv.indexReg), pv.scale)) return {};
+    }
+    for (const auto &t : pv.extraTerms)
+      if (!addTerm(valueOfReg(t.first), t.second)) return {};
+    if (pv.constBytes != 0)
+      if (!addTerm(builder_.create<arith::ConstantOp>(
+                       IntegerAttr::get(builder_.getI64Type(), pv.constBytes)),
+                   1))
+        return {};
+    return off;
   }
 
   // A parameter register used as a pointer: the kind becomes Address, and
@@ -475,16 +564,59 @@ bool PtxToRougeEmitter::promoteParamToAddress(const std::string &reg) {
 LogicalResult PtxToRougeEmitter::analyseAddresses() {
   MLIRContext *ctx = module_.getContext();
 
-  // Does the function have a back edge? A pointer ADVANCED inside a loop is
-  // the one form the recovered "base + index" structure cannot express, see
-  // the add branches below.
-  bool hasLoop = false;
-  for (size_t i = 0; i < fn_->body.size() && !hasLoop; ++i) {
+  // The loops of the function, and the registers that MOVE inside one.
+  //
+  // A pointer advanced inside a loop (`add.s64 %p, %p, 16` — nvcc's tiled
+  // kernels do this on every iteration) cannot be folded into a constant byte
+  // offset: the recovered memref[index] form would read the first tile each
+  // time. The card proved it: int8_gemm.ptx translated that way and the answer
+  // was CUDA_ERROR_ILLEGAL_ADDRESS. Such registers get a different
+  // representation — their offset becomes a VALUE carried by the loop — and
+  // the set is found before the linear pass, because the pass has to know it
+  // from the very first definition.
+  std::vector<std::pair<size_t, size_t>> loops;
+  for (size_t i = 0; i < fn_->body.size(); ++i) {
     const PtxInstruction &ins = fn_->body[i];
     if (ins.op != "bra" || ins.args.empty()) continue;
     auto it = fn_->labels.find(ins.args[0]);
-    if (it != fn_->labels.end() && (size_t)it->second <= i) hasLoop = true;
+    if (it != fn_->labels.end() && (size_t)it->second <= i)
+      loops.push_back({(size_t)it->second, i});
   }
+  auto insideLoop = [&](size_t at) {
+    for (const auto &l : loops)
+      if (at >= l.first && at < l.second) return true;
+    return false;
+  };
+  const bool hasLoop = !loops.empty();
+
+  {
+    llvm::StringSet<> deref;
+    for (const PtxInstruction &ins : fn_->body)
+      for (const std::string &arg : ins.args) {
+        if (arg.size() < 2 || arg.front() != '[') continue;
+        std::string inner = stripBrackets(arg);
+        const size_t cut = inner.find_first_of("+-");
+        if (cut != std::string::npos) inner = inner.substr(0, cut);
+        inner = regName(inner);
+        if (!inner.empty()) deref.insert(inner);
+      }
+    for (size_t i = 0; i < fn_->body.size(); ++i) {
+      const PtxInstruction &ins = fn_->body[i];
+      if (!insideLoop(i)) continue;
+      if (ins.op != "add.s64" && ins.op != "add.u64" &&
+          ins.op != "add.s32" && ins.op != "add.u32")
+        continue;
+      if (ins.args.size() < 3) continue;
+      const std::string dst = regName(ins.args[0]);
+      if (dst != regName(ins.args[1]) && dst != regName(ins.args[2])) continue;
+      // Only a register that is READ as an address has to move: an ordinary
+      // counter (`add.s32 %r5, %r5, 1`) is just a counter.
+      if (!deref.count(dst)) continue;
+      dynAddr_.insert(dst);
+    }
+  }
+
+
 
   // The parameters: their index by name.
   llvm::StringMap<int> paramIndex;
@@ -561,7 +693,29 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
     v = strtoll(tok.c_str(), &end, 0);
     return end && *end == '\0';
   };
+
+  // Second pre-scan: every register whose VALUE is needed by a dynamic
+  // pointer's step or rebase INSIDE a loop must be emitted as an SSA value
+  // (its defining instruction can't be skipped). Do this before the linear
+  // pass so that an early definition (e.g. `mul.wide %rd4, %r8, 4` before
+  // the `add.s64 %rd5, %rd5, %rd4` that consumes it) knows it is needed.
   for (size_t i = 0; i < fn_->body.size(); ++i) {
+    const PtxInstruction &ins = fn_->body[i];
+    if (!insideLoop(i)) continue;
+    if (ins.op != "add.s64" && ins.op != "add.u64" &&
+        ins.op != "add.s32" && ins.op != "add.u32")
+      continue;
+    if (ins.args.size() < 3) continue;
+    const std::string dst = regName(ins.args[0]);
+    if (!dynAddr_.count(dst)) continue;
+    const std::string a = regName(ins.args[1]);
+    const std::string b = regName(ins.args[2]);
+    auto consider = [&](const std::string &reg) {
+      if (reg.empty()) return;
+      long long imm = 0;
+      if (!parseImm(reg, imm)) neededValue_.insert(reg);
+    };
+  }  for (size_t i = 0; i < fn_->body.size(); ++i) {
     const PtxInstruction &ins = fn_->body[i];
     if (ins.args.empty()) continue;
     // A store's first operand is an address, not a destination register.
@@ -588,6 +742,35 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       return true;
     }
     return false;
+  };
+
+  // A MOVING pointer's offset is a value in the IR: every contribution to it
+  // must be a whole number of ELEMENTS, because memref indexes elements. A
+  // step of 6 bytes into f16 elements is not expressible as memref[index],
+  // and pretending otherwise reads the wrong element — so it is refused here,
+  // where the element size is known.
+  auto attachDynamic = [&](MemAccess &acc, const std::string &reg,
+                           const PtrValue &pv) -> LogicalResult {
+    // A dynamic pointer: its offset is a loop-carried SSA value. Check both
+    // pv.dynamic (set after the first step executes) and dynAddr_ (set during
+    // analysis for any register that steps inside a loop).
+    if (!pv.dynamic && !dynAddr_.count(reg)) return success();
+    acc.dynReg = reg;
+    acc.dynScales = pv.dynScales;
+    acc.dynConsts = pv.dynConsts;
+    auto whole = [&](long long bytes) {
+      if (bytes % acc.elemBytes == 0) return success();
+      return fail("the moving pointer '" + reg + "' advances by " +
+                  std::to_string(bytes) + " bytes, which is not a whole "
+                  "number of " + std::to_string(acc.elemBytes) +
+                  "-byte elements: memref indexes elements, so the access is "
+                  "not expressible");
+    };
+    for (int s : acc.dynScales)
+      if (failed(whole(s))) return failure();
+    for (long long s : acc.dynConsts)
+      if (failed(whole(s))) return failure();
+    return success();
   };
 
   for (size_t i = 0; i < fn_->body.size(); ++i) {
@@ -627,6 +810,14 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
         pv.kind = PtrValue::Address;
         pv.isGlobal = false;
         pv.addrShared = sit->second;
+        // A moving shared-memory pointer is rebased by this move. Only a move
+        // INSIDE a loop rebases; one before the loop is a plain address setup.
+        if (dynAddr_.count(regName(ins.args[0])) && insideLoop(i)) {
+          pv.dynamic = true;
+          ptrValue_[regName(ins.args[0])] = pv;
+          dynInit_[i] = DynInit{/*rebase=*/true};
+          continue;
+        }
         ptrValue_[regName(ins.args[0])] = pv;
         skip_.insert(i);
         continue;
@@ -655,6 +846,18 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
                       "' is not understood: only a kernel parameter or a "
                       "shared variable can be the base of an address");
         }
+      }
+      // A pointer that moves is rebased here (nvcc redoes the cvta on every
+      // iteration of a tiled kernel): the offset starts at ZERO again, and it
+      // is a value, so the loop can carry it. Only a cvta INSIDE a loop
+      // rebases; a cvta before the loop is a plain address setup.
+      if (dynAddr_.count(regName(ins.args[0])) && insideLoop(i)) {
+        pv.dynamic = true;
+        ptrValue_[regName(ins.args[0])] = pv;
+        // The offset restarts at ZERO at every rebase; the loop carries it,
+        // so the first step reads the initial offset (0).
+        dynInit_[i] = DynInit{/*rebase=*/true};
+        continue;  // NOT skipped: the offset is emitted as a value
       }
       ptrValue_[regName(ins.args[0])] = pv;
       skip_.insert(i);
@@ -686,7 +889,21 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       if (it != ptrValue_.end() && it->second.kind == PtrValue::Offset)
         pv.constBytes = it->second.constBytes;
       ptrValue_[regName(ins.args[0])] = pv;
-      skip_.insert(i);
+      // If this offset feeds a moving pointer's step, its SSA value is
+      // needed in the IR — emit it instead of skipping.
+      if (neededValue_.count(regName(ins.args[0]))) {
+        Type offTy = builder_.getI64Type();
+        Value v = extendToI64(valueOfReg(idx));
+        if (scale != 1)
+          v = builder_
+                  .create<arith::MulIOp>(
+                      v, builder_.create<arith::ConstantOp>(
+                             IntegerAttr::get(offTy, scale)))
+                  .getResult();
+        regValue_[regName(ins.args[0])] = v;
+      }
+      // Not needed as a dynamic offset: leave it to the ordinary mul
+      // lowering in emitInstruction (mul.wide is 32x32->64 arithmetic there).
       continue;
     }
 
@@ -716,9 +933,20 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
         // the unit (it scales the index, not the byte offset).
         pv.constBytes = baseConst;
         ptrValue_[regName(ins.args[0])] = pv;
-        // Do NOT skip: mul.lo is also used for ordinary arithmetic, and the
-        // recovered access uses the source register, not this result. Skipping
-        // would leave regValue_ unset for the ordinary uses.
+        if (neededValue_.count(regName(ins.args[0]))) {
+          Type offTy = builder_.getI64Type();
+          Value v = extendToI64(valueOfReg(idx));
+          if (baseScale * (int)scale != 1)
+            v = builder_
+                    .create<arith::MulIOp>(
+                        v, builder_.create<arith::ConstantOp>(
+                               IntegerAttr::get(offTy, baseScale * (int)scale)))
+                    .getResult();
+          regValue_[regName(ins.args[0])] = v;
+        }
+        // Not needed as a dynamic offset: leave it to the ordinary mul
+        // lowering in emitInstruction (it is NOT skipped — cmp_signed.ptx and
+        // the fuzzers use mul.lo as plain arithmetic).
         continue;
       }
       // Non-constant scale: fall through to the ordinary-value path.
@@ -729,30 +957,117 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       if (ins.args.size() < 3) return fail("bad add.s64");
       const std::string a = regName(ins.args[1]);
       const std::string b = regName(ins.args[2]);
-      // A pointer that MOVES. `add.s64 %p, %p, 16` (nvcc advances a tile
-      // pointer on every iteration) cannot be folded into a constant byte
-      // offset: the offset changes per iteration, and the recovered
-      // memref[index] form would read the FIRST tile every time. The
-      // front-end produced exactly that for int8_gemm.ptx — the card answered
-      // CUDA_ERROR_ILLEGAL_ADDRESS, which is the good outcome; guessing is not.
+      const std::string dst = regName(ins.args[0]);
+      // A parameter used as the base of an address without cvta.
+      if (pointerParams_.count(a)) promoteParamToAddress(a);
+      if (pointerParams_.count(b)) promoteParamToAddress(b);
+
+      // A MOVING pointer: `%p = %p + X` (a step) or `%p = base + off` (a
+      // rebase after a cvta the analysis could not see, e.g. a shared symbol
+      // move). The offset becomes a value, so no constant folding. Only steps
+      // INSIDE a loop need this: outside a loop the linear accumulation is
+      // exact, and treating it as dynamic would drop the base. Only an
+      // Address-kind register can move; an Offset-kind one is just
+      // base+offset arithmetic within a single iteration (e.g. `mul.wide`
+      // then `add`), not a pointer that changes between iterations.
+      if (dynAddr_.count(dst) && insideLoop(i) &&
+          ptrValue_.count(dst) && ptrValue_[dst].kind == PtrValue::Address) {
+        auto cur = ptrValue_.find(dst);
+        auto ai = ptrValue_.find(a);
+        auto bi = ptrValue_.find(b);
+        DynInit di;
+        PtrValue pv;
+        bool ok = false;
+        if (a == dst || b == dst) {
+          const std::string other = (a == dst) ? b : a;
+          if (cur == ptrValue_.end() || cur->second.kind != PtrValue::Address)
+            return fail("the moving pointer '" + dst +
+                        "' is stepped before its base is known");
+          pv = cur->second;
+          di.rebase = false;
+          long long imm = 0;
+          if (parseImm(other, imm)) {
+            di.imm = imm;
+            pv.dynConsts.push_back(imm);
+            ok = true;
+          } else {
+            auto oi = ptrValue_.find(other);
+            if (oi != ptrValue_.end() && oi->second.kind == PtrValue::Offset &&
+                !oi->second.indexReg.empty() &&
+                oi->second.extraTerms.empty() &&
+                oi->second.constBytes == 0) {
+              di.src = oi->second.indexReg;
+              di.scale = oi->second.scale;
+              pv.dynScales.push_back(oi->second.scale);
+              neededValue_.insert(di.src);
+              ok = true;
+            }
+          }
+          if (!ok)
+            return fail("the step of the moving pointer '" + dst +
+                        "' is not understood: the front-end needs an "
+                        "immediate or a register that holds a byte offset");
+        } else {
+          const std::string other = (ai != ptrValue_.end() &&
+                                     ai->second.kind == PtrValue::Address &&
+                                     !ai->second.dynamic)
+                                        ? b
+                                        : a;
+          auto base = ptrValue_.find(other == b ? a : b);
+          if (base == ptrValue_.end() ||
+              base->second.kind != PtrValue::Address || base->second.dynamic)
+            return fail("the base of the moving pointer '" + dst +
+                        "' is not understood");
+          pv = base->second;
+          di.rebase = true;
+          long long imm = 0;
+          if (parseImm(other, imm)) {
+            di.imm = imm;
+            pv.dynConsts.push_back(imm);
+            ok = true;
+          } else {
+            auto oi = ptrValue_.find(other);
+            if (oi != ptrValue_.end() && oi->second.kind == PtrValue::Offset &&
+                !oi->second.indexReg.empty() &&
+                oi->second.extraTerms.empty() && oi->second.constBytes == 0) {
+              di.src = oi->second.indexReg;
+              di.scale = oi->second.scale;
+              pv.dynScales.push_back(oi->second.scale);
+              neededValue_.insert(di.src);
+              ok = true;
+            }
+          }
+          if (!ok)
+            return fail("the offset of the moving pointer '" + dst +
+                        "' is not understood: the front-end needs an immediate "
+                        "or a register that holds the whole offset");
+        }
+        pv.kind = PtrValue::Address;
+        pv.indexReg.clear();
+        pv.extraTerms.clear();
+        pv.constBytes = 0;
+        ptrValue_[dst] = pv;
+        dynInit_[i] = di;
+        continue;  // NOT skipped: the offset is a value in the IR
+      }
+
+      // A pointer that MOVES but is not one of the registers above: the base
+      // is derived further (`%p` feeds `%q = %p + %r`, and only `%q` is
+      // dereferenced), and folding the step into a constant byte offset would
+      // read the first tile on every iteration.
       {
-        auto dstIt = ptrValue_.find(regName(ins.args[0]));
+        auto dstIt = ptrValue_.find(dst);
         const bool moves = dstIt != ptrValue_.end() &&
                            dstIt->second.kind == PtrValue::Address &&
                            (!dstIt->second.indexReg.empty() ||
                             !dstIt->second.extraTerms.empty() ||
                             dstIt->second.constBytes != 0);
-        if (hasLoop && moves && (regName(ins.args[0]) == a ||
-                                 regName(ins.args[0]) == b))
-          return fail("the address register '" + regName(ins.args[0]) +
+        if (hasLoop && moves && (dst == a || dst == b))
+          return fail("the address register '" + dst +
                       "' is advanced inside a loop ('" + op.str() +
-                      "'): a moving pointer is not expressible yet, and "
-                      "folding the step into a constant byte offset would "
-                      "read the first tile on every iteration");
+                      "'): the front-end expresses a moving pointer only when "
+                      "the advanced register is the one dereferenced");
       }
-      // A parameter used as the base of an address without cvta.
-      if (pointerParams_.count(a)) promoteParamToAddress(a);
-      if (pointerParams_.count(b)) promoteParamToAddress(b);
       auto ai = ptrValue_.find(a);
       auto bi = ptrValue_.find(b);
       PtrValue pv;
@@ -830,20 +1145,102 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       if (ins.args.size() < 3) return fail("bad add.s32");
       const std::string a = regName(ins.args[1]);
       const std::string b = regName(ins.args[2]);
+      const std::string dst = regName(ins.args[0]);
+      // The 32-bit form of a moving pointer (a demoted shared address that is
+      // advanced per iteration). Only an Address-kind register can move; an
+      // Offset-kind one is just base+offset arithmetic within a single
+      // iteration, not a pointer that changes between iterations.
+      if (dynAddr_.count(dst) && insideLoop(i) &&
+          ptrValue_.count(dst) && ptrValue_[dst].kind == PtrValue::Address) {
+        auto cur = ptrValue_.find(dst);
+        auto ai = ptrValue_.find(a);
+        auto bi = ptrValue_.find(b);
+        DynInit di;
+        PtrValue pv;
+        bool ok = false;
+        if (a == dst || b == dst) {
+          const std::string other = (a == dst) ? b : a;
+          if (cur == ptrValue_.end() || cur->second.kind != PtrValue::Address)
+            return fail("the moving pointer '" + dst +
+                        "' is stepped before its base is known");
+          pv = cur->second;
+          long long imm = 0;
+          if (parseImm(other, imm)) {
+            di.imm = imm;
+            pv.dynConsts.push_back(imm);
+            ok = true;
+          } else {
+            auto oi = ptrValue_.find(other);
+            if (oi != ptrValue_.end() && oi->second.kind == PtrValue::Offset &&
+                !oi->second.indexReg.empty() &&
+                oi->second.extraTerms.empty() &&
+                oi->second.constBytes == 0) {
+              di.src = oi->second.indexReg;
+              di.scale = oi->second.scale;
+              pv.dynScales.push_back(oi->second.scale);
+              neededValue_.insert(di.src);
+              ok = true;
+            }
+          }
+          if (!ok)
+            return fail("the step of the moving pointer '" + dst +
+                        "' is not understood: the front-end needs an "
+                        "immediate or a register that holds a byte offset");
+        } else {
+          const std::string other =
+              (ai != ptrValue_.end() && ai->second.kind == PtrValue::Address &&
+               !ai->second.dynamic)
+                  ? b
+                  : a;
+          auto base = ptrValue_.find(other == b ? a : b);
+          if (base == ptrValue_.end() ||
+              base->second.kind != PtrValue::Address || base->second.dynamic)
+            return fail("the base of the moving pointer '" + dst +
+                        "' is not understood");
+          pv = base->second;
+          di.rebase = true;
+          long long imm = 0;
+          if (parseImm(other, imm)) {
+            di.imm = imm;
+            pv.dynConsts.push_back(imm);
+            ok = true;
+          } else {
+            auto oi = ptrValue_.find(other);
+            if (oi != ptrValue_.end() && oi->second.kind == PtrValue::Offset &&
+                !oi->second.indexReg.empty() &&
+                oi->second.extraTerms.empty() && oi->second.constBytes == 0) {
+              di.src = oi->second.indexReg;
+              di.scale = oi->second.scale;
+              pv.dynScales.push_back(oi->second.scale);
+              neededValue_.insert(di.src);
+              ok = true;
+            }
+          }
+          if (!ok)
+            return fail("the offset of the moving pointer '" + dst +
+                        "' is not understood: the front-end needs an immediate "
+                        "or a register that holds the whole offset");
+        }
+        pv.kind = PtrValue::Address;
+        pv.indexReg.clear();
+        pv.extraTerms.clear();
+        pv.constBytes = 0;
+        ptrValue_[dst] = pv;
+        dynInit_[i] = di;
+        continue;  // NOT skipped: the offset is a value in the IR
+      }
       {
-        auto dstIt = ptrValue_.find(regName(ins.args[0]));
+        auto dstIt = ptrValue_.find(dst);
         const bool moves = dstIt != ptrValue_.end() &&
                            dstIt->second.kind == PtrValue::Address &&
                            (!dstIt->second.indexReg.empty() ||
                             !dstIt->second.extraTerms.empty() ||
                             dstIt->second.constBytes != 0);
-        if (hasLoop && moves && (regName(ins.args[0]) == a ||
-                                 regName(ins.args[0]) == b))
-          return fail("the address register '" + regName(ins.args[0]) +
+        if (hasLoop && moves && (dst == a || dst == b))
+          return fail("the address register '" + dst +
                       "' is advanced inside a loop ('" + op.str() +
-                      "'): a moving pointer is not expressible yet, and "
-                      "folding the step into a constant byte offset would "
-                      "read the first tile on every iteration");
+                      "'): the front-end expresses a moving pointer only when "
+                      "the advanced register is the one dereferenced");
       }
       auto ai = ptrValue_.find(a);
       auto bi = ptrValue_.find(b);
@@ -1052,6 +1449,7 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       if (!acc.elemType)
         return fail("the element type of the load '" + op.str() + "' is not known");
       acc.elemBytes = bytesOf(acc.elemType);
+      if (failed(attachDynamic(acc, reg, it->second))) return failure();
       if (!acc.indexReg.empty()) {
         auto it2 = ptrValue_.find(acc.indexReg);
         if (it2 != ptrValue_.end() && it2->second.isThreadId)
@@ -1109,6 +1507,7 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       if (!acc.elemType)
         return fail("the element type of the store '" + op.str() + "' is not known");
       acc.elemBytes = bytesOf(acc.elemType);
+      if (failed(attachDynamic(acc, reg, it->second))) return failure();
       if (!acc.indexReg.empty()) {
         auto it2 = ptrValue_.find(acc.indexReg);
         if (it2 != ptrValue_.end() && it2->second.isThreadId)
@@ -1170,6 +1569,7 @@ LogicalResult PtxToRougeEmitter::analyseAddresses() {
       if (!acc.elemType)
         return fail("the element type of the atomic '" + op.str() + "' is not known");
       acc.elemBytes = bytesOf(acc.elemType);
+      if (failed(attachDynamic(acc, reg, it->second))) return failure();
       if (!acc.indexReg.empty()) {
         auto it2 = ptrValue_.find(acc.indexReg);
         if (it2 != ptrValue_.end() && it2->second.isThreadId)
@@ -1268,12 +1668,49 @@ Value PtxToRougeEmitter::operandValue(StringRef tok, Type type) {
   return valueOfReg(name);
 }
 
-// The index of an access, in elements.
+// The index of an access, in elements. All arithmetic is done in the i64
+// (byte-offset) domain and converted to `index` only at the very end: the
+// moving-pointer offset is an i64 value, and `arith.divui`/`arith.muli` need
+// a non-index integer type.
 Value PtxToRougeEmitter::accessIndex(const MemAccess &acc) {
   MLIRContext *ctx = module_.getContext();
   const int eb = acc.elemBytes;
+  // i64 (bytes) domain helpers.
+  auto toI64 = [&](Value raw) -> Value {
+    if (!raw) return {};
+    Type t = raw.getType();
+    if (t.isIndex())
+      return builder_.create<arith::IndexCastOp>(builder_.getI64Type(), raw)
+          .getResult();
+    if (auto intTy = dyn_cast<IntegerType>(t)) {
+      if (intTy.getWidth() == 1) return {};
+      if (intTy.getWidth() == 64) return raw;
+      return builder_.create<arith::ExtUIOp>(builder_.getI64Type(), raw)
+          .getResult();
+    }
+    return {};
+  };
+  auto scaled64 = [&](Value raw, int scale) -> Value {
+    Value v = toI64(raw);
+    if (!v) return {};
+    if (scale == eb) return v;
+    if (scale % eb != 0) return {};
+    return builder_
+        .create<arith::MulIOp>(
+            v, builder_.create<arith::ConstantOp>(
+                   IntegerAttr::get(builder_.getI64Type(), scale / eb)))
+        .getResult();
+  };
+  auto toIndex = [&](Value v) -> Value {
+    if (!v) return {};
+    if (v.getType().isIndex()) return v;
+    return builder_.create<arith::IndexCastOp>(builder_.getIndexType(), v)
+        .getResult();
+  };
+
   // Thread id fast path: keep the bare thread id (or thread id + a constant)
-  // so the vectoriser recognises a unit-stride access.
+  // so the vectoriser recognises a unit-stride access. Stay in the `index`
+  // domain here — the i64 domain is only needed for moving-pointer offsets.
   if (acc.indexIsThreadId && acc.extraTerms.empty()) {
     if (acc.scale != eb) return {};
     auto tid = builder_.create<rouge::ThreadIdOp>(
@@ -1289,47 +1726,24 @@ Value PtxToRougeEmitter::accessIndex(const MemAccess &acc) {
     return idx;
   }
 
-  // A term of the address: the register's index in ELEMENTS. A byte scale
-  // that is a whole number of elements is a stride, not an error: the block
-  // index of a tiled kernel is exactly that (`gemm_tile.ptx`: the block
-  // offset is blockId*512 bytes of f16, i.e. blockId*256 elements, and the
-  // thread's own offset is tlinear*2 bytes).
-  auto toIndex = [&](Value raw) -> Value {
-    if (!raw) return {};
-    if (raw.getType().isIndex()) return raw;
-    if (auto intTy = dyn_cast<IntegerType>(raw.getType())) {
-      if (intTy.getWidth() == 1) return {};
-      return builder_.create<arith::IndexCastOp>(builder_.getIndexType(), raw)
-          .getResult();
-    }
-    return {};
-  };
-  auto scaled = [&](Value raw, int scale) -> Value {
-    Value v = toIndex(raw);
-    if (!v) return {};
-    if (scale == eb) return v;
-    if (scale % eb != 0) return {};
-    Value c = builder_.create<arith::ConstantIndexOp>(loc_, scale / eb);
-    return builder_.create<arith::MulIOp>(v, c).getResult();
-  };
-
   // Build the primary term.
   Value idx;
   if (acc.indexIsThreadId) {
     auto tid = builder_.create<rouge::ThreadIdOp>(
         loc_, builder_.getIndexType(),
         rouge::DimensionAttr::get(ctx, rouge::Dimension::x));
-    idx = scaled(tid.getResult(), acc.scale);
+    idx = scaled64(toI64(tid.getResult()), acc.scale);
   } else if (!acc.indexReg.empty()) {
-    idx = scaled(valueOfReg(acc.indexReg), acc.scale);
+    idx = scaled64(toI64(valueOfReg(acc.indexReg)), acc.scale);
   } else {
-    idx = builder_.create<arith::ConstantIndexOp>(loc_, 0);
+    idx = builder_.create<arith::ConstantOp>(
+        IntegerAttr::get(builder_.getI64Type(), 0));
   }
   if (!idx) return {};
 
   // Extra byte-offset terms.
   for (const auto &t : acc.extraTerms) {
-    Value v = scaled(valueOfReg(t.first), t.second);
+    Value v = scaled64(toI64(valueOfReg(t.first)), t.second);
     if (!v) return {};
     idx = builder_.create<arith::AddIOp>(idx, v).getResult();
   }
@@ -1338,11 +1752,28 @@ Value PtxToRougeEmitter::accessIndex(const MemAccess &acc) {
   if (acc.constBytes != 0) {
     if (acc.constBytes % eb != 0) return {};
     long long c = acc.constBytes / eb;
-    Value cv = builder_.create<arith::ConstantIndexOp>(loc_, c);
+    Value cv = builder_.create<arith::ConstantOp>(
+        IntegerAttr::get(builder_.getI64Type(), c));
     idx = builder_.create<arith::AddIOp>(idx, cv).getResult();
   }
 
-  return idx;
+  // A moving pointer: its offset is a value. The contributions were checked at
+  // the access (every one is a whole number of elements), so the division is
+  // exact — and for the common one-byte element it disappears entirely.
+  if (!acc.dynReg.empty()) {
+    Value d = valueOfReg(acc.dynReg);
+    if (!d) return {};
+    Value dv = toI64(d);
+    if (!dv) return {};
+    if (eb != 1) {
+      Value ebv = builder_.create<arith::ConstantOp>(
+          IntegerAttr::get(builder_.getI64Type(), eb));
+      dv = builder_.create<arith::DivUIOp>(dv, ebv).getResult();
+    }
+    idx = builder_.create<arith::AddIOp>(idx, dv).getResult();
+  }
+
+  return toIndex(idx);
 }
 
 // The body of the kernel.
@@ -1374,7 +1805,10 @@ LogicalResult PtxToRougeEmitter::emitBody() {
       loopBack_[target] = be;
     }
   }
-  return emitRange(0, body.size(), {});
+    for (size_t bi = 0; bi < body.size(); ++bi)
+    for (size_t bi = 0; bi < body.size(); ++bi) {
+    }
+    return emitRange(0, body.size(), {});
 }
 
 // Is the register still read after 'from' before anything redefines it?
@@ -1657,7 +2091,16 @@ LogicalResult PtxToRougeEmitter::emitLoop(size_t header, size_t back) {
     if (r == condPred) continue;
     if (!definedBefore.count(r)) continue;
     Value v = valueOfReg(r);
-    if (!v) continue;
+    if (!v) {
+      // A dynamic pointer defined before the loop but without an SSA value:
+      // its static Address was never materialised. Its loop-carried offset
+      // starts at ZERO — the static part of the address (base + index) is
+      // still used by accessIndex, and the carried value adds the per-iteration
+      // step on top.
+      if (!dynAddr_.count(r)) continue;
+      v = builder_.create<arith::ConstantOp>(
+          IntegerAttr::get(builder_.getI64Type(), 0)).getResult();
+    }
     carried.push_back(r);
     initVals.push_back(v);
   }
@@ -1743,6 +2186,73 @@ LogicalResult PtxToRougeEmitter::emitLoop(size_t header, size_t back) {
 LogicalResult PtxToRougeEmitter::emitInstruction(const PtxInstruction &ins,
                                                   size_t index) {
   const StringRef op = ins.op;
+
+  // A definition of a MOVING pointer's offset (see PtrValue::dynamic): the
+  // offset is an i64 value in bytes, so the loop can carry it like any other
+  // value. A rebase starts it over, a step adds to it.
+  auto dynIt = dynInit_.find(index);
+  if (dynIt != dynInit_.end()) {
+    const DynInit &di = dynIt->second;
+    if (!ins.pred.empty())
+      return fail("a predicated step of a moving pointer is not supported");
+    Type offTy = builder_.getI64Type();
+    auto extend = [&](Value v) -> Value {
+      if (!v) return {};
+      Type t = v.getType();
+      if (t.isIndex())
+        return builder_.create<arith::IndexCastOp>(offTy, v).getResult();
+      if (t == offTy) return v;
+      if (auto it2 = dyn_cast<IntegerType>(t); it2 && it2.getWidth() < 64)
+        return builder_.create<arith::ExtUIOp>(offTy, v).getResult();
+      return {};
+    };
+    auto constant = [&](long long v) -> Value {
+      return builder_.create<arith::ConstantOp>(IntegerAttr::get(offTy, v))
+          .getResult();
+    };
+    Value off;
+    if (di.rebase) {
+      off = di.src.empty() ? constant(di.imm)
+                           : scaleValue(extend(valueOfReg(di.src)), di.scale);
+    } else {
+      Value old = valueOfReg(regName(ins.args[0]));
+      if (!old) {
+        // No previous offset value: this is the first step inside the loop and
+        // the register was set up before the loop (a static Address). Material
+        // its byte offset as an SSA value so the loop can carry it.
+        auto cur = ptrValue_.find(regName(ins.args[0]));
+        if (cur == ptrValue_.end() || cur->second.kind != PtrValue::Address ||
+            cur->second.dynamic)
+          return fail("the step of the moving pointer '" +
+                      regName(ins.args[0]) +
+                      "' has no offset before it: PTX would step an undefined "
+                      "value");
+        old = materializeOffset(cur->second);
+        if (!old)
+          return fail("the offset of the moving pointer '" +
+                      regName(ins.args[0]) +
+                      "' is not understood");
+      }
+      Value add = di.src.empty() ? constant(di.imm)
+                                 : scaleValue(extend(valueOfReg(di.src)), di.scale);
+      if (!add)
+        return fail("the step of the moving pointer '" +
+                    regName(ins.args[0]) + "' is not understood");
+      off = builder_
+                .create<arith::AddIOp>(old, add)
+                .getResult();
+    }
+    if (!off)
+      return fail("the offset of the moving pointer '" + regName(ins.args[0]) +
+                  "' is not understood");
+    regValue_[regName(ins.args[0])] = off;
+    // Mark the pointer as dynamic now that its offset is an SSA value carried
+    // by the loop. (The flag is not set during analysis: that happens here, at
+    // emission time, so that materializeOffset can still read the static
+    // structure when the first step inside the loop has no preceding rebase.)
+    ptrValue_[regName(ins.args[0])].dynamic = true;
+    return success();
+  }
 
   // The address arithmetic is not emitted: the access is emitted with the
   // recovered structure instead.
@@ -2039,10 +2549,13 @@ LogicalResult PtxToRougeEmitter::emitInstruction(const PtxInstruction &ins,
       if (isa<FloatType>(t)) {
         v = builder_.create<arith::MulFOp>(a, b).getResult();
       } else if (o.rfind("mul.wide.", 0) == 0) {
-        // The wide multiplication: 32x32 -> 64.
+        // The wide multiplication: 32x32 -> 64. Extend both operands to i64
+        // (extui is a no-op if they are already i64).
         Type i64 = IntegerType::get(module_.getContext(), 64);
-        Value a64 = builder_.create<arith::ExtUIOp>(i64, a).getResult();
-        Value b64 = builder_.create<arith::ExtUIOp>(i64, b).getResult();
+        Value a64 = extendToI64(a);
+        Value b64 = extendToI64(b);
+        if (!a64 || !b64)
+          return fail("the operands of '" + op.str() + "' are not understood");
         v = builder_.create<arith::MulIOp>(a64, b64).getResult();
       } else {
         v = builder_.create<arith::MulIOp>(a, b).getResult();
